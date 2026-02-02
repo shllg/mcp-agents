@@ -36,7 +36,6 @@ Each `--provider` flag maps to a single exposed tool:
 |----------|-----------|-------------|
 | `claude` | `claude_code` | `claude -p <prompt>` |
 | `gemini` | `gemini` | `gemini [-s] -p <prompt>` |
-| `codex` (default) | `codex` | `codex exec <prompt>` |
 
 ### `claude_code` parameters
 
