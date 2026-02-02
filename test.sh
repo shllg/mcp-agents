@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Smoke tests for mcp-agents stdio transport.
+# Verifies the server responds to piped JSON-RPC without exiting prematurely.
+#
+# The keepalive timer means the server won't exit on its own after stdin EOF,
+# so we use `timeout` to cap each test run.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+SERVER="node server.js"
+TIMEOUT_CMD="timeout"
+if ! command -v timeout >/dev/null 2>&1; then
+  if command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="gtimeout"
+  else
+    echo "Error: 'timeout' (coreutils) is required. Install via: brew install coreutils"
+    exit 1
+  fi
+fi
+PASS=0
+FAIL=0
+
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+red()   { printf '\033[31m%s\033[0m\n' "$*"; }
+
+# ── Helper: run tools/list with a given --provider and check for expected tool ──
+test_tools_list() {
+  local label="$1"
+  local provider="$2"
+  local expected_tool="$3"
+
+  echo "--- $label ---"
+
+  RESPONSE=$(
+    {
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+      sleep 1
+    } | $TIMEOUT_CMD 10 $SERVER --provider "$provider" 2>/dev/null || true
+  )
+
+  if echo "$RESPONSE" | jq -e ".result.tools[] | select(.name == \"$expected_tool\")" >/dev/null 2>&1; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label"
+    echo "  Response: $RESPONSE"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# ── Helper: full handshake then tools/list ──
+test_handshake() {
+  local label="$1"
+  local provider="$2"
+  local expected_tool="$3"
+
+  echo "--- $label ---"
+
+  RESPONSE=$(
+    {
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}'
+      sleep 0.3
+      printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+      sleep 0.3
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+      sleep 1
+    } | $TIMEOUT_CMD 10 $SERVER --provider "$provider" 2>/dev/null || true
+  )
+
+  if echo "$RESPONSE" | grep -q "\"$expected_tool\""; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label"
+    echo "  Response: $RESPONSE"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# ── Helper: full handshake → tools/call with a connectivity check ──
+test_connectivity() {
+  local label="$1"
+  local provider="$2"
+  local tool_name="$3"
+  local call_timeout="${4:-120}"
+
+  echo "--- $label ---"
+
+  RESPONSE=$(
+    {
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}'
+      sleep 0.3
+      printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+      sleep 0.3
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool_name\",\"arguments\":{\"prompt\":\"This is a connectivity test. Reply with exactly: OK\"}}}"
+      sleep "$call_timeout"
+    } | $TIMEOUT_CMD "$((call_timeout + 10))" $SERVER --provider "$provider" 2>/dev/null || true
+  )
+
+  # Success = got a non-error tool result with actual content
+  if echo "$RESPONSE" | jq -e '.result.content[0].text' >/dev/null 2>&1 \
+     && ! echo "$RESPONSE" | jq -e '.result.isError' >/dev/null 2>&1; then
+    local text
+    text=$(echo "$RESPONSE" | jq -r '.result.content[0].text' 2>/dev/null | head -1)
+    green "PASS: $label → $text"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label"
+    echo "  Response: $RESPONSE"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# ========== Protocol tests (fast) ==========
+
+# ---------- Ping (all providers) ----------
+for p in claude gemini codex; do
+  test_tools_list "tools/list --provider $p → ping" "$p" "ping"
+done
+
+# ---------- Claude provider ----------
+test_tools_list "tools/list --provider claude → claude_code" "claude" "claude_code"
+test_handshake  "handshake --provider claude → claude_code"  "claude" "claude_code"
+
+# ---------- Gemini provider ----------
+test_tools_list "tools/list --provider gemini → gemini" "gemini" "gemini"
+test_handshake  "handshake --provider gemini → gemini"  "gemini" "gemini"
+
+# ---------- Codex provider (default) ----------
+test_tools_list "tools/list --provider codex → codex" "codex" "codex"
+test_handshake  "handshake --provider codex → codex"  "codex" "codex"
+
+# ========== Integration tests (call real CLIs) ==========
+
+if [ "${SKIP_INTEGRATION:-}" = "1" ]; then
+  echo ""
+  echo "(Skipping integration tests — SKIP_INTEGRATION=1)"
+else
+  test_connectivity "call claude (connectivity)" "claude" "claude_code" 30
+  test_connectivity "call gemini (connectivity)" "gemini" "gemini"     30
+fi
+
+# ---------- Summary ----------
+echo ""
+echo "Results: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ] || exit 1

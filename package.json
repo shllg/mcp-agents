@@ -1,0 +1,35 @@
+{
+  "name": "mcp-agents",
+  "version": "0.2.0",
+  "description": "MCP server that wraps AI CLI tools (Claude Code, Gemini CLI, Codex CLI) for use by any MCP client",
+  "type": "module",
+  "bin": {
+    "mcp-agents": "./server.js"
+  },
+  "files": [
+    "server.js"
+  ],
+  "keywords": [
+    "mcp",
+    "claude",
+    "gemini",
+    "codex",
+    "anthropic",
+    "google",
+    "openai",
+    "ai",
+    "cli"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thomaswitt/mcp-agents"
+  },
+  "author": "Thomas Witt",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

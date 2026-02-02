@@ -1,0 +1,91 @@
+# mcp-agents
+
+MCP server that wraps AI CLI tools — [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Gemini CLI](https://github.com/google-gemini/gemini-cli), and [Codex CLI](https://github.com/openai/codex) — so any MCP client can call them as tools.
+
+## Prerequisites
+
+- **Node.js >= 18**
+- At least one of the following CLIs installed and on your `$PATH`:
+
+| CLI | Install |
+|-----|---------|
+| `claude` | [Claude Code docs](https://docs.anthropic.com/en/docs/claude-code) |
+| `gemini` | `npm install -g @anthropic-ai/gemini-cli` |
+| `codex` | `npm install -g @openai/codex` |
+
+Only the CLI you select with `--provider` needs to be present.
+
+## Quick test
+
+```bash
+# Default provider (codex)
+npx mcp-agents
+
+# Specific provider
+npx mcp-agents --provider claude
+npx mcp-agents --provider gemini
+```
+
+The server speaks [JSON-RPC over stdio](https://modelcontextprotocol.io/docs/concepts/transports#stdio). It prints `[mcp-agents] ready (provider: <name>)` to stderr when it's listening.
+
+## Providers & Tools
+
+Each `--provider` flag maps to a single exposed tool:
+
+| Provider | Tool name | CLI command |
+|----------|-----------|-------------|
+| `claude` | `claude_code` | `claude -p <prompt>` |
+| `gemini` | `gemini` | `gemini [-s] -p <prompt>` |
+| `codex` (default) | `codex` | `codex exec <prompt>` |
+
+### `claude_code` parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `prompt` | `string` | yes | The prompt to send to Claude Code |
+| `timeout_ms` | `integer` | no | Timeout in ms (default: 120 000) |
+
+### `gemini` parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `prompt` | `string` | yes | The prompt to send to Gemini CLI |
+| `sandbox` | `boolean` | no | Run in sandbox mode (`-s` flag) |
+| `timeout_ms` | `integer` | no | Timeout in ms (default: 120 000) |
+
+### `codex` parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `prompt` | `string` | yes | The prompt to send to Codex CLI |
+| `timeout_ms` | `integer` | no | Timeout in ms (default: 120 000) |
+
+## Integration with OpenAI Codex
+
+Add two entries to `~/.codex/config.toml` — one per provider you want available:
+
+```toml
+[mcp_servers.claude-code]
+command = "npx"
+args = ["-y", "mcp-agents", "--provider", "claude"]
+
+[mcp_servers.gemini]
+command = "npx"
+args = ["-y", "mcp-agents", "--provider", "gemini"]
+```
+
+Then in a Codex session you can call the `claude_code` or `gemini` tools, which shell out to the respective CLIs.
+
+## How it works
+
+1. An MCP client connects over stdio
+2. The server reads `--provider <name>` from its argv (defaults to `codex`)
+3. It registers a single tool matching that provider's CLI
+4. Client calls `tools/call` with the tool name and a `prompt`
+5. The server runs the CLI as a child process and returns stdout (or stderr) as the tool result
+
+The server includes a keepalive timer to prevent Node.js from exiting prematurely when stdin reaches EOF before the async subprocess registers an active handle.
+
+## License
+
+MIT
