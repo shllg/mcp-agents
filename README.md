@@ -60,7 +60,7 @@ with configurable flags:
 
 | CLI Flag | Default | Codex flag |
 |----------|---------|------------|
-| `--model` | `gpt-5.2-codex` | `-m <model>` |
+| `--model` | `gpt-5.3-codex` | `-m <model>` |
 | `--model_reasoning_effort` | `high` | `-c model_reasoning_effort=<value>` |
 
 Hardcoded defaults: `-s read-only -a never` (safe for MCP server mode).

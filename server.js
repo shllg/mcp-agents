@@ -90,7 +90,7 @@ Usage: mcp-agents [options]
 
 Options:
   --provider <name>              CLI backend to use (${providers}) [default: codex]
-  --model <model>                Model to use (codex) [default: gpt-5.2-codex]
+  --model <model>                Model to use (codex) [default: gpt-5.3-codex]
   --model_reasoning_effort <e>   Reasoning effort (codex) [default: high]
   --help, -h                     Show this help message
   --version, -v                  Show version number`);
@@ -206,7 +206,7 @@ function runCli(command, args, opts = {}) {
 function runCodexPassthrough({ model, modelReasoningEffort }) {
   const args = [
     "-m",
-    model || "gpt-5.2-codex",
+    model || "gpt-5.3-codex",
     "-s",
     "read-only",
     "-a",
@@ -240,9 +240,7 @@ async function main() {
 
   if (!backend) {
     logErr(`[mcp-agents] Unknown provider: ${providerName}`);
-    logErr(
-      `[mcp-agents] Available: ${Object.keys(CLI_BACKENDS).join(", ")}`,
-    );
+    logErr(`[mcp-agents] Available: ${Object.keys(CLI_BACKENDS).join(", ")}`);
     process.exitCode = 1;
     return;
   }
