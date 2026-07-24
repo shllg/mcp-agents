@@ -43,15 +43,54 @@ The server speaks [JSON-RPC over stdio](https://modelcontextprotocol.io/docs/con
 
 ## Providers & Tools
 
-Each `--provider` flag maps to a single exposed tool:
+Each `--provider` flag selects one CLI backend:
 
-| Provider | Tool name | CLI command |
-|----------|-----------|-------------|
-| `claude` | `claude_code` | `claude --model claude-opus-4-8 --effort xhigh -p --output-format json` |
+| Provider | Tool names | CLI command |
+|----------|------------|-------------|
+| `claude` | `claude_code`, `claude-start`, `claude-status`, `claude-result`, `claude-cancel` | `claude --model claude-opus-4-8 --effort xhigh` |
 | `gemini` | `gemini` | `agy --sandbox -p <prompt>` |
 | `codex` | *(pass-through)* | `codex mcp-server` |
 
-### `claude_code` parameters
+### Claude reviews
+
+For substantial second opinions and code reviews, use the background tools:
+
+1. Call `claude-start` with the complete review prompt and an absolute `cwd`.
+2. Call `claude-status` with the returned `jobId` and `cursor`. Repeat with
+   each new cursor until the state is terminal.
+3. When the state is `completed`, call `claude-result`. Continue from
+   `nextOffset` until `done` is `true`.
+4. Call `claude-cancel` if the verdict is no longer needed.
+
+| Tool | Required arguments | Optional arguments |
+|------|--------------------|--------------------|
+| `claude-start` | `prompt`, absolute `cwd` | — |
+| `claude-status` | `jobId`, `cursor` | `wait_ms` |
+| `claude-result` | `jobId` | `offset` |
+| `claude-cancel` | `jobId` | — |
+
+`claude-status` long-polls for 10 seconds by default and accepts `wait_ms` up to
+60 seconds. Canceling a status poll does not cancel its job. Jobs are one-shot
+and local to the current MCP connection: there are no reply sessions, and a
+disconnect cancels active work. The server allows 8 active and 32 retained jobs,
+keeps terminal jobs for one hour, pages results at 32,768 Unicode code points,
+and rejects a final result over 10 MiB.
+
+Background reviews have a bridge-owned two-hour deadline. Operators can replace
+it with `--timeout <seconds>` when starting the server; callers cannot shorten a
+job with `timeout_ms`. Claude is pinned to `claude-opus-4-8` at effort `xhigh`
+and runs as a leaf reviewer: it keeps project instructions and repository
+context, but disables hooks, subagents, skills, slash commands, external MCP
+servers, and mutation tools. Only `Read`, `Glob`, `Grep`, and plan-mode
+read-only `Bash` inspection are available; the leaf instruction also forbids
+test execution, installs, delegation, and external side effects. Intermediate
+model output, tool inputs/results, paths, and reasoning are not forwarded
+through MCP; only sanitized phase status and the final verdict are exposed.
+
+Use the blocking `claude_code` tool only for small prompts where a single MCP
+call can comfortably finish inside the client timeout.
+
+#### `claude_code` parameters
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -524,9 +563,10 @@ matters more than launch reliability.
 ## Integration with OpenAI Codex
 
 Add two entries to `~/.codex/config.toml` — one per provider you want available.
-Give the outer MCP call 60 seconds beyond each mcp-agents budget so the provider
-can return its result: 960 seconds for Claude's 900-second budget and 360 seconds
-for Gemini's 300-second budget:
+The 960-second Claude client timeout preserves compatibility with the blocking
+900-second `claude_code` tool. Background reviews do not hold one MCP request
+open: `claude-start` returns immediately and each `claude-status` poll lasts at
+most 60 seconds.
 
 ```toml
 [mcp_servers.claude-code]
@@ -534,13 +574,27 @@ command = "mcp-agents"
 args = ["--provider", "claude"]
 tool_timeout_sec = 960
 
+[mcp_servers.claude-code.tools.claude-start]
+approval_mode = "approve"
+
+[mcp_servers.claude-code.tools.claude-status]
+approval_mode = "approve"
+
+[mcp_servers.claude-code.tools.claude-result]
+approval_mode = "approve"
+
+[mcp_servers.claude-code.tools.claude-cancel]
+approval_mode = "approve"
+
 [mcp_servers.gemini]
 command = "mcp-agents"
 args = ["--provider", "gemini"]
 tool_timeout_sec = 360
 ```
 
-Then in a Codex session you can call the `claude_code` or `gemini` tools, which shell out to the respective CLIs.
+In a Codex session, ask for a Claude second opinion or review and use
+`claude-start` → `claude-status` → `claude-result`. Keep `claude_code` for tiny
+blocking prompts; `gemini` remains a blocking tool.
 
 ## Development
 
@@ -560,27 +614,31 @@ npm run bench:mcp-startup
 This measures MCP launch through `initialize` and `tools/list`; it does not call
 the provider model/tool.
 
-For a manual end-to-end background check, have Claude Code call `codex-start`,
-poll `codex-status` at least twice, read advancing commentary offsets, and then
-read the literal final token with `codex-result`. Repeat inside a Claude
-subagent to confirm both contexts share the MCP connection and receive ordinary
-tool results. This smoke check uses real model calls and remains separate from
+For a manual Claude background check, call `claude-start` with a short review
+prompt and this repository as `cwd`, poll `claude-status` with each returned
+cursor, and read the verdict with `claude-result`. For the inverse direction,
+have Claude Code call `codex-start`, poll `codex-status`, and read
+`codex-result`. These smoke checks use real model calls and remain separate from
 the deterministic test-suite gate.
 
 ## How it works
 
 1. An MCP client connects over stdio
 2. The server reads `--provider <name>` from its argv (defaults to `codex`)
-3. Claude and Gemini register one CLI tool; Codex forwards its native tools and
-   adds the optional background-job tools described above
+3. Gemini registers one blocking CLI tool; Claude registers its legacy blocking
+   tool plus the one-shot review-job tools; Codex forwards its native tools and
+   adds its background-job tools
 4. Client calls `tools/call` with the tool name and a `prompt`
-5. The server runs the CLI as a child process and returns tool text (Claude JSON `result`, or stdout/stderr for other providers)
+5. The server runs the CLI as a detached child process; Claude review jobs parse
+   stream-json into safe status and retained result pages, while blocking tools
+   return normalized provider output
 
 The server keeps a small keepalive timer so Node.js does not exit prematurely
 when stdin reaches EOF before an async subprocess registers an active handle.
-For Claude and Gemini provider mode, that keepalive is cleared during shutdown:
-the server now exits when the MCP stdio connection closes and kills any tracked
-detached provider child process groups that would otherwise linger.
+For Claude and Gemini provider mode, that keepalive is cleared during shutdown.
+When the MCP stdio connection closes, active Claude jobs receive an interrupt
+and bounded TERM/KILL fallback; any remaining tracked detached provider process
+groups are reaped before the server exits.
 
 ## License
 

@@ -98,6 +98,37 @@ test_tools_list() {
   fi
 }
 
+# ── Helper: assert the Claude provider's wrapper-owned tool schemas ──
+test_claude_tools_schema() {
+  local label="$1"
+  local predicate="$2"
+  local output_file
+  local status
+
+  echo "--- $label ---"
+
+  output_file=$(mktemp)
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+    sleep 0.3
+  } | $TIMEOUT_CMD 5 $SERVER --provider claude >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+  RESPONSE=$(cat "$output_file")
+  rm -f "$output_file"
+
+  if [ "$status" -eq 0 ] &&
+    printf '%s\n' "$RESPONSE" | jq -e "$predicate" >/dev/null 2>&1; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (exit $status)"
+    echo "  Response: $RESPONSE"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 # ── Helper: full handshake then tools/list ──
 test_handshake() {
   local label="$1"
@@ -298,6 +329,37 @@ test_tools_list "tools/list --provider claude → claude_code (900s default)" \
 test_tools_list "tools/list --provider claude honors --timeout override" \
   "claude" "claude_code" "7000" "7"
 test_handshake  "handshake --provider claude → claude_code"  "claude" "claude_code"
+test_claude_tools_schema "Claude tools/list advertises the complete one-shot job API" \
+  '(.result.tools | map(.name) | sort) ==
+    ["claude-cancel","claude-result","claude-start","claude-status","claude_code","ping"]'
+test_claude_tools_schema "Claude job tools expose closed operational schemas" \
+  '(.result.tools | map({key:.name,value:.}) | from_entries) as $t |
+   (($t["claude-start"].inputSchema |
+      (.additionalProperties == false) and
+      (.required == ["prompt","cwd"]) and
+      ((.properties | keys | sort) == ["cwd","prompt"]) and
+      (.properties.cwd.type == "string")) and
+    ($t["claude-status"].inputSchema |
+      (.additionalProperties == false) and
+      (.required == ["jobId","cursor"]) and
+      ((.properties | keys | sort) == ["cursor","jobId","wait_ms"]) and
+      (.properties.cursor.minimum == 0) and
+      (.properties.wait_ms.maximum == 60000)) and
+    ($t["claude-result"].inputSchema |
+      (.additionalProperties == false) and
+      (.required == ["jobId"]) and
+      ((.properties | keys | sort) == ["jobId","offset"]) and
+      (.properties.offset.minimum == 0)) and
+    ($t["claude-cancel"].inputSchema |
+      (.additionalProperties == false) and
+      (.required == ["jobId"]) and
+      ((.properties | keys) == ["jobId"])))'
+test_claude_tools_schema "legacy claude_code keeps prompt and caller timeout compatibility" \
+  '(.result.tools | map(select(.name == "claude_code"))[0].inputSchema) as $s |
+   ($s.additionalProperties == true) and
+   ($s.required == ["prompt"]) and
+   (($s.properties | keys | sort) == ["prompt","timeout_ms"]) and
+   ($s.properties.timeout_ms.minimum == 1)'
 
 # ---------- Gemini provider ----------
 test_tools_list "tools/list --provider gemini → gemini (300s default)" \
@@ -459,6 +521,699 @@ EOF
   else
     green "PASS: $label"
     PASS=$((PASS + 1))
+  fi
+
+  rm -rf "$tmpdir"
+}
+
+# ── Helper: fake Claude CLI for background-job contract tests. It captures ──
+# argv/cwd/stdin per process and emits deterministic stream-json, including
+# fragmented, malformed, and unknown frames that the bridge must safely ignore.
+write_claude_job_stub() {
+  cat >"$1/claude" <<'EOF'
+#!/usr/bin/env node
+const fs = require("fs");
+const path = require("path");
+
+const captureDir = process.env.MCP_STUB_CLAUDE_CAPTURE_DIR;
+const base = path.join(captureDir, String(process.pid));
+const argv = process.argv.slice(2);
+const streaming = argv.includes("stream-json");
+fs.appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${process.pid}\n`);
+fs.writeFileSync(`${base}.json`, JSON.stringify({
+  pid: process.pid,
+  argv,
+  cwd: process.cwd(),
+  streaming,
+}));
+
+let input = "";
+let prompt = "";
+let started = false;
+const timers = [];
+const later = (delay, fn) => timers.push(setTimeout(fn, delay));
+const appendSignal = (value) =>
+  fs.appendFileSync(`${base}.signals`, `${value}\n`);
+const emit = (value) =>
+  process.stdout.write(`${JSON.stringify(value)}\n`);
+const emitSplit = (value, onFlushed = () => {}) => {
+  const line = `${JSON.stringify(value)}\n`;
+  // Fragment only inside the ASCII JSON prefix. Splitting a JS string between
+  // UTF-16 surrogate halves would make the stub itself corrupt astral text.
+  const splitAt = Math.min(17, line.length - 1);
+  process.stdout.write(line.slice(0, splitAt));
+  later(8, () => process.stdout.write(line.slice(splitAt), onFlushed));
+};
+const promptText = (message) => {
+  const content = message?.message?.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part) => part?.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("");
+};
+const finishReview = () => {
+  if (started) return;
+  started = true;
+  if (prompt.startsWith("TIMEOUT") || prompt.startsWith("HANG")) {
+    emit({ type: "system", subtype: "init", session_id: `stub-${process.pid}` });
+    return;
+  }
+
+  later(5, () => emitSplit({
+    type: "system",
+    subtype: "init",
+    session_id: `stub-${process.pid}`,
+  }));
+  later(20, () => process.stdout.write("this is not json\n"));
+  later(25, () => emit({
+    type: "future_event",
+    prompt: "SENTINEL_PROMPT",
+    reasoning: "SENTINEL_REASONING",
+  }));
+  later(35, () => emit({
+    type: "assistant",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "SENTINEL_DRAFT" }],
+    },
+  }));
+  later(45, () => emit({
+    type: "stream_event",
+    event: {
+      type: "content_block_delta",
+      delta: { type: "text_delta", text: "SENTINEL_PARTIAL" },
+    },
+  }));
+  later(55, () => emit({
+    type: "tool_progress",
+    tool_name: "SENTINEL_TOOL",
+    command: "SENTINEL_COMMAND",
+    path: "/SENTINEL_PATH",
+    output: "SENTINEL_OUTPUT",
+    prompt: "SENTINEL_PROGRESS_PROMPT",
+  }));
+
+  let result = "CLAUDE_REVIEW_OK";
+  if (prompt.startsWith("PAGE")) result = "🚀".repeat(32_780);
+  if (prompt.startsWith("OVERSIZE")) {
+    result = "O".repeat((10 * 1024 * 1024) + 1_024);
+  }
+  if (prompt.startsWith("EMPTY_THEN_OK")) {
+    const attemptFile = path.join(captureDir, "empty-attempt-count");
+    let attempt = 0;
+    try { attempt = Number(fs.readFileSync(attemptFile, "utf8")); } catch {}
+    attempt += 1;
+    fs.writeFileSync(attemptFile, String(attempt));
+    result = attempt === 1 ? "" : "CLAUDE_RETRY_OK";
+  }
+  if (prompt.startsWith("PROVIDER_ERROR")) {
+    later(80, () => emitSplit(
+      {
+        type: "result",
+        subtype: "error",
+        is_error: true,
+        result: "SENTINEL_PROVIDER_ERROR",
+      },
+      () => later(10, () => process.exit(0)),
+    ));
+  } else {
+    later(80, () => emitSplit(
+      {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result,
+      },
+      () => later(10, () => process.exit(0)),
+    ));
+  }
+};
+
+process.on("SIGTERM", () => {
+  appendSignal("SIGTERM");
+  if (!prompt.startsWith("TIMEOUT")) process.exit(0);
+});
+process.on("SIGINT", () => {
+  appendSignal("SIGINT");
+  if (!prompt.startsWith("TIMEOUT")) process.exit(0);
+});
+
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  fs.appendFileSync(`${base}.stdin`, chunk);
+  input += chunk;
+  let newline;
+  while ((newline = input.indexOf("\n")) !== -1) {
+    const line = input.slice(0, newline);
+    input = input.slice(newline + 1);
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (message?.type === "user" && !started) {
+      prompt = promptText(message);
+      finishReview();
+    }
+    if (
+      message?.type === "control_request" &&
+      message?.request?.subtype === "interrupt"
+    ) {
+      appendSignal("CONTROL_INTERRUPT");
+      if (!prompt.startsWith("TIMEOUT")) later(10, () => process.exit(0));
+    }
+  }
+});
+process.stdin.on("end", () => {
+  if (streaming) return;
+  prompt = input;
+  emit({
+    type: "result",
+    subtype: "success",
+    is_error: false,
+    result: "LEGACY_CLAUDE_OK",
+  });
+  later(10, () => process.exit(0));
+});
+setInterval(() => {}, 1 << 30);
+EOF
+  chmod +x "$1/claude"
+}
+
+# Drives the Claude wrapper-owned background tools and emits one JSON summary.
+write_claude_job_driver() {
+  cat >"$1/claude-job-driver.mjs" <<'EOF'
+import { spawn } from "node:child_process";
+import {
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+} from "node:fs";
+
+const [stubDir, serverDir, scenario] = process.argv.slice(2);
+const captureDir = `${stubDir}/captures`;
+mkdirSync(captureDir, { recursive: true });
+const terminalStates = new Set(["completed", "failed", "canceled"]);
+const child = spawn("node", ["server.js", "--provider", "claude"], {
+  cwd: serverDir,
+  env: {
+    ...process.env,
+    PATH: `${stubDir}:${process.env.PATH}`,
+    MCP_STUB_CLAUDE_CAPTURE_DIR: captureDir,
+    MCP_AGENTS_TEST_CLAUDE_JOB_TIMEOUT_MS:
+      scenario === "timeout" ? "400" : "4000",
+    MCP_AGENTS_TEST_CLAUDE_JOB_RETENTION_MS:
+      scenario === "retention" ? "80" : "3600000",
+    MCP_AGENTS_TEST_CLAUDE_CANCEL_TERM_MS: "35",
+    MCP_AGENTS_TEST_CLAUDE_CANCEL_KILL_MS: "35",
+    MCP_AGENTS_TEST_CLAUDE_MAX_ACTIVE_JOBS:
+      scenario === "capacity" ? "2" : "8",
+    MCP_AGENTS_TEST_CLAUDE_MAX_RETAINED_JOBS:
+      scenario === "retained" ? "2" : "32",
+  },
+  stdio: ["pipe", "pipe", "pipe"],
+});
+
+let stdout = "";
+let stderr = "";
+let parseBuffer = "";
+let nextId = 2;
+let driverError;
+const frames = [];
+const pending = new Map();
+const data = {
+  starts: [],
+  statuses: [],
+  results: [],
+  cancels: [],
+  invalid: [],
+  pings: [],
+};
+
+child.stdin.on("error", () => {});
+child.stdout.setEncoding("utf8");
+child.stderr.setEncoding("utf8");
+child.stderr.on("data", (chunk) => { stderr += chunk; });
+const send = (message) => {
+  if (child.stdin.writable) {
+    child.stdin.write(`${JSON.stringify(message)}\n`);
+  }
+};
+const request = (method, params, id = nextId++) => new Promise((resolve, reject) => {
+  const timer = setTimeout(() => {
+    pending.delete(JSON.stringify(id));
+    reject(new Error(`request ${JSON.stringify(id)} timed out`));
+  }, 3_500);
+  pending.set(JSON.stringify(id), {
+    resolve: (frame) => {
+      clearTimeout(timer);
+      resolve(frame);
+    },
+  });
+  send({ jsonrpc: "2.0", id, method, params });
+});
+const callTool = (name, args, id, meta) => request(
+  "tools/call",
+  {
+    name,
+    arguments: args,
+    ...(meta ? { _meta: meta } : {}),
+  },
+  id,
+);
+const structured = (frame) => frame?.result?.structuredContent;
+const startJob = async (prompt) => {
+  const frame = await callTool("claude-start", { prompt, cwd: serverDir });
+  data.starts.push(frame);
+  const jobId = structured(frame)?.jobId;
+  if (typeof jobId !== "string" || !jobId) {
+    throw new Error(`claude-start did not return a jobId: ${JSON.stringify(frame)}`);
+  }
+  return { jobId, cursor: structured(frame).cursor ?? 0 };
+};
+const status = async (jobId, cursor, waitMs = 100) => {
+  const frame = await callTool(
+    "claude-status",
+    { jobId, cursor, wait_ms: waitMs },
+  );
+  data.statuses.push(frame);
+  return frame;
+};
+const statusUntilTerminal = async (jobId, initialCursor = 0) => {
+  let cursor = initialCursor;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const frame = await status(jobId, cursor, 120);
+    const value = structured(frame);
+    if (!value) throw new Error(`status missing structuredContent: ${JSON.stringify(frame)}`);
+    if (terminalStates.has(value.state)) return frame;
+    cursor = value.cursor;
+  }
+  throw new Error(`job ${jobId} did not become terminal`);
+};
+const result = async (jobId, offset = 0) => {
+  const frame = await callTool("claude-result", { jobId, offset });
+  data.results.push(frame);
+  return frame;
+};
+const cancel = async (jobId) => {
+  const frame = await callTool("claude-cancel", { jobId });
+  data.cancels.push(frame);
+  return frame;
+};
+const ping = async () => {
+  const frame = await callTool("ping", {});
+  data.pings.push(frame);
+  return frame;
+};
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const waitForCaptureCount = async (expected) => {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const count = readdirSync(captureDir)
+      .filter((name) => name.endsWith(".json"))
+      .length;
+    if (count >= expected) return;
+    await delay(20);
+  }
+  throw new Error(`expected ${expected} Claude captures`);
+};
+const capturedPidForPrompt = (expectedPrompt) => {
+  for (const name of readdirSync(captureDir).filter((item) => item.endsWith(".stdin"))) {
+    const base = `${captureDir}/${name.slice(0, -6)}`;
+    const raw = readFileSync(`${base}.stdin`, "utf8");
+    const matched = raw
+      .split("\n").filter(Boolean)
+      .flatMap((line) => {
+        try { return [JSON.parse(line)]; } catch { return []; }
+      })
+      .some((message) =>
+        message?.type === "user" &&
+        message?.message?.content === expectedPrompt
+      );
+    if (matched) return JSON.parse(readFileSync(`${base}.json`, "utf8")).pid;
+  }
+  return undefined;
+};
+const pidIsAlive = (pid) => {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+child.stdout.on("data", (chunk) => {
+  const text = chunk;
+  stdout += text;
+  parseBuffer += text;
+  let newline;
+  while ((newline = parseBuffer.indexOf("\n")) !== -1) {
+    const line = parseBuffer.slice(0, newline);
+    parseBuffer = parseBuffer.slice(newline + 1);
+    if (!line) continue;
+    let frame;
+    try {
+      frame = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    frames.push(frame);
+    const waiter = pending.get(JSON.stringify(frame.id));
+    if (waiter) {
+      pending.delete(JSON.stringify(frame.id));
+      waiter.resolve(frame);
+    }
+  }
+});
+
+const closed = new Promise((resolve) => {
+  child.once("close", (code, signal) => resolve({ code, signal }));
+});
+const hardStop = setTimeout(() => {
+  try { child.kill("SIGKILL"); } catch {}
+}, 7_000);
+
+try {
+  await request("initialize", {
+    protocolVersion: "2024-11-05",
+    capabilities: {},
+    clientInfo: { name: "claude-job-test", version: "0" },
+  }, 1);
+  send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+  if (scenario === "lifecycle") {
+    const job = await startJob("NORMAL");
+    const immediate = await status(job.jobId, 0, 0);
+    const terminal = await statusUntilTerminal(
+      job.jobId,
+      structured(immediate)?.cursor ?? job.cursor,
+    );
+    data.futureCursor = await status(
+      job.jobId,
+      (structured(terminal)?.cursor ?? 0) + 1,
+      0,
+    );
+    await result(job.jobId);
+    await ping();
+    data.lifecycleJobId = job.jobId;
+    data.lifecycleTerminal = terminal;
+  } else if (scenario === "legacy") {
+    data.legacy = await callTool("claude_code", {
+      prompt: "LEGACY",
+      timeout_ms: 2_000,
+      model: "ignored-for-compatibility",
+    });
+    await ping();
+  } else if (scenario === "invalid") {
+    data.invalid.push(await callTool("claude-start", {
+      prompt: "NORMAL",
+      cwd: "relative/path",
+    }));
+    data.invalid.push(await callTool("claude-start", {
+      prompt: "NORMAL",
+      cwd: serverDir,
+      timeout_ms: 1,
+    }));
+    data.invalid.push(await callTool("claude-status", {
+      jobId: "missing-cursor",
+    }));
+    data.invalid.push(await callTool("claude-status", {
+      jobId: "invalid-wait",
+      cursor: 0,
+      wait_ms: 60_001,
+    }));
+    await ping();
+  } else if (scenario === "cancel") {
+    const hanging = await startJob("HANG");
+    const sibling = await startJob("NORMAL SIBLING");
+    let running = await status(hanging.jobId, 0, 120);
+    if ((structured(running)?.cursor ?? 0) === 0) {
+      running = await status(hanging.jobId, 0, 120);
+    }
+    const waitCursor = structured(running)?.cursor ?? 0;
+    const waiterId = "cancel-only-the-waiter";
+    data.waiterId = waiterId;
+    callTool(
+      "claude-status",
+      { jobId: hanging.jobId, cursor: waitCursor, wait_ms: 1_000 },
+      waiterId,
+    ).then((frame) => { data.waiterFrame = frame; }).catch(() => {});
+    await delay(30);
+    send({
+      jsonrpc: "2.0",
+      method: "notifications/cancelled",
+      params: { requestId: waiterId, reason: "test waiter cancellation" },
+    });
+    // The MCP SDK may either deliver the handler's prompt abort result or
+    // suppress the canceled request's response. Snapshot whichever observable
+    // outcome occurred before the explicit job cancellation below.
+    await delay(100);
+    data.waiterFrameBeforeJobCancel = data.waiterFrame;
+    data.afterWaiterCancel = await status(hanging.jobId, waitCursor, 0);
+    const firstCancel = await cancel(hanging.jobId);
+    data.hangingTerminal = await statusUntilTerminal(
+      hanging.jobId,
+      structured(firstCancel)?.cursor ?? waitCursor,
+    );
+    data.hangingPid = capturedPidForPrompt("HANG");
+    data.hangingAliveAfterTerminal = pidIsAlive(data.hangingPid);
+    data.secondCancel = await cancel(hanging.jobId);
+    data.siblingTerminal = await statusUntilTerminal(
+      sibling.jobId,
+      sibling.cursor,
+    );
+    await result(sibling.jobId);
+    await ping();
+    data.hangingJobId = hanging.jobId;
+    data.siblingJobId = sibling.jobId;
+  } else if (scenario === "timeout") {
+    const timedOut = await startJob("TIMEOUT");
+    data.timeoutTerminal = await statusUntilTerminal(
+      timedOut.jobId,
+      timedOut.cursor,
+    );
+    data.timeoutPid = capturedPidForPrompt("TIMEOUT");
+    data.timeoutAliveAfterTerminal = pidIsAlive(data.timeoutPid);
+    const followup = await startJob("NORMAL AFTER TIMEOUT");
+    data.followupTerminal = await statusUntilTerminal(
+      followup.jobId,
+      followup.cursor,
+    );
+    await result(followup.jobId);
+    await ping();
+  } else if (scenario === "retry") {
+    const job = await startJob("EMPTY_THEN_OK");
+    data.retryTerminal = await statusUntilTerminal(job.jobId, job.cursor);
+    data.retryResult = await result(job.jobId);
+  } else if (scenario === "provider-error") {
+    const job = await startJob("PROVIDER_ERROR");
+    data.providerErrorTerminal = await statusUntilTerminal(
+      job.jobId,
+      job.cursor,
+    );
+    data.providerErrorResult = await result(job.jobId);
+    await ping();
+  } else if (scenario === "progress") {
+    const job = await startJob("HANG PROGRESS");
+    data.progressStatus = await callTool(
+      "claude-status",
+      { jobId: job.jobId, cursor: 0, wait_ms: 500 },
+      undefined,
+      { progressToken: "claude-progress-token" },
+    );
+    data.progressHeartbeat = await callTool(
+      "claude-status",
+      {
+        jobId: job.jobId,
+        cursor: structured(data.progressStatus)?.cursor ?? 0,
+        wait_ms: 30,
+      },
+      undefined,
+      { progressToken: "claude-progress-token" },
+    );
+    await cancel(job.jobId);
+    data.progressTerminal = await statusUntilTerminal(
+      job.jobId,
+      structured(data.cancels.at(-1))?.cursor ?? 0,
+    );
+  } else if (scenario === "disconnect") {
+    const job = await startJob("HANG DISCONNECT");
+    data.disconnectStatus = await status(job.jobId, 0, 500);
+  } else if (scenario === "paging") {
+    const job = await startJob("PAGE");
+    await statusUntilTerminal(job.jobId, job.cursor);
+    const first = await result(job.jobId, 0);
+    const second = await result(
+      job.jobId,
+      structured(first)?.nextOffset ?? 0,
+    );
+    data.pageFirst = first;
+    data.pageSecond = second;
+  } else if (scenario === "oversize") {
+    const job = await startJob("OVERSIZE");
+    data.oversizeTerminal = await statusUntilTerminal(job.jobId, job.cursor);
+    data.oversizeResult = await result(job.jobId);
+    await ping();
+  } else if (scenario === "retention") {
+    const job = await startJob("NORMAL RETENTION");
+    await statusUntilTerminal(job.jobId, job.cursor);
+    await result(job.jobId);
+    await delay(140);
+    data.expired = await status(job.jobId, 0, 0);
+    await ping();
+  } else if (scenario === "capacity") {
+    const first = await startJob("HANG A");
+    const second = await startJob("HANG B");
+    await waitForCaptureCount(2);
+    data.capacityRejected = await callTool("claude-start", {
+      prompt: "HANG C",
+      cwd: serverDir,
+    });
+    await cancel(first.jobId);
+    await cancel(second.jobId);
+    await statusUntilTerminal(
+      first.jobId,
+      structured(data.cancels[0])?.cursor ?? first.cursor,
+    );
+    await statusUntilTerminal(
+      second.jobId,
+      structured(data.cancels[1])?.cursor ?? second.cursor,
+    );
+    await ping();
+  } else if (scenario === "retained") {
+    const first = await startJob("NORMAL RETAINED ONE");
+    await statusUntilTerminal(first.jobId, first.cursor);
+    await result(first.jobId);
+    const second = await startJob("NORMAL RETAINED TWO");
+    await statusUntilTerminal(second.jobId, second.cursor);
+    await result(second.jobId);
+    const third = await startJob("NORMAL RETAINED THREE");
+    data.stillRetained = await status(second.jobId, 0, 0);
+    data.evicted = await status(first.jobId, 0, 0);
+    await statusUntilTerminal(third.jobId, third.cursor);
+    await result(third.jobId);
+  } else {
+    throw new Error(`unknown scenario ${scenario}`);
+  }
+} catch (error) {
+  driverError = error instanceof Error ? error.message : String(error);
+} finally {
+  await delay(50);
+  try { child.stdin.end(); } catch {}
+}
+
+const closeInfo = await closed;
+clearTimeout(hardStop);
+const captures = readdirSync(captureDir)
+  .filter((name) => name.endsWith(".json"))
+  .sort()
+  .map((name) => {
+    const base = `${captureDir}/${name.slice(0, -5)}`;
+    const meta = JSON.parse(readFileSync(`${base}.json`, "utf8"));
+    let rawStdin = "";
+    let signals = [];
+    try { rawStdin = readFileSync(`${base}.stdin`, "utf8"); } catch {}
+    try {
+      signals = readFileSync(`${base}.signals`, "utf8")
+        .split("\n").filter(Boolean);
+    } catch {}
+    const stdinParsed = rawStdin
+      .split("\n")
+      .filter(Boolean)
+      .flatMap((line) => {
+        try { return [JSON.parse(line)]; } catch { return []; }
+      });
+    let alive = false;
+    try {
+      process.kill(meta.pid, 0);
+      alive = true;
+    } catch {}
+    return { meta, rawStdin, stdinParsed, signals, alive };
+  });
+
+if (scenario === "paging") {
+  const pageMetrics = (frame) => {
+    const contentText = frame?.result?.content?.[0]?.text ?? "";
+    const structuredText = frame?.result?.structuredContent?.text ?? "";
+    return {
+      contentCodePoints: Array.from(contentText).length,
+      structuredCodePoints: Array.from(structuredText).length,
+      equal: contentText === structuredText,
+      allRocket: Array.from(contentText).every((char) => char === "🚀"),
+      offset: frame?.result?.structuredContent?.offset,
+      nextOffset: frame?.result?.structuredContent?.nextOffset,
+      endOffset: frame?.result?.structuredContent?.endOffset,
+      done: frame?.result?.structuredContent?.done,
+    };
+  };
+  data.pageMetrics = [
+    pageMetrics(data.pageFirst),
+    pageMetrics(data.pageSecond),
+  ];
+  for (const frame of frames) {
+    const content = frame?.result?.content?.[0];
+    if (typeof content?.text === "string" && content.text.length > 1_000) {
+      content.text = `[omitted ${Array.from(content.text).length} code points]`;
+    }
+    const resultText = frame?.result?.structuredContent;
+    if (typeof resultText?.text === "string" && resultText.text.length > 1_000) {
+      resultText.text =
+        `[omitted ${Array.from(resultText.text).length} code points]`;
+    }
+  }
+}
+
+process.stdout.write(`${JSON.stringify({
+  scenario,
+  driverError,
+  closeInfo,
+  frames,
+  captures,
+  data,
+  stderr,
+  rawParseTail: parseBuffer,
+})}\n`);
+EOF
+}
+
+test_claude_job() {
+  local label="$1"
+  local scenario="$2"
+  local predicate="$3"
+  local tmpdir
+  local status
+  local summary
+  local ok=1
+
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  write_claude_job_stub "$tmpdir"
+  write_claude_job_driver "$tmpdir"
+
+  set +e
+  summary=$(
+    $TIMEOUT_CMD 9 node "$tmpdir/claude-job-driver.mjs" \
+      "$tmpdir" "$(pwd)" "$scenario" 2>/dev/null
+  )
+  status=$?
+  set -e
+
+  [ "$status" -eq 0 ] || ok=0
+  printf '%s' "$summary" | jq -e \
+    "(.driverError == null) and (.closeInfo.code == 0) and ($predicate)" \
+    >/dev/null 2>&1 || ok=0
+
+  if [ "$ok" -eq 1 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (status=$status)"
+    echo "  Summary: ${summary:0:12000}"
+    FAIL=$((FAIL + 1))
   fi
 
   rm -rf "$tmpdir"
@@ -2138,6 +2893,287 @@ test_no_registered_child_leaks() {
 }
 
 test_provider_shutdown_kills_child "stdin shutdown kills detached claude child"
+
+# Stub-based Claude one-shot review tests (fast — no real Claude needed).
+test_claude_job \
+  "Claude background review isolates the leaf CLI and parses fragmented stream-json" \
+  "lifecycle" \
+  'def arg_after($argv; $flag):
+     $argv[(($argv | index($flag)) + 1)];
+   (.captures | length == 1) and
+   (.captures[0] as $capture |
+     ($capture.meta.cwd == "'"$(pwd)"'") and
+     ($capture.meta.streaming == true) and
+     (arg_after($capture.meta.argv; "--model") == "claude-opus-4-8") and
+     (arg_after($capture.meta.argv; "--effort") == "xhigh") and
+     (arg_after($capture.meta.argv; "--input-format") == "stream-json") and
+     (arg_after($capture.meta.argv; "--output-format") == "stream-json") and
+     (arg_after($capture.meta.argv; "--setting-sources") == "project") and
+     (arg_after($capture.meta.argv; "--permission-mode") == "plan") and
+     (arg_after($capture.meta.argv; "--tools") == "Bash,Glob,Grep,Read") and
+     ((arg_after($capture.meta.argv; "--settings") | fromjson) ==
+       {"disableAllHooks":true,"disableAgentView":true,"disableArtifact":true}) and
+     (arg_after($capture.meta.argv; "--append-system-prompt") |
+       (contains("leaf, read-only code reviewer") and
+        contains("do not delegate") and
+        contains("do not") and
+        contains("run tests"))) and
+     ($capture.meta.argv | index("--no-session-persistence") != null) and
+     ($capture.meta.argv | index("--verbose") != null) and
+     ($capture.meta.argv | index("--disable-slash-commands") != null) and
+     ($capture.meta.argv | index("--strict-mcp-config") != null) and
+     ($capture.meta.argv | index("--include-partial-messages") == null) and
+     ($capture.meta.argv | index("--mcp-config") == null) and
+     ($capture.meta.argv | index("--dangerously-skip-permissions") == null) and
+     ([$capture.stdinParsed[] |
+       select(.type == "user" and
+         .message == {"role":"user","content":"NORMAL"})] | length == 1)) and
+   (.data.starts[0].result.structuredContent |
+     (.jobId | type == "string") and
+     (.state == "starting") and
+     (.cursor == 0) and
+     (.resultAvailable == false) and
+     (.next.tool == "claude-status")) and
+   ([.data.statuses[].result.structuredContent.state] |
+     (index("running") != null) and (index("completed") != null)) and
+   ([.data.statuses[].result.structuredContent.cursor |
+      select(type == "number")] as $cursors |
+     ($cursors == ($cursors | sort)) and
+     (($cursors | max) >= 3)) and
+   (.data.lifecycleTerminal.result.structuredContent |
+     (.state == "completed") and
+     (.resultAvailable == true) and
+     (.next.tool == "claude-result")) and
+   (.data.futureCursor.result |
+     (.isError == true) and
+     (.structuredContent.code == "status_cursor_ahead")) and
+   (.data.results[0].result |
+     (.isError != true) and
+     (.content[0].text == "CLAUDE_REVIEW_OK") and
+     (.structuredContent.text == "CLAUDE_REVIEW_OK") and
+     (.structuredContent.offset == 0) and
+     (.structuredContent.nextOffset == 16) and
+     (.structuredContent.endOffset == 16) and
+     (.structuredContent.done == true)) and
+   (.data.pings[-1].result.content[0].text == "pong") and
+   ((.frames | tostring) | contains("SENTINEL_") | not) and
+   (.stderr | contains("[mcp-agents] Claude job started")) and
+   (.stderr | contains("[mcp-agents] Claude job terminal")) and
+   (.stderr | contains("SENTINEL_") | not) and
+   (.stderr | contains("NORMAL") | not)'
+
+test_claude_job \
+  "legacy claude_code remains blocking and keeps its response shape" \
+  "legacy" \
+  'def arg_after($argv; $flag):
+     $argv[(($argv | index($flag)) + 1)];
+   (.captures | length == 1) and
+   (.captures[0] as $capture |
+     ($capture.meta.streaming == false) and
+     ($capture.rawStdin == "LEGACY") and
+     (arg_after($capture.meta.argv; "--model") == "claude-opus-4-8") and
+     (arg_after($capture.meta.argv; "--effort") == "xhigh") and
+     (arg_after($capture.meta.argv; "--output-format") == "json") and
+     ($capture.meta.argv | index("--no-session-persistence") != null) and
+     ($capture.meta.argv | index("--input-format") == null)) and
+   (.data.legacy.result |
+     (.isError != true) and
+     (.content == [{"type":"text","text":"LEGACY_CLAUDE_OK"}])) and
+   (.data.pings[-1].result.content[0].text == "pong")'
+
+test_claude_job \
+  "Claude jobs reject relative cwd, caller timeout, and malformed polling locally" \
+  "invalid" \
+  '(.captures | length == 0) and
+   (.data.invalid | length == 4) and
+   (.data.invalid | all(
+     (.result.isError == true) and
+     (.result.structuredContent.code == "invalid_arguments"))) and
+   ([.data.invalid[].result.structuredContent.issues[].argument] |
+     (index("cwd") != null) and
+     (index("timeout_ms") != null) and
+     (index("cursor") != null) and
+     (index("wait_ms") != null)) and
+   (.data.pings[-1].result.content[0].text == "pong")'
+
+test_claude_job \
+  "canceling a status waiter leaves its Claude job alive and its sibling completes" \
+  "cancel" \
+  '([.captures[] |
+      select(any(.stdinParsed[];
+        .type == "user" and .message.content == "HANG"))] | length == 1) and
+   ([.captures[] |
+      select(any(.stdinParsed[];
+        .type == "user" and .message.content == "HANG"))][0] as $hanging |
+     ([$hanging.stdinParsed[] |
+       select(.type == "control_request" and
+         .request.subtype == "interrupt")] | length == 1) and
+     ($hanging.signals | index("CONTROL_INTERRUPT") != null)) and
+   ((.data.waiterFrameBeforeJobCancel == null) or
+     (.data.waiterFrameBeforeJobCancel.result.structuredContent.state == "running")) and
+   (.data.afterWaiterCancel.result.structuredContent |
+     (.state == "running") and (.resultAvailable == false)) and
+   (.data.hangingTerminal.result.structuredContent.state == "canceled") and
+   (.data.hangingPid | type == "number") and
+   (.data.hangingAliveAfterTerminal == false) and
+   (. as $root |
+     .data.secondCancel.result |
+       (.isError != true) and
+       (.structuredContent.state == "canceled") and
+       (.structuredContent.cursor ==
+         $root.data.hangingTerminal.result.structuredContent.cursor)) and
+   (.data.siblingTerminal.result.structuredContent.state == "completed") and
+   ([.data.results[] |
+     select(.result.structuredContent.text == "CLAUDE_REVIEW_OK")] | length == 1) and
+   (.data.pings[-1].result.content[0].text == "pong")'
+
+test_claude_job \
+  "one Claude timeout fails only that job and the server handles a follow-up review" \
+  "timeout" \
+  '([.captures[] |
+      select(any(.stdinParsed[];
+        .type == "user" and .message.content == "TIMEOUT"))] | length == 1) and
+   ([.captures[] |
+      select(any(.stdinParsed[];
+        .type == "user" and .message.content == "TIMEOUT"))][0] as $timed |
+     ($timed.signals | index("CONTROL_INTERRUPT") != null) and
+     ($timed.signals | index("SIGTERM") != null)) and
+   (.data.timeoutTerminal.result.structuredContent |
+     (.state == "failed") and
+     (.message | ascii_downcase | contains("timed out"))) and
+   (.data.timeoutPid | type == "number") and
+   (.data.timeoutAliveAfterTerminal == false) and
+   (.data.followupTerminal.result.structuredContent.state == "completed") and
+   ([.data.results[] |
+     select(.result.structuredContent.text == "CLAUDE_REVIEW_OK")] | length == 1) and
+   (.data.pings[-1].result.content[0].text == "pong")'
+
+test_claude_job \
+  "Claude retries one empty terminal result inside the same job and then succeeds" \
+  "retry" \
+  '(.data.starts | length == 1) and
+   (.captures | length == 2) and
+   ([.captures[].stdinParsed[] |
+     select(.type == "user" and
+       .message.content == "EMPTY_THEN_OK")] | length == 2) and
+   (.data.retryTerminal.result.structuredContent.jobId ==
+     .data.starts[0].result.structuredContent.jobId) and
+   (.data.retryTerminal.result.structuredContent.state == "completed") and
+   (.data.retryResult.result |
+     (.isError != true) and
+     (.content[0].text == "CLAUDE_RETRY_OK") and
+     (.structuredContent.text == "CLAUDE_RETRY_OK") and
+     (.structuredContent.done == true)) and
+   ([.data.statuses[].result.structuredContent.message |
+     select(contains("retrying after an empty result"))] | length == 1)'
+
+test_claude_job \
+  "Claude provider errors become generic failures without leaking provider payloads" \
+  "provider-error" \
+  '(.captures | length == 1) and
+   (.data.providerErrorTerminal.result.structuredContent |
+     (.state == "failed") and
+     (.message == "Claude: provider returned an error")) and
+   (.data.providerErrorResult.result |
+     (.isError == true) and
+     (.structuredContent.state == "failed") and
+     (.structuredContent.resultAvailable == false)) and
+   ((.frames | tostring) | contains("SENTINEL_PROVIDER_ERROR") | not) and
+   (.stderr | contains("SENTINEL_PROVIDER_ERROR") | not) and
+   (.data.pings[-1].result.content[0].text == "pong")'
+
+test_claude_job \
+  "Claude status progress uses the supplied token and exposes only sanitized phase text" \
+  "progress" \
+  '([.frames[] |
+      select(.method == "notifications/progress")] as $progress |
+     ($progress | length == 2) and
+     ($progress[1].params.progress > $progress[0].params.progress) and
+     ($progress | all(
+       (.params.progressToken == "claude-progress-token") and
+       (.params.progress | type == "number") and
+       (.params.message | startswith("Claude: ")) and
+       (.params.message | contains("SENTINEL") | not)))) and
+   (.data.progressStatus.result.structuredContent.state == "running") and
+   (.data.progressTerminal.result.structuredContent.state == "canceled")'
+
+test_claude_job \
+  "disconnecting with a live Claude job interrupts and reaps its process" \
+  "disconnect" \
+  '(.captures | length == 1) and
+   (.data.disconnectStatus.result.structuredContent.state == "running") and
+   (.captures[0] |
+     (.alive == false) and
+     (.signals | index("CONTROL_INTERRUPT") != null) and
+     ([.stdinParsed[] |
+       select(.type == "control_request" and
+         .request.subtype == "interrupt")] | length == 1))'
+
+test_claude_job \
+  "Claude results page by Unicode code point without splitting astral text" \
+  "paging" \
+  '(.data.pageMetrics ==
+     [{"contentCodePoints":32768,
+       "structuredCodePoints":32768,
+       "equal":true,
+       "allRocket":true,
+       "offset":0,
+       "nextOffset":32768,
+       "endOffset":32780,
+       "done":false},
+      {"contentCodePoints":12,
+       "structuredCodePoints":12,
+       "equal":true,
+       "allRocket":true,
+       "offset":32768,
+       "nextOffset":32780,
+       "endOffset":32780,
+       "done":true}])'
+
+test_claude_job \
+  "Claude rejects an atomic result over 10 MiB without leaking it through MCP" \
+  "oversize" \
+  '(.data.oversizeTerminal.result.structuredContent |
+     (.state == "failed") and
+     (.message | contains("10 MiB"))) and
+   (.data.oversizeResult.result |
+     (.isError == true) and
+     (.structuredContent.state == "failed") and
+     (.structuredContent.resultAvailable == false)) and
+   ((.frames | tostring | length) < 100000) and
+   (.data.pings[-1].result.content[0].text == "pong")'
+
+test_claude_job \
+  "Claude terminal jobs expire from connection-local retention" \
+  "retention" \
+  '(.data.expired.result |
+     (.isError == true) and
+     (.structuredContent.code == "job_not_found")) and
+   (.data.pings[-1].result.content[0].text == "pong")'
+
+test_claude_job \
+  "Claude active-job capacity rejects excess work without spawning it" \
+  "capacity" \
+  '(.captures | length == 2) and
+   (.data.capacityRejected.result |
+     (.isError == true) and
+     (.structuredContent.code == "job_capacity_full") and
+     (.structuredContent.activeJobs == 2) and
+     (.structuredContent.maxActiveJobs == 2)) and
+   ([.data.statuses[].result.structuredContent.state |
+     select(. == "canceled")] | length >= 2) and
+   (.data.pings[-1].result.content[0].text == "pong")'
+
+test_claude_job \
+  "Claude retained-job capacity evicts collected terminal results at the bound" \
+  "retained" \
+  '(.captures | length == 3) and
+   (.data.evicted.result |
+     (.isError == true) and
+     (.structuredContent.code == "job_not_found")) and
+   (.data.stillRetained.result.structuredContent.state == "completed") and
+   ([.data.results[].result.structuredContent |
+     select(.state == "completed" and .done == true)] | length == 3)'
 
 # Stub-based strict Codex contract tests (fast — no real Codex needed).
 test_codex_bridge_config \

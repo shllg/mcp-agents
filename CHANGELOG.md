@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.23.0] - 2026-07-24
+
+### Added
+
+- Add `claude-start`, `claude-status`, `claude-result`, and `claude-cancel` for
+  reliable one-shot Claude reviews. Jobs return immediately, expose bounded
+  cursor-based status polling, retain paged final results, and use a
+  bridge-owned two-hour deadline instead of holding one MCP call open for the
+  entire review. The blocking `claude_code` contract remains available for
+  short prompts.
+
+### Changed
+
+- Emit strictly increasing MCP progress values and content-free Claude job
+  start/terminal lifecycle logs for operational visibility.
+
+### Security
+
+- Run background Claude reviews as fixed Opus 4.8/xhigh leaf sessions with
+  project context but no hooks, subagents, skills, slash commands, external MCP
+  servers, mutation tools, or caller-controlled model/effort/timeout. Only
+  sanitized phase status crosses MCP before the final verdict; prompts are
+  never echoed in progress or bridge logs, and drafts, reasoning, tool
+  inputs/results, provider errors, and diagnostics stay private.
+
 ## [0.22.0] - 2026-07-24
 
 ### Added
