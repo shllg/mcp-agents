@@ -60,6 +60,17 @@ const DEFAULT_CODEX_CANCEL_GRACE_MS = 30_000;
 // must never fire for legitimate slow-frame delivery, only a genuine wedge.
 const DEFAULT_CODEX_FLUSH_STALL_MS = 60_000;
 const DEFAULT_CODEX_PROGRESS_INTERVAL_MS = 1_000;
+// Cadence of a background job's status CURSOR — deliberately far coarser than the
+// progress-notification interval above. Notifications are a free UI stream, but every
+// cursor bump wakes a codex-status long-poll, and each wake costs the polling agent a
+// whole model turn over its accumulated transcript. At the 1s progress cadence an
+// active job woke a poller ~1x/second, so `wait_ms` never engaged (a status call
+// returns immediately whenever the cursor is behind the head) and a 40-minute build
+// cost hundreds of poll turns. Terminal transitions bypass this entirely, so a longer
+// interval never delays completion.
+const DEFAULT_CODEX_STATUS_INTERVAL_MS = 30_000;
+// Largest delay setTimeout can represent; Node clamps anything larger to 1ms.
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const DEFAULT_CODEX_WAIT_INTERVAL_MS = 10_000;
 const MAX_CODEX_STATUS_WAIT_MS = 60_000;
 const MAX_CODEX_PROGRESS_CODEPOINTS = 200;
@@ -321,6 +332,16 @@ Options:
                                  cancellation before the bridge abandons the
                                  request (the bridge stays connected)
                                  [default: ${DEFAULT_CODEX_CANCEL_GRACE_MS / 1000}]
+  --codex_status_interval <secs> How often a background job's status cursor may
+                                 advance, and the default idle wait of a
+                                 codex-status poll. Each advance wakes a poll and
+                                 costs the polling agent a model turn; lifecycle
+                                 transitions (first running, cancel, terminal)
+                                 bypass it, so a larger value never delays
+                                 completion. Above ${MAX_CODEX_STATUS_WAIT_MS / 1000} a caught-up poller is
+                                 still woken by the ${MAX_CODEX_STATUS_WAIT_MS / 1000}s heartbeat ceiling, so
+                                 only the status text goes stale. 0 = every change
+                                 [default: ${DEFAULT_CODEX_STATUS_INTERVAL_MS / 1000}]
   --timeout <seconds>            Default timeout per call
                                  [default: codex ${DEFAULT_CODEX_TIMEOUT_MS / 1000}, claude ${DEFAULT_CLAUDE_TIMEOUT_MS / 1000}, gemini ${DEFAULT_TIMEOUT_MS / 1000}]
   --help, -h                     Show this help message
@@ -331,8 +352,9 @@ Options:
  * Parse CLI flags from process.argv.
  * Handles --help, --version, --provider, --model, --model_reasoning_effort,
  * --sandbox_mode, --approval_policy, --codex-workspace-network, --goal,
- * --codex_idle_timeout, --codex_cancel_grace, and unknown flags.
- * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, codexWorkspaceNetworkAccess?: boolean, goal?: string, codexIdleTimeoutMs?: number, codexCancelGraceMs?: number, defaultTimeoutMs?: number }}
+ * --codex_idle_timeout, --codex_cancel_grace, --codex_status_interval, --timeout,
+ * and unknown flags.
+ * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, codexWorkspaceNetworkAccess?: boolean, goal?: string, codexIdleTimeoutMs?: number, codexCancelGraceMs?: number, codexStatusIntervalMs?: number, defaultTimeoutMs?: number }}
  */
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -345,6 +367,7 @@ function parseArgs() {
   let goal;
   let codexIdleTimeoutMs;
   let codexCancelGraceMs;
+  let codexStatusIntervalMs;
   let defaultTimeoutMs;
 
   for (let i = 0; i < args.length; i++) {
@@ -453,6 +476,21 @@ function parseArgs() {
         codexCancelGraceMs = Math.round(secs * 1000);
         break;
       }
+      case "--codex_status_interval": {
+        if (i + 1 >= args.length) {
+          process.stderr.write("error: --codex_status_interval requires a value\n");
+          process.exit(1);
+        }
+        const secs = Number(args[++i]);
+        if (!Number.isFinite(secs) || secs < 0) {
+          process.stderr.write(
+            "error: --codex_status_interval must be a non-negative number\n",
+          );
+          process.exit(1);
+        }
+        codexStatusIntervalMs = Math.round(secs * 1000);
+        break;
+      }
       case "--timeout": {
         if (i + 1 >= args.length) {
           process.stderr.write("error: --timeout requires a value\n");
@@ -482,6 +520,7 @@ function parseArgs() {
     goal,
     codexIdleTimeoutMs,
     codexCancelGraceMs,
+    codexStatusIntervalMs,
     defaultTimeoutMs,
   };
 }
@@ -2153,7 +2192,16 @@ function codexToolPresentation(toolName) {
       description:
         "Start an optional background Codex job (same arguments as codex, including " +
         "allow_subagents). This returns immediately; call codex-status with the " +
-        "returned job ID and cursor until the job is terminal.",
+        "returned job ID and cursor until the job is terminal. PREFER THE BLOCKING " +
+        "`codex` TOOL, including for long builds: it costs one call instead of one " +
+        "model turn per status change, emits progress notifications whenever the " +
+        "caller supplied a progress token (a job never can — its request carries " +
+        "none), and is canceled by aborting the turn. Use this when the job must OUTLIVE the " +
+        "caller (it keeps running after you stop waiting, or another agent must be " +
+        "able to cancel it later by job ID), or when your client does not render " +
+        "progress notifications and you need status as ordinary tool results. Note a " +
+        "terminal status is evidence, not proof: `canceled` is also recorded when Codex " +
+        "never acknowledged, so inspect the workspace before reusing it.",
     };
   }
   if (toolName === "codex-reply-start") {
@@ -2162,14 +2210,20 @@ function codexToolPresentation(toolName) {
       ...presentation,
       description:
         "Start an optional background reply on an existing Codex thread. This returns " +
-        "immediately; call codex-status until the job is terminal.",
+        "immediately; call codex-status until the job is terminal. PREFER THE BLOCKING " +
+        "`codex-reply` TOOL unless the job must OUTLIVE the caller (see codex-start).",
     };
   }
   if (toolName === "codex-status") {
     return {
       description:
         "Poll a background Codex job. At the current cursor this waits for new status " +
-        "or a heartbeat, producing an ordinary transcript-visible tool result.",
+        "or a heartbeat, producing an ordinary transcript-visible tool result. Two " +
+        "things end the wait: a cursor advance, paced server-side by " +
+        "--codex_status_interval, and the wait_ms heartbeat. A call returns IMMEDIATELY " +
+        "whenever the cursor is already behind the head, so wait_ms cannot slow a " +
+        "poller that is behind — but it does bound how often a caught-up poller is " +
+        "re-woken, so leave it at the default or raise it rather than lowering it.",
       inputSchema: {
         type: "object",
         properties: {
@@ -2183,7 +2237,12 @@ function codexToolPresentation(toolName) {
             type: "integer",
             minimum: 0,
             maximum: MAX_CODEX_STATUS_WAIT_MS,
-            description: "Long-poll duration in milliseconds; defaults to 10000.",
+            description:
+              "Maximum idle wait in milliseconds. Omitted, it tracks the server's status " +
+              "interval, capped at the 60s maximum — so an interval above 60s still " +
+              "heartbeats every 60s — and is 10000 when pacing is disabled. A ceiling " +
+              "on idle waiting, not a floor on poll spacing: a call still returns at " +
+              "once when the cursor is behind.",
           },
         },
         required: [...CODEX_JOB_TOOL_CONTRACTS[toolName].required],
@@ -2443,7 +2502,7 @@ function rewriteCodexToolsListMessage(msg) {
  * Per-request idle and hard deadlines convert unbounded Codex stalls into
  * surfaced JSON-RPC errors. Correlated events also provide client-visible MCP
  * progress and enough terminal metadata to recover a missing final response.
- * @param {{ model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, workspaceNetworkAccess?: boolean, idleTimeoutMs?: number, cancelGraceOverrideMs?: number, hardTimeoutMs?: number, goal?: string }} opts
+ * @param {{ model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, workspaceNetworkAccess?: boolean, idleTimeoutMs?: number, cancelGraceOverrideMs?: number, statusIntervalOverrideMs?: number, hardTimeoutMs?: number, goal?: string }} opts
  */
 function runCodexPassthrough({
   model,
@@ -2453,6 +2512,7 @@ function runCodexPassthrough({
   workspaceNetworkAccess,
   idleTimeoutMs,
   cancelGraceOverrideMs,
+  statusIntervalOverrideMs,
   hardTimeoutMs,
   goal,
 }) {
@@ -2488,6 +2548,16 @@ function runCodexPassthrough({
   const progressIntervalMs = testTunableMs(
     "MCP_AGENTS_CODEX_PROGRESS_INTERVAL_MS",
     DEFAULT_CODEX_PROGRESS_INTERVAL_MS,
+  );
+  // CLI flag wins over the env tunable, which wins over the default. Clamped to the
+  // largest delay setTimeout represents: Node silently fires anything above it after
+  // 1ms, which would invert this knob into a cursor bump per event.
+  const statusIntervalMs = Math.min(
+    MAX_TIMER_DELAY_MS,
+    statusIntervalOverrideMs ?? testTunableMs(
+      "MCP_AGENTS_CODEX_STATUS_INTERVAL_MS",
+      DEFAULT_CODEX_STATUS_INTERVAL_MS,
+    ),
   );
   const waitIntervalMs = testTunableMs(
     "MCP_AGENTS_CODEX_WAIT_INTERVAL_MS",
@@ -3068,7 +3138,7 @@ function runCodexPassthrough({
     const elapsed = job.lastStatusAt == null
       ? Number.POSITIVE_INFINITY
       : Date.now() - job.lastStatusAt;
-    if (elapsed >= progressIntervalMs) {
+    if (elapsed >= statusIntervalMs) {
       setJobStatusNow(job, formatted.slice("Codex: ".length), { state: "running" });
       return;
     }
@@ -3076,7 +3146,7 @@ function runCodexPassthrough({
     if (!job.statusTimer) {
       job.statusTimer = setTimeout(
         () => flushPendingJobStatus(job),
-        Math.max(1, progressIntervalMs - elapsed),
+        Math.max(1, statusIntervalMs - elapsed),
       );
     }
   };
@@ -3546,7 +3616,14 @@ function runCodexPassthrough({
         queueJobStatusResponse(entry, job);
         return true;
       }
-      const waitMs = args.wait_ms ?? DEFAULT_CODEX_WAIT_INTERVAL_MS;
+      // Pacing the cursor alone does not bound wakeups: a caught-up poller is still
+      // re-woken by the heartbeat every wait_ms. Default that wait to the status
+      // cadence so a heartbeat never out-paces the cursor it reports on, capped at the
+      // protocol maximum, and fall back to the plain default when pacing is disabled.
+      const defaultWaitMs = statusIntervalMs > 0
+        ? Math.min(MAX_CODEX_STATUS_WAIT_MS, statusIntervalMs)
+        : DEFAULT_CODEX_WAIT_INTERVAL_MS;
+      const waitMs = args.wait_ms ?? defaultWaitMs;
       if (args.cursor < job.statusCursor || waitMs === 0) {
         queueJobStatusResponse(entry, job);
         return true;
@@ -5058,6 +5135,7 @@ async function main() {
     goal,
     codexIdleTimeoutMs,
     codexCancelGraceMs,
+    codexStatusIntervalMs,
     defaultTimeoutMs,
   } = parseArgs();
   const backend = CLI_BACKENDS[providerName];
@@ -5081,6 +5159,7 @@ async function main() {
       goal,
       idleTimeoutMs: codexIdleTimeoutMs,
       cancelGraceOverrideMs: codexCancelGraceMs,
+      statusIntervalOverrideMs: codexStatusIntervalMs,
       hardTimeoutMs: defaultTimeoutMs,
     });
     return;

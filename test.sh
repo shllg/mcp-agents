@@ -291,6 +291,7 @@ test_cli_flag "--help shows workspace-write default" "--help" "workspace-write"
 test_cli_flag "--help shows never default"  "--help"    "never"
 test_cli_flag "--help shows workspace network default" "--help" "--codex-workspace-network"
 test_cli_flag "--help shows codex_idle_timeout" "--help" "codex_idle_timeout"
+test_cli_flag "--help shows codex_status_interval default" "--help" "codex_status_interval"
 test_cli_flag "--help shows goal flag"      "--help"    "Persistent objective"
 test_cli_flag "--help shows provider timeout defaults" "--help" "claude 900, gemini 300"
 test_cli_flag "-h prints usage"             "-h"        "Usage:"
@@ -315,6 +316,9 @@ test_cli_error "--timeout with non-number"                  "--timeout abc"     
 test_cli_error "--codex_idle_timeout without value"         "--codex_idle_timeout"       "requires a value"
 test_cli_error "--codex_idle_timeout non-number"            "--codex_idle_timeout abc"   "non-negative number"
 test_cli_error "--codex_idle_timeout negative"              "--codex_idle_timeout -1"    "non-negative number"
+test_cli_error "--codex_status_interval without value"      "--codex_status_interval"     "requires a value"
+test_cli_error "--codex_status_interval non-number"         "--codex_status_interval abc" "non-negative number"
+test_cli_error "--codex_status_interval negative"           "--codex_status_interval -1"  "non-negative number"
 
 # ========== Protocol tests (fast) ==========
 
@@ -2597,7 +2601,20 @@ const pidFile = `${stubDir}/codex.pid`;
 const callFile = `${stubDir}/calls.jsonl`;
 const child = spawn(
   "node",
-  ["server.js", "--provider", "codex", "--codex_idle_timeout", "2", "--timeout", "4"],
+  // --codex_status_interval 1.5 (=1500ms) is passed on the CLI while the env var below
+  // holds the fast 20ms value: the cursor assertion therefore fails unless the CLI flag
+  // both reaches the runtime AND wins over the environment.
+  [
+    "server.js",
+    "--provider",
+    "codex",
+    "--codex_idle_timeout",
+    "2",
+    "--timeout",
+    "4",
+    "--codex_status_interval",
+    "1.5",
+  ],
   {
     cwd: serverDir,
     env: {
@@ -2609,6 +2626,12 @@ const child = spawn(
       MCP_AGENTS_CODEX_TERMINAL_GRACE_MS: "80",
       MCP_AGENTS_CODEX_CANCEL_GRACE_MS: "100",
       MCP_AGENTS_CODEX_PROGRESS_INTERVAL_MS: "20",
+      // Deliberately the WRONG (fast) value — the CLI flag above sets 1500ms and must
+      // beat it. With the flag effective the cursor stays nearly frozen for the whole
+      // run, which also proves lifecycle transitions bypass pacing; if the flag stops
+      // reaching the runtime, or stops winning over the environment, this 20ms value
+      // takes over, the cursor climbs, and the assertion below fails.
+      MCP_AGENTS_CODEX_STATUS_INTERVAL_MS: "20",
       MCP_AGENTS_CODEX_WAIT_INTERVAL_MS: "100",
       MCP_AGENTS_TEST_PRIVATE_PREFIX: "mcp-agents/job/test/",
       ...(mode === "asynctruncate" ? { MCP_AGENTS_TEST_COMMENTARY_BYTES: "64" } : {}),
@@ -3695,6 +3718,7 @@ test_codex_job_lifecycle "Codex background job exposes status, commentary, and r
    ([.frames[] | select(.id == "mcp-agents/job/test/client" and .error.code == -32600)] | length == 1) and
    ([.frames[] | select(.method == "codex/event")] | length == 0) and
    ([.statusResults[] | select(.state == "running")] | length >= 1) and
+   ((.statusResults | map(.cursor) | max) <= 4) and
    ([.statusResults[] | select(.state == "completed" and .resultAvailable == true)] | length == 1) and
    ([.commentaryResults[] | select((.text | contains("Inspecting the")) and .state == "running")] | length >= 1) and
    ((.commentaryResults | map(.text) | join("")) == "Inspecting the bridge 🚀\n\n") and

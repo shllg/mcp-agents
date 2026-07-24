@@ -299,8 +299,8 @@ interactive exchange) refreshes its idle deadline. Codex stderr, client pings,
 unrelated requests, and events belonging to another call cannot keep a stalled
 call alive. If a call reaches its idle deadline, the wrapper fails **only that
 call** with a JSON-RPC error (`-32001`), sends Codex a `notifications/cancelled`
-for that request so it stops working, suppresses the stalled call's late native
-response, and **keeps the connection open** — sibling calls and the stdio
+for that request — best-effort, so it asks Codex to stop rather than making it (see
+**Cancellation** below) — suppresses the stalled call's late native response, and **keeps the connection open** — sibling calls and the stdio
 transport are unaffected. This matters because a stdio transport close makes MCP
 clients such as Claude Code mark the server `failed` and permanently unregister
 every `mcp__codex__*` tool for the rest of the session (stdio servers are not
@@ -317,7 +317,10 @@ aborted turn, or subagent teardown) is treated the same way: it costs exactly on
 request. `--codex_cancel_grace <seconds>` (default `30`) bounds how long Codex may
 take to acknowledge it; on expiry the wrapper settles that request id locally,
 suppresses Codex's late response, and leaves the bridge and every sibling call
-running. The grace is generous on purpose — a Codex mid-turn is running sandboxed
+running. Settling the request is **not** proof Codex stopped — an unacknowledged
+turn is recorded as abandoned and may keep running and writing. The mid-frame
+escalation described above arms a second full grace, so that path takes roughly
+twice as long before the bridge finalizes. The grace is generous on purpose — a Codex mid-turn is running sandboxed
 commands and does not service MCP cancellation quickly, so a short grace would
 make the escalation path the default path. This matters more than the timeout
 case because the isolated `CODEX_HOME` holds Codex's `sessions/` directory: a
@@ -374,12 +377,44 @@ bridge:
 | `codex-result` | Read the terminal answer in bounded pages |
 | `codex-cancel` | Idempotently request cancellation |
 
+**Prefer the blocking `codex` call, including for long builds.** It costs one tool
+call instead of one caller turn per status change, still streams
+`notifications/progress` to a progress-aware UI, and is canceled by aborting the
+turn. Reach for a job only when the work must *outlive* the caller — it has to keep
+running after you stop waiting, or another agent must be able to cancel it later by
+`jobId`.
+
 The start result returns immediately with an opaque `jobId`, status `cursor`,
 and the next suggested call. Repeated `codex-status` calls produce ordinary MCP
 tool results, so an outer agent or subagent can relay what Codex is doing even
-when its UI does not render `notifications/progress`. At the current cursor a
-status call waits up to 10 seconds by default for a change, then returns a
-heartbeat; `wait_ms` may be set from `0` to `60000`.
+when its UI does not render `notifications/progress` — the one visibility a job
+offers that a blocking call does not. At the current cursor a status call waits for
+a change and then returns a heartbeat; `wait_ms` may be set from `0` to `60000`, and
+when omitted it defaults to the status interval below (`10000` when that pacing is
+disabled).
+
+Two things end a status wait, and both matter to poll cost. A **cursor advance** is
+paced server-side by `--codex_status_interval <seconds>` (default `30`), which
+coalesces intermediate progress instead of bumping the cursor on every message. The
+**`wait_ms` heartbeat** is the other, and it is not paced by that interval — so
+`wait_ms` now tracks the status interval (capped at `60000`, so an interval above 60
+seconds still heartbeats every 60) to keep a heartbeat
+from out-pacing the cursor it reports on. `wait_ms` remains a ceiling on *idle*
+waiting and never a floor on poll spacing: a status call returns **immediately**
+whenever the cursor is already behind the head, so a poller that has fallen behind
+cannot be slowed by raising it — but a caught-up one can, which is why lowering
+`wait_ms` costs turns for nothing.
+
+Only intermediate progress updates are paced; lifecycle transitions — the first
+`running`, a cancellation, and any terminal state — bump the cursor and wake every
+waiter directly, bypassing the interval, so raising it never delays completion. Stall detection is likewise
+unaffected — `lastActivitySeconds` is stamped from raw Codex events, not from status
+ticks — and `codex-commentary` still retains the full narrative. `0` restores a cursor
+advance on every change; values above `60` leave the heartbeat ceiling in charge and
+only let the status text go stale. Progress *notifications* keep their own, much finer
+cadence and cost the caller no context — but note they are emitted only for a
+**blocking** call: a background job's request carries no progress token, so a job's
+only visibility is `codex-status` / `codex-commentary`.
 
 When `commentaryEndOffset` advances, call `codex-commentary` with the last
 `nextOffset`. Commentary contains only Codex messages explicitly marked with
@@ -426,14 +461,22 @@ semantics. This covers the failure mode where work landed in the tree but the
 caller otherwise received neither the result nor the thread ID.
 
 **Cancellation and reconnect.** Client cancellation starts a short,
-non-resettable grace period. If Codex does not settle within that bound, the
-wrapper synthesizes no response for the canceled ID, fails any other open calls
-once, kills and reaps the detached Codex process group, and exits. A native
+non-resettable grace period bounded by `--codex_cancel_grace` (the mid-frame escalation below arms
+a second one, so that path can take about twice as long). If Codex does not
+settle within it, the wrapper settles that request id locally, suppresses Codex's
+late response, and **leaves the bridge and every sibling call running** — a single
+stalled call must never take the whole bridge down. Two bounded exceptions: a stream
+wedged mid-frame that also ignores the cancellation (with no safe boundary at which
+to inject an error, the wrapper retries once and then escalates to a whole-bridge
+teardown), and the aggregate cap — once suppressed responses reach
+`MAX_SUPPRESSED_CODEX_RESPONSES` the bridge finalizes rather than track them
+indefinitely. After either, the client reconnects to a fresh bridge. A native
 response that arrives inside the grace period is discarded whenever it can be
-intercepted without corrupting a partially forwarded frame. The MCP client can
-then reconnect to a fresh bridge; the canceled, potentially write-capable call
-is never replayed automatically. Inspect the working tree before manually
-retrying it because cancellation does not prove that Codex made no changes.
+intercepted without corrupting a partially forwarded frame. The canceled,
+potentially write-capable call is never replayed automatically. **Cancellation is
+best-effort and does not prove Codex stopped** — an unacknowledged turn is recorded
+as abandoned, not terminated, and may keep running and writing the workspace, so
+inspect the working tree before manually retrying it.
 
 This legacy bridge deliberately does **not** respawn `codex mcp-server` inside
 the existing stdio connection or transparently replay threads. `codex-reply`

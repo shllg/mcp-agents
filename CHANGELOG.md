@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.24.0] - 2026-07-25
+
+### Added
+
+- `--codex_status_interval <seconds>` (default `30`, env
+  `MCP_AGENTS_CODEX_STATUS_INTERVAL_MS`, `0` disables) bounds how often a background
+  job's status cursor may advance, coalescing intermediate progress into one wake. It
+  is clamped to the largest delay `setTimeout` can represent, so an absurd value cannot
+  invert into a bump per event.
+
+### Changed
+
+- **A background job's status cursor now advances at most every 30 seconds by
+  default, instead of once per second.** Every cursor advance wakes a `codex-status`
+  long-poll, and each wake costs the polling agent a full model turn over its
+  accumulated transcript — so the old cadence made `wait_ms` meaningless (a status
+  call returns immediately whenever the cursor is behind the head) and turned a
+  40-minute build into hundreds of poll turns. Only intermediate progress updates are
+  paced — lifecycle transitions (first `running`, cancellation, terminal) bypass the
+  interval, so completion is never delayed; `lastActivitySeconds` is stamped from raw
+  Codex events, so stall detection is unchanged; commentary retention is untouched.
+  Progress *notifications* keep their own 1-second cadence — they cost the caller no
+  context, so a progress-aware UI stays as live as before.
+- **`codex-status`'s `wait_ms` now defaults to the status interval** (capped at
+  `60000`) instead of a flat `10000`. Pacing the cursor alone does not bound wakeups —
+  a caught-up poller is still re-woken by the heartbeat — so a flat 10s default would
+  have kept waking callers roughly six times a minute regardless of the new cadence.
+- `codex-start` / `codex-reply-start` now say plainly that the blocking `codex` /
+  `codex-reply` call is preferred even for long builds, and that a job is for work
+  that must outlive its caller. `codex-status` documents both wake sources and that
+  `wait_ms` is a ceiling on idle waiting, not a floor on poll spacing.
+
+### Fixed
+
+- The "Cancellation and reconnect" section of the README still described the
+  pre-`f672ece` behaviour — that an unacknowledged cancellation kills the Codex
+  process group and exits the bridge. It now matches the code: the request is settled
+  locally, the bridge and sibling calls survive, only a mid-frame wedge escalates to a
+  bounded teardown, and cancellation is best-effort and never proof that Codex stopped.
+  The per-call-liveness and cancellation paragraphs said an idle-timeout cancellation is
+  sent "so it stops working" and described a single grace; both now say plainly that the
+  request is settled rather than the writer stopped, and that the mid-frame escalation
+  arms a second grace.
+
 ## [0.23.0] - 2026-07-24
 
 ### Added
