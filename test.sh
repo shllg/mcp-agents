@@ -1453,6 +1453,15 @@ process.stdin.on("data", (d) => {
     } else if (m.method === "tools/call") {
       process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "codex/event", params: { msg: "working" } }) + "\n");
       if (MODE === "die") process.exit(0); // codex dies without responding
+      // late: stall past the idle watchdog, THEN answer — the "zombie writer finally
+      // reports back" case, which must settle the abandonment record rather than leave
+      // the count climbing forever.
+      const lateMs = Number(process.env.MCP_STUB_LATE_MS || 0);
+      if (lateMs > 0) {
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { content: [{ type: "text", text: "late" }] } }) + "\n");
+        }, lateMs);
+      }
       // stall: emit nothing further → idle watchdog must fire
     }
   }
@@ -1468,6 +1477,45 @@ EOF
 # ── Helper: drive initialize + tools/call(id:2) at a stub codex, asserting the ──
 # wrapper synthesizes a JSON-RPC -32001 error for the open id:2 (no hang).
 #   $1 label, $2 MCP_STUB_MODE (stall|die), $3 extra server args
+# ── Helper: abandon a turn via the idle watchdog, then peek at the ledger ────
+# codex-peek's abandonedTurnsProcessWide is the ONLY thing that reports a turn the
+# wrapper stopped waiting for while Codex may still be writing. Without this case, the
+# noteAbandonedTurn / noteAbandonedTurnSettled bookkeeping could be deleted outright and
+# the suite would stay green — which is exactly the "reports nothing, so nothing is
+# running" inversion the tool exists to prevent.
+#   $1 label, $2 tool name to abandon (codex | codex-start), $3 jq predicate over id:9,
+#   $4 optional MCP_STUB_LATE_MS — when set, the stub answers AFTER being abandoned, so
+#      the predicate pins the SETTLEMENT half of the ledger rather than the recording half
+test_codex_abandoned_ledger() {
+  local label="$1" tool="$2" predicate="$3" late_ms="${4:-0}"
+  local tmpdir output_file status RESPONSE ok
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  output_file="$tmpdir/out.txt"
+  write_codex_watchdog_stub "$tmpdir"
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    sleep 0.3
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":{\"prompt\":\"hi\",\"cwd\":\"/tmp/abandon-workspace\",\"sandbox\":\"workspace-write\"}}}"
+    sleep 4
+    if [ "$late_ms" -gt 0 ]; then sleep 4; fi
+    printf '%s\n' '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"codex-peek","arguments":{}}}'
+    sleep 1.5
+  } | PATH="$tmpdir:$PATH" MCP_STUB_MODE=stall MCP_STUB_LATE_MS="$late_ms" \
+    $TIMEOUT_CMD 25 $SERVER --provider codex --codex_idle_timeout 2 >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+  RESPONSE=$(cat "$output_file")
+  ok=1
+  echo "$RESPONSE" | jq -e "$predicate" >/dev/null 2>&1 || ok=0
+  if [ "$ok" -eq 1 ]; then green "PASS: $label"; PASS=$((PASS + 1)); else
+    red "FAIL: $label (status=$status)"; echo "  Response: $RESPONSE"; FAIL=$((FAIL + 1)); fi
+  rm -rf "$tmpdir"
+}
+
 run_codex_watchdog_case() {
   local label="$1" mode="$2" extra="$3" expected_status="$4"
   local tmpdir output_file pid_file status RESPONSE child_pid
@@ -1991,6 +2039,151 @@ test_codex_toolslist_rewrite() {
   [ "$status" -eq 0 ] || ok=0
   echo "$RESPONSE" | jq -e "$predicate" >/dev/null 2>&1 || ok=0
   if [ -n "$grep_str" ]; then printf '%s' "$RESPONSE" | grep -Fq "$grep_str" || ok=0; fi
+  if [ "$ok" -eq 1 ]; then green "PASS: $label"; PASS=$((PASS + 1)); else
+    red "FAIL: $label (status=$status)"; echo "  Response: $RESPONSE"; FAIL=$((FAIL + 1)); fi
+  rm -rf "$tmpdir"
+}
+
+# ── Helper: a stub that parks a `codex` call in flight ──────────────────────
+# Answers initialize/tools/list, then for tools/call name=codex emits one
+# codex/event (so the wrapper learns the thread) and NEVER responds — the shape
+# of a long build, which is exactly when codex-peek has to answer.
+write_codex_inflight_stub() {
+  cat >"$1/codex" <<'EOF'
+#!/usr/bin/env node
+if (process.argv[2] === "--version") { process.stdout.write("codex-cli 0.145.0\n"); process.exit(0); }
+require("fs").appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${process.pid}\n`);
+const send = (o) => process.stdout.write(`${JSON.stringify(o)}\n`);
+let buf = "";
+process.stdin.on("data", (chunk) => {
+  buf += chunk;
+  let nl;
+  while ((nl = buf.indexOf("\n")) >= 0) {
+    const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+    if (!line.trim()) continue;
+    let msg; try { msg = JSON.parse(line); } catch { continue; }
+    if (msg.method === "initialize") {
+      send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "codex", version: "0" } } });
+    } else if (msg.method === "tools/list") {
+      send({ jsonrpc: "2.0", id: msg.id, result: { tools: [
+        { name: "codex", description: "Run a Codex session.", inputSchema: { type: "object", required: ["prompt"], properties: { prompt: { type: "string" }, cwd: { type: "string" }, sandbox: { type: "string" } } } },
+        { name: "codex-reply", description: "Continue a Codex session.", inputSchema: { type: "object", required: ["prompt"], properties: { prompt: { type: "string" }, threadId: { type: "string" } } } },
+      ] } });
+    } else if (msg.method === "tools/call" && msg.params &&
+               (msg.params.name === "codex" || msg.params.name === "codex-reply")) {
+      // One event, correlated, then silence: the turn stays in flight. A reply carries
+      // the thread it continues, which is how the wrapper recovers its workspace.
+      const thread = (msg.params.arguments && msg.params.arguments.threadId) ||
+        "0199aaaa-bbbb-cccc-dddd-eeeeffff0000";
+      send({ jsonrpc: "2.0", method: "codex/event", params: { _meta: { requestId: msg.id, threadId: thread }, msg: { type: "task_started" } } });
+    }
+  }
+});
+process.stdin.on("end", () => process.exit(0));
+EOF
+  chmod +x "$1/codex"
+}
+
+# ── Helper: park a codex turn, then assert a jq predicate over a codex-peek ──
+#   $1 label, $2 peek arguments (JSON object), $3 jq predicate over the id:4 result
+test_codex_peek() {
+  local label="$1" peek_args="$2" predicate="$3"
+  local tmpdir output_file status RESPONSE ok
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  output_file="$tmpdir/out.txt"
+  write_codex_inflight_stub "$tmpdir"
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+    sleep 0.5
+    printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codex","arguments":{"prompt":"build it","cwd":"/tmp/peek-workspace","sandbox":"workspace-write"}}}'
+    sleep 0.8
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"codex-peek\",\"arguments\":$peek_args}}"
+    sleep 1.2
+  } | PATH="$tmpdir:$PATH" $TIMEOUT_CMD 15 $SERVER --provider codex >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+  RESPONSE=$(cat "$output_file")
+  ok=1
+  [ "$status" -eq 0 ] || ok=0
+  echo "$RESPONSE" | jq -e "$predicate" >/dev/null 2>&1 || ok=0
+  if [ "$ok" -eq 1 ]; then green "PASS: $label"; PASS=$((PASS + 1)); else
+    red "FAIL: $label (status=$status)"; echo "  Response: $RESPONSE"; FAIL=$((FAIL + 1)); fi
+  rm -rf "$tmpdir"
+}
+
+# ── Helper: park a codex turn, then a codex-reply on the SAME thread, then peek ──
+# The reply carries no cwd, so its workspace can only come from the thread map — the
+# bookkeeping this feature added, and the part a fresh-turn-only test cannot reach.
+#   $1 label, $2 jq predicate over the id:5 result
+test_codex_peek_reply() {
+  local label="$1" predicate="$2"
+  local tmpdir output_file status RESPONSE ok
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  output_file="$tmpdir/out.txt"
+  write_codex_inflight_stub "$tmpdir"
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+    sleep 0.5
+    printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codex","arguments":{"prompt":"build it","cwd":"/tmp/peek-workspace","sandbox":"workspace-write"}}}'
+    sleep 0.8
+    printf '%s\n' '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"codex-reply","arguments":{"prompt":"carry on","threadId":"0199aaaa-bbbb-cccc-dddd-eeeeffff0000"}}}'
+    sleep 0.8
+    printf '%s\n' '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"codex-peek","arguments":{}}}'
+    sleep 1.2
+  } | PATH="$tmpdir:$PATH" $TIMEOUT_CMD 18 $SERVER --provider codex >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+  RESPONSE=$(cat "$output_file")
+  ok=1
+  [ "$status" -ne 0 ] && ok=0
+  echo "$RESPONSE" | jq -e "$predicate" >/dev/null 2>&1 || ok=0
+  if [ "$ok" -eq 1 ]; then green "PASS: $label"; PASS=$((PASS + 1)); else
+    red "FAIL: $label (status=$status)"; echo "  Response: $RESPONSE"; FAIL=$((FAIL + 1)); fi
+  rm -rf "$tmpdir"
+}
+
+# ── Helper: dispatch a BACKGROUND job, then peek ────────────────────────────
+# A job's native request runs under the wrapper's private id namespace; the row must
+# be addressed by jobId and must not hand that private id out.
+#   $1 label, $2 jq predicate over the id:4 result
+test_codex_peek_job() {
+  local label="$1" predicate="$2"
+  local tmpdir output_file status RESPONSE ok
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  output_file="$tmpdir/out.txt"
+  write_codex_inflight_stub "$tmpdir"
+  set +e
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+    sleep 0.5
+    printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codex-start","arguments":{"prompt":"build it","cwd":"/tmp/job-workspace","sandbox":"workspace-write"}}}'
+    sleep 1.0
+    printf '%s\n' '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"codex-peek","arguments":{}}}'
+    sleep 1.2
+  } | PATH="$tmpdir:$PATH" $TIMEOUT_CMD 18 $SERVER --provider codex >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+  RESPONSE=$(cat "$output_file")
+  ok=1
+  [ "$status" -ne 0 ] && ok=0
+  echo "$RESPONSE" | jq -e "$predicate" >/dev/null 2>&1 || ok=0
   if [ "$ok" -eq 1 ]; then green "PASS: $label"; PASS=$((PASS + 1)); else
     red "FAIL: $label (status=$status)"; echo "  Response: $RESPONSE"; FAIL=$((FAIL + 1)); fi
   rm -rf "$tmpdir"
@@ -3417,7 +3610,63 @@ test_codex_toolslist_rewrite "tools/list advertises exact curated argument sets"
   'select(.id==2) | ((.result.tools|map(select(.name=="codex"))[0].inputSchema.properties|keys) == ["allow_subagents","cwd","goal","model","model_reasoning_effort","prompt","sandbox"] and (.result.tools|map(select(.name=="codex-reply"))[0].inputSchema.properties|keys) == ["goal","prompt","threadId"])'
 test_codex_toolslist_rewrite "tools/list advertises all optional Codex job tools" \
   "normal" \
-  'select(.id==2) | ([.result.tools[].name | select(startswith("codex-"))] | sort) == ["codex-cancel","codex-commentary","codex-reply","codex-reply-start","codex-result","codex-start","codex-status"]'
+  'select(.id==2) | ([.result.tools[].name | select(startswith("codex-"))] | sort) == ["codex-cancel","codex-commentary","codex-peek","codex-reply","codex-reply-start","codex-result","codex-start","codex-status"]'
+test_codex_toolslist_rewrite "codex-peek advertises a closed, wholly optional filter schema" \
+  "normal" \
+  'select(.id==2) | (.result.tools|map(select(.name=="codex-peek"))[0].inputSchema |
+    (.additionalProperties == false) and (.required == []) and
+    ((.properties|keys) == ["cwd","requestId","threadId"]))'
+test_codex_peek "codex-peek reports a parked turn with its identity and workspace" \
+  '{}' \
+  'select(.id==4) | .result.structuredContent as $s |
+   ($s.count == 1) and ($s.ambiguous == false) and
+   ($s.turns[0] | (.tool == "codex") and (.cwd == "/tmp/peek-workspace") and
+     (.sandbox == "workspace-write") and (.cwdInferred == false) and
+     (.threadId == "0199aaaa-bbbb-cccc-dddd-eeeeffff0000") and
+     (has("requestId")) and (has("elapsedSeconds")) and (has("lastActivitySeconds")))'
+test_codex_peek "codex-peek never returns the prompt" \
+  '{}' \
+  'select(.id==4) | (.result | tostring | contains("build it") | not)'
+test_codex_peek "codex-peek honours a cwd filter" \
+  '{"cwd":"/tmp/peek-workspace"}' \
+  'select(.id==4) | (.result.structuredContent.count == 1)'
+test_codex_peek "an empty codex-peek warns that absence is not termination" \
+  '{"cwd":"/tmp/somewhere-else"}' \
+  'select(.id==4) | (.result.structuredContent.count == 0) and
+   (.result.content[0].text | contains("not evidence"))'
+test_codex_peek "codex-peek rejects a non-string requestId instead of ignoring it" \
+  '{"requestId":4}' \
+  'select(.id==4) | (.error.code == -32602) or
+   (.result.isError == true) or
+   ((.result.structuredContent.issues // []) | any(.argument == "requestId"))'
+test_codex_peek_reply "a codex-reply turn reports the workspace inherited from its thread" \
+  'select(.id==5) | .result.structuredContent as $s |
+   ($s.count == 2) and
+   ($s.turns | map(select(.tool == "codex-reply")) | length == 1) and
+   ($s.turns[] | select(.tool == "codex-reply") |
+     (.cwd == "/tmp/peek-workspace") and (.cwdInferred == true) and
+     (.threadId == "0199aaaa-bbbb-cccc-dddd-eeeeffff0000") and (.state == "running")) and
+   ($s.turns[] | select(.tool == "codex") | .cwdInferred == false)'
+test_codex_abandoned_ledger "an abandoned blocking turn is counted, not forgotten" \
+  "codex" \
+  'select(.id==9) | .result.structuredContent.abandonedTurnsProcessWide >= 1'
+test_codex_abandoned_ledger "an abandoned background JOB is counted too" \
+  "codex-start" \
+  'select(.id==9) | .result.structuredContent.abandonedTurnsProcessWide >= 1'
+test_codex_abandoned_ledger "a late native response SETTLES the abandonment, so the count returns to zero" \
+  "codex" \
+  'select(.id==9) | .result.structuredContent.abandonedTurnsProcessWide == 0' \
+  5000
+test_codex_abandoned_ledger "a late response settles an abandoned JOB too, not just a blocking call" \
+  "codex-start" \
+  'select(.id==9) | .result.structuredContent.abandonedTurnsProcessWide == 0' \
+  5000
+test_codex_peek_job "a background job is addressed by jobId and never leaks the private request id" \
+  'select(.id==4) | .result.structuredContent as $s |
+   ($s.count == 1) and
+   ($s.turns[0] | (.tool == "codex") and (has("jobId")) and (has("requestId") | not) and
+     (.cwd == "/tmp/job-workspace")) and
+   (.result | tostring | contains("mcp-agents/job/") | not)'
 test_codex_toolslist_rewrite "Codex job tools use exact closed schemas" \
   "normal" \
   'select(.id==2) | (.result.tools | map({key:.name,value:.}) | from_entries) as $t |

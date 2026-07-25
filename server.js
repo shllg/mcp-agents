@@ -78,6 +78,11 @@ const MAX_CODEX_PAGE_CODEPOINTS = 32_768;
 const MAX_CODEX_COMMENTARY_BYTES = 1024 * 1024;
 const MAX_ACTIVE_CODEX_JOBS = 8;
 const MAX_RETAINED_CODEX_JOBS = 32;
+// `codex-reply` takes no cwd — a reply inherits the workspace of the thread it
+// continues — so the only way codex-peek can name a reply's workspace is to
+// remember where each thread was opened. Bounded FIFO; losing an old mapping
+// costs a peek row its cwd, never correctness.
+const MAX_REMEMBERED_CODEX_THREAD_WORKSPACES = 64;
 const CODEX_JOB_RETENTION_MS = 60 * 60 * 1_000;
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const DEFAULT_CLAUDE_STATUS_WAIT_MS = 10_000;
@@ -152,6 +157,17 @@ const CODEX_JOB_TOOL_CONTRACTS = {
   },
 };
 const CODEX_JOB_TOOL_NAMES = Object.keys(CODEX_JOB_TOOL_CONTRACTS);
+// Tools answered entirely from wrapper state, addressing no job. codex-peek reads
+// the in-flight table so a caller blocked on `codex` / `codex-reply` has SOME
+// readable liveness: a blocking call is otherwise opaque until it returns, which
+// is exactly the gap that let an operator mistake a working turn for a dead one.
+const CODEX_LOCAL_TOOL_CONTRACTS = {
+  "codex-peek": {
+    allowed: ["cwd", "threadId", "requestId"],
+    required: [],
+  },
+};
+const CODEX_LOCAL_TOOL_NAMES = Object.keys(CODEX_LOCAL_TOOL_CONTRACTS);
 const TERMINAL_CODEX_JOB_STATES = new Set(["completed", "failed", "canceled"]);
 const CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS = 2;
 const CLAUDE_JOB_TOOL_NAMES = [
@@ -2302,13 +2318,51 @@ function codexToolPresentation(toolName) {
       },
     };
   }
+  if (toolName === "codex-peek") {
+    return {
+      description:
+        "List the Codex turns this server currently has in flight, blocking and " +
+        "background alike. Read-only and immediate: it starts nothing, cancels " +
+        "nothing, and never returns prompts or model output. Use it to tell a working " +
+        "turn from a wedged one WITHOUT cancelling to find out — a blocking `codex` / " +
+        "`codex-reply` call is otherwise opaque until it returns, and neither the " +
+        "process table nor a quiet transcript can see it. Each row carries the threadId " +
+        "once Codex reports one, the workspace, and lastActivitySeconds — small and " +
+        "falling means healthy however long elapsedSeconds grows. A client call is " +
+        "identified by requestId (stable for the life of the call); a background job by " +
+        "its jobId. `state` is `running`, or `canceling` for a turn whose cancellation " +
+        "has not been confirmed — that turn is still executing and still WRITING. Two " +
+        "answers that mean less than they look like: an EMPTY list is not evidence a " +
+        "turn finished (an abandoned turn keeps running with no in-flight request left " +
+        "to report — see abandonedTurns), and a row may carry cwdUnknown when the " +
+        "workspace could not be recovered, in which case a cwd filter still reports it " +
+        "rather than hiding it.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          cwd: {
+            type: "string",
+            description: "Only turns whose workspace equals this absolute path.",
+          },
+          threadId: { type: "string", description: "Only the turn on this Codex thread." },
+          requestId: {
+            type: "string",
+            description: "Only the turn with this requestId, as returned by a previous peek.",
+          },
+        },
+        required: [...CODEX_LOCAL_TOOL_CONTRACTS[toolName].required],
+        additionalProperties: false,
+      },
+    };
+  }
   return undefined;
 }
 
 function validateCodexToolCallMessage(msg) {
   if (!msg || typeof msg !== "object" || msg.method !== "tools/call") return undefined;
   const toolName = msg.params?.name;
-  const contract = CODEX_TOOL_CONTRACTS[toolName] ?? CODEX_JOB_TOOL_CONTRACTS[toolName];
+  const contract = CODEX_TOOL_CONTRACTS[toolName] ?? CODEX_JOB_TOOL_CONTRACTS[toolName] ??
+    CODEX_LOCAL_TOOL_CONTRACTS[toolName];
   if (!contract) return undefined;
   const args = msg.params?.arguments;
   if (!args || typeof args !== "object" || Array.isArray(args)) {
@@ -2417,6 +2471,16 @@ function validateCodexToolCallMessage(msg) {
   ) {
     issues.push({ argument: "offset", problem: "must be a nonnegative integer" });
   }
+  // Without this a codex-peek filter of the wrong type is silently coerced away, so
+  // "is request X still alive?" is answered with every turn in the process — which
+  // reads as yes.
+  if (Object.hasOwn(args, "requestId")) {
+    if (typeof args.requestId !== "string") {
+      issues.push({ argument: "requestId", problem: "must be a string" });
+    } else if (!args.requestId.trim()) {
+      issues.push({ argument: "requestId", problem: "must not be blank" });
+    }
+  }
 
   return issues.length > 0
     ? {
@@ -2469,12 +2533,14 @@ function rewriteCodexToolsListMessage(msg) {
   );
   const hasCodex = existingNames.has("codex");
   const hasCodexReply = existingNames.has("codex-reply");
-  const availableJobTools = CODEX_JOB_TOOL_NAMES.filter((toolName) => {
-    if (toolName === "codex-start") return hasCodex;
-    if (toolName === "codex-reply-start") return hasCodexReply;
-    return hasCodex || hasCodexReply;
-  });
-  for (const toolName of availableJobTools) {
+  const availableAddedTools = [...CODEX_JOB_TOOL_NAMES, ...CODEX_LOCAL_TOOL_NAMES].filter(
+    (toolName) => {
+      if (toolName === "codex-start") return hasCodex;
+      if (toolName === "codex-reply-start") return hasCodexReply;
+      return hasCodex || hasCodexReply;
+    },
+  );
+  for (const toolName of availableAddedTools) {
     const presentation = codexToolPresentation(toolName);
     const existing = tools.find((tool) => tool?.name === toolName);
     if (existing) {
@@ -2711,6 +2777,29 @@ function runCodexPassthrough({
   const serverRequestParents = new Map();
   const jobs = new Map();
   const jobsByNativeRequest = new Map();
+  const threadWorkspaces = new Map(); // threadId -> { cwd, sandbox } from the opening `codex` call
+  // LRU, not FIFO. Map iteration order is insertion order, so evicting the first key
+  // without refreshing on use throws out the long-lived thread you keep replying to
+  // before idle newer ones — exactly backwards for the case this map exists to serve.
+  const lookupThreadWorkspace = (threadId) => {
+    if (!threadId) return undefined;
+    const found = threadWorkspaces.get(threadId);
+    if (!found) return undefined;
+    threadWorkspaces.delete(threadId);
+    threadWorkspaces.set(threadId, found);
+    return found;
+  };
+  const rememberThreadWorkspace = (threadId, cwd, sandbox) => {
+    if (!threadId || !cwd) return;
+    if (threadWorkspaces.has(threadId)) {
+      lookupThreadWorkspace(threadId);
+      return;
+    }
+    threadWorkspaces.set(threadId, { cwd, sandbox });
+    while (threadWorkspaces.size > MAX_REMEMBERED_CODEX_THREAD_WORKSPACES) {
+      threadWorkspaces.delete(threadWorkspaces.keys().next().value);
+    }
+  };
   const privateRequestPrefix = process.env.MCP_AGENTS_TEST_PRIVATE_PREFIX ??
     `mcp-agents/job/${randomUUID()}/`;
   let privateRequestSequence = 0;
@@ -2870,12 +2959,29 @@ function runCodexPassthrough({
       (typeof suppliedProgressToken === "number" && Number.isFinite(suppliedProgressToken))
         ? suppliedProgressToken
         : undefined;
+    // Workspace identity for codex-peek. `codex`/`codex-start` carry cwd + sandbox
+    // as required arguments; `codex-reply`/`codex-reply-start` carry neither, so a
+    // reply's workspace is recovered from the thread it continues and flagged as
+    // inferred rather than asserted.
+    // Harvest ONLY from a call that is itself a turn. codex-peek takes cwd/threadId/
+    // requestId as FILTERS, and recording those as the request's own identity would
+    // make a peek entry claim to be a turn on that thread in that workspace.
+    const isTurnCall = msg.method === "tools/call" &&
+      Boolean(CODEX_TOOL_CONTRACTS[msg.params?.name] ?? CODEX_JOB_TOOL_CONTRACTS[msg.params?.name]);
+    const callArgs = isTurnCall ? msg.params?.arguments : undefined;
+    const suppliedCwd = typeof callArgs?.cwd === "string" ? callArgs.cwd : undefined;
+    const suppliedSandbox = typeof callArgs?.sandbox === "string" ? callArgs.sandbox : undefined;
+    const repliedThreadId = typeof callArgs?.threadId === "string" ? callArgs.threadId : undefined;
+    const inheritedWorkspace = suppliedCwd ? undefined : lookupThreadWorkspace(repliedThreadId);
     const entry = {
       id: msg.id,
       method: msg.method,
       toolName: msg.method === "tools/call" ? msg.params?.name : undefined,
       progressToken,
-      threadId: undefined,
+      threadId: repliedThreadId,
+      cwd: suppliedCwd ?? inheritedWorkspace?.cwd,
+      sandbox: suppliedSandbox ?? inheritedWorkspace?.sandbox,
+      cwdInferred: !suppliedCwd && Boolean(inheritedWorkspace),
       state: "open",
       lastAgentMessage: undefined,
       progressSequence: 0,
@@ -3585,11 +3691,113 @@ function runCodexPassthrough({
     }
     queueLocalToolResponse(clientEntry, startResult(job));
   };
+  // Read-only view of the in-flight table for codex-peek. Only real Codex turns are
+  // listed — `codex` and `codex-reply` — whether the client issued one directly or a
+  // job dispatched it privately. The peek call is a different tool, so a peek can
+  // never report itself.
+  const normalizeWorkspace = (value) =>
+    typeof value === "string" && value.length > 1 && value.endsWith("/")
+      ? value.replace(/\/+$/, "")
+      : value;
+  const peekRows = (filter) => {
+    const now = Date.now();
+    const rows = [];
+    for (const entry of inFlight.values()) {
+      if (entry.method !== "tools/call") continue;
+      if (!entry.toolName || !CODEX_TOOL_CONTRACTS[entry.toolName]) continue;
+      // "canceled" is NOT gone. The bridge cancels best-effort and waits out
+      // --codex_cancel_grace, during which Codex is still executing under
+      // workspace-write. Dropping those rows would answer "nothing in flight" to the
+      // one caller who most needs a yes: someone deciding whether it is safe to send a
+      // second writer into that tree.
+      const live = entry.state === "open";
+      const canceling = entry.state === "canceled";
+      if (!live && !canceling) continue;
+      // A job's native request id belongs to the wrapper's private namespace; handing
+      // it out makes it addressable from outside the job state machine. Jobs are
+      // addressed by jobId.
+      const requestId = entry.internalJob ? undefined : idKey(entry.id);
+      if (filter.requestId && filter.requestId !== requestId) continue;
+      if (filter.threadId && filter.threadId !== entry.threadId) continue;
+      const cwd = normalizeWorkspace(entry.cwd);
+      // A cwd filter must never HIDE a turn whose workspace is merely unknown — that
+      // converts "I cannot tell" into "nothing is running there", the exact inversion
+      // this tool exists to prevent. Unknown-workspace turns are always reported.
+      if (filter.cwd && cwd !== undefined && filter.cwd !== cwd) continue;
+      rows.push({
+        ...(requestId ? { requestId } : {}),
+        tool: entry.toolName,
+        state: canceling ? "canceling" : "running",
+        ...(entry.threadId ? { threadId: entry.threadId } : {}),
+        ...(cwd ? { cwd, cwdInferred: Boolean(entry.cwdInferred) } : { cwdUnknown: true }),
+        ...(entry.sandbox ? { sandbox: entry.sandbox } : {}),
+        ...(entry.internalJob && entry.jobId ? { jobId: entry.jobId } : {}),
+        elapsedSeconds: Math.max(0, Math.floor((now - entry.startedAt) / 1_000)),
+        lastActivitySeconds: Math.max(
+          0,
+          Math.floor((now - (entry.lastActivityAt ?? entry.startedAt)) / 1_000),
+        ),
+      });
+    }
+    rows.sort((a, b) =>
+      b.elapsedSeconds - a.elapsedSeconds ||
+      String(a.requestId ?? a.jobId ?? "").localeCompare(String(b.requestId ?? b.jobId ?? ""))
+    );
+    return rows;
+  };
+  const describePeekRow = (turn) =>
+    `${turn.tool} ${turn.requestId ?? turn.jobId ?? "(unidentified)"}: ` +
+    `${turn.elapsedSeconds}s elapsed, last activity ${turn.lastActivitySeconds}s ago` +
+    (turn.state === "canceling" ? ", CANCELING (not confirmed stopped)" : "") +
+    (turn.threadId ? `, thread ${turn.threadId}` : ", thread not yet reported") +
+    (turn.cwd
+      ? `, cwd ${turn.cwd}${turn.cwdInferred ? " (inherited)" : ""}`
+      : ", workspace unknown");
+  const peekResult = (args) => {
+    const filter = {
+      cwd: typeof args.cwd === "string" ? normalizeWorkspace(args.cwd) : undefined,
+      threadId: typeof args.threadId === "string" ? args.threadId : undefined,
+      requestId: typeof args.requestId === "string" ? args.requestId : undefined,
+    };
+    const filtered = Boolean(filter.cwd || filter.threadId || filter.requestId);
+    const turns = peekRows(filter);
+    const canceling = turns.filter((turn) => turn.state === "canceling").length;
+    // An empty peek is the one answer a caller must not over-read: a turn the wrapper
+    // stopped waiting for keeps running inside Codex with no in-flight request left.
+    let text = turns.length === 0
+      ? `No ${filtered ? "matching " : ""}Codex turn is in flight. This is not evidence ` +
+        "one finished — an abandoned turn keeps running with nothing left to report."
+      : turns.map(describePeekRow).join("\n");
+    if (filtered && turns.length > 1) {
+      text += `\n\n${turns.length} turns match; the filter does not identify a single turn.`;
+    }
+    if (canceling > 0) {
+      text += `\n\n${canceling} turn(s) cancelled but NOT confirmed stopped — still writing.`;
+    }
+    if (abandonedTurns.size > 0) {
+      text += `\n\n${abandonedTurns.size} abandoned turn(s) may still be writing` +
+        `${filtered ? " (process-wide; not narrowed by your filter)" : ""}.`;
+    }
+    return localToolResult(text, {
+      turns,
+      count: turns.length,
+      canceling,
+      ambiguous: filtered && turns.length > 1,
+      // Process-wide by nature — abandoned turns retain no workspace — so it is named
+      // for what it is. A machine consumer reading a bare `abandonedTurns` under a cwd
+      // filter would attribute all of them to that workspace.
+      abandonedTurnsProcessWide: abandonedTurns.size,
+    });
+  };
   const handleJobToolCall = (msg, entry) => {
     const toolName = msg.params?.name;
     const args = msg.params?.arguments ?? {};
     if (toolName === "codex-start" || toolName === "codex-reply-start") {
       dispatchJob(msg, entry, toolName === "codex-start" ? "codex" : "codex-reply");
+      return true;
+    }
+    if (toolName === "codex-peek") {
+      queueLocalToolResponse(entry, peekResult(args));
       return true;
     }
     if (!CODEX_JOB_TOOL_CONTRACTS[toolName]) return false;
@@ -3986,6 +4194,12 @@ function runCodexPassthrough({
       const job = jobs.get(entry.jobId);
       privateJobRequestIds.delete(key);
       suppressedResponseIds.add(key);
+      // A job abandoned by the idle or hard deadline is exactly as unconfirmed as a
+      // blocking call abandoned the same way — Codex may still be writing. Recording it
+      // here is what lets codex-peek's abandonedTurnsProcessWide see it at all; without
+      // this the job path reported nothing in flight and nothing abandoned, which is the
+      // inversion this tool exists to prevent.
+      noteAbandonedTurn(entry, label);
       if (job && !isTerminalJob(job)) transitionJobTerminal(job, "failed", label);
       settleInFlight(entry.id);
       entry.timeoutPending = undefined;
@@ -4268,7 +4482,12 @@ function runCodexPassthrough({
     if (!entry || entry.state !== "open") return;
     const job = entry.internalJob ? jobs.get(entry.jobId) : undefined;
     const threadId = msg.params?._meta?.threadId;
-    if (typeof threadId === "string" && threadId) entry.threadId = threadId;
+    if (typeof threadId === "string" && threadId) {
+      entry.threadId = threadId;
+      // Learned here rather than at dispatch: the opening `codex` call supplies the
+      // cwd but not the thread, and Codex names the thread only once it starts.
+      if (!entry.cwdInferred) rememberThreadWorkspace(threadId, entry.cwd, entry.sandbox);
+    }
     if (job && typeof threadId === "string" && threadId) job.threadId = threadId;
     const event = msg.params?.msg;
     const eventType = event?.type;
@@ -4695,6 +4914,10 @@ function runCodexPassthrough({
       rewriteBuf = rewriteBuf.subarray(nl + 1);
       if (rewriteDropReleaseId !== undefined) {
         suppressedResponseIds.delete(rewriteDropReleaseId);
+        // The response finally landed, oversized or not — the turn is no longer
+        // abandoned. Without this an over-limit result left its record forever and
+        // abandonedTurnsProcessWide only ever climbed.
+        noteAbandonedTurnSettled(rewriteDropReleaseId);
         rewriteDropReleaseId = undefined;
       }
       rewriteDropUntilNewline = false;
@@ -4729,6 +4952,7 @@ function runCodexPassthrough({
         if (privateJob) {
           privateJobRequestIds.delete(key);
           suppressedResponseIds.delete(key);
+          noteAbandonedTurnSettled(key);
           jobsByNativeRequest.delete(key);
           transitionJobTerminal(
             privateJob,
@@ -4774,6 +4998,11 @@ function runCodexPassthrough({
           if (jobsByNativeRequest.has(key)) {
             privateJobRequestIds.delete(key);
             suppressedResponseIds.delete(key);
+            // A job's late native response settles its abandonment just as a plain
+            // call's does. Without this the record survived for the life of the
+            // process, so codex-peek's abandonedTurnsProcessWide only ever climbed and
+            // its "may still be writing" warning stopped meaning anything.
+            noteAbandonedTurnSettled(key);
             outBuf = null;
           } else if (suppressedResponseIds.has(key)) {
             suppressedResponseIds.delete(key);

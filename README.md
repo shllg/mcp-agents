@@ -384,6 +384,38 @@ turn. Reach for a job only when the work must *outlive* the caller — it has to
 running after you stop waiting, or another agent must be able to cancel it later by
 `jobId`.
 
+### `codex-peek` — is that turn still working?
+
+A blocking call is opaque until it returns, which makes "wedged" and "busy" look
+identical from outside. `codex-peek` answers that without cancelling anything to find
+out: it lists every Codex turn in flight, blocking and background alike, read-only and
+immediate, and takes optional `cwd` / `threadId` / `requestId` filters.
+
+| Field | Meaning |
+| --- | --- |
+| `requestId` | A **client** call's handle, stable for its lifetime. This is the wrapper's internal `type:value` key, not the raw JSON-RPC id, and it is not accepted by `notifications/cancelled` |
+| `jobId` | A **background job's** handle, in place of `requestId` — a job's native request runs in the wrapper's private id namespace, which is never handed out |
+| `state` | `running`, or `canceling` for a turn whose cancellation is not confirmed — still executing, still writing |
+| `threadId` | Present once Codex reports it; names the rollout file too |
+| `cwd`, `cwdInferred`, `cwdUnknown` | The workspace; `cwdInferred` when recovered from the thread rather than the call; `cwdUnknown` when it could not be recovered at all |
+| `sandbox` | The sandbox the turn was granted |
+| `elapsedSeconds` | Wall clock since the call started — **not** progress |
+| `lastActivitySeconds` | Since the last correlated Codex event — small and falling means healthy |
+
+Do not look for a per-turn process instead: `codex mcp-server` is long-lived and
+multiplexes every request, so there is no `codex exec` to find and a process-table
+check reports nothing while a build is running.
+
+Three answers that mean less than they look like. An **empty list** is not evidence a
+turn finished — an abandoned turn keeps running inside Codex with nothing in flight
+left to report, and their count comes back as `abandonedTurnsProcessWide` — named for its scope,
+because an abandoned turn retains no workspace and so is never narrowed by a filter. A large `elapsedSeconds` is not a stall — it is only wall clock
+— and a large `lastActivitySeconds` is not one either: a single tool call can
+legitimately run silent for many minutes, so quiet is *unproven*, never *finished*.
+Cancelling to find out is the one thing that cannot be undone. And a `cwd` filter never
+hides a turn whose workspace is unknown — it reports it with `cwdUnknown`, because
+"I cannot tell" must not silently become "nothing is running there".
+
 The start result returns immediately with an opaque `jobId`, status `cursor`,
 and the next suggested call. Repeated `codex-status` calls produce ordinary MCP
 tool results, so an outer agent or subagent can relay what Codex is doing even

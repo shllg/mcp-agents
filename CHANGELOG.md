@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.25.0] - 2026-07-25
+
+### Added
+
+- `codex-peek` lists the Codex turns the server currently has in flight — blocking
+  and background alike — read-only and immediate. Steering callers to blocking
+  dispatch (0.24.0) left one gap: a blocking call is opaque until it returns, and
+  nothing outside the bridge can see it. The `codex mcp-server` child is long-lived
+  and multiplexes every request, so a caller inspecting the process table finds no
+  per-turn process and can conclude a running build is dead. That happened: a healthy
+  20-minute build was cancelled four seconds after its last file write, on the
+  strength of a `pgrep` that structurally could not have matched it. Each row carries
+  a handle — `requestId` for a client call, `jobId` for a background job — plus
+  `state` (`running` or `canceling`), the `threadId` once Codex reports one, the
+  workspace, `elapsedSeconds`, and `lastActivitySeconds`: small and falling means
+  healthy however large `elapsedSeconds` grows. Optional `cwd` / `threadId` /
+  `requestId` filters narrow the list, and `ambiguous` marks a filter that still
+  matches several turns.
+- Turn workspaces are remembered per thread (bounded, 64 entries) so a `codex-reply`
+  turn — which takes no `cwd` argument, inheriting the workspace of the thread it
+  continues — can still be reported with one, flagged `cwdInferred`.
+
+### Notes
+
+- An empty `codex-peek` is **not** evidence a turn finished, and the tool says so in
+  its own output: an abandoned turn keeps running inside Codex with no in-flight
+  request left to report. The count of such turns is returned as `abandonedTurnsProcessWide` — named for its
+  scope, since an abandoned turn retains no workspace to filter on. A `cwd` filter also
+  compares normalised paths, not symlink-resolved ones.
+- A **cancelled** turn is listed with `state: "canceling"` for the cancellation grace
+  window, because cancellation is best-effort: during it Codex is still executing under
+  `workspace-write`. Once the grace expires the row is gone and only
+  `abandonedTurnsProcessWide` remembers it — still not confirmed stopped. Omitting those rows would answer "nothing in
+  flight" to the caller who most needs a yes — someone deciding whether it is safe to
+  send a second writer into that tree.
+- A `cwd` filter never hides a turn whose workspace could not be recovered; such rows
+  are reported with `cwdUnknown` so "I cannot tell" cannot become "nothing is running
+  there". The thread→workspace map is LRU, so the long-lived thread you keep replying
+  to is not evicted ahead of idle newer ones.
+- `codex-peek` never returns prompts or model output, never reports itself, and never
+  discloses a job's private native request id — jobs are addressed by `jobId`.
+
 ## [0.24.0] - 2026-07-25
 
 ### Added
