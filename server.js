@@ -49,6 +49,8 @@ const CODEX_WORKSPACE_NETWORK_ACCESS_ENV =
 // unrelated calls cannot keep a wedged request alive. 0 disables the idle cap.
 const DEFAULT_CODEX_IDLE_TIMEOUT_MS = 600_000;
 const DEFAULT_CODEX_TERMINAL_GRACE_MS = 1_000;
+const SUCCESS_TERMINAL_EVENTS = new Set(["task_complete", "turn_complete"]);
+const ABORT_TERMINAL_EVENTS = new Set(["turn_aborted"]);
 // How long codex gets to acknowledge a cancellation before the bridge stops
 // waiting. A codex mid-turn is running sandboxed commands and streaming model
 // output; it does NOT service a cancellation promptly, so this must be generous.
@@ -2918,7 +2920,7 @@ function runCodexPassthrough({
       // Fall back to a bounded teardown ONLY for that residue, rather than tearing
       // the whole bridge down for a request that could have been answered safely.
       if (entry.state === "terminal_grace") {
-        synthesizeTerminalResult(entry);
+        synthesizeTerminalResult(entry, entry.terminalOutcome);
         if (finalizing || inFlight.get(idKey(entry.id)) !== entry) return;
       }
       finalize({
@@ -2984,6 +2986,9 @@ function runCodexPassthrough({
       cwdInferred: !suppliedCwd && Boolean(inheritedWorkspace),
       state: "open",
       lastAgentMessage: undefined,
+      terminalEventType: undefined,
+      terminalEventObservedAt: undefined,
+      terminalOutcome: undefined,
       progressSequence: 0,
       startedAt: Date.now(),
       lastActivityAt: Date.now(),
@@ -2998,6 +3003,9 @@ function runCodexPassthrough({
       fallbackReady: false,
       timeoutPending: undefined,
       nativeCancelSent: false,
+      suppressedNativeResponseSeen: false,
+      confirmedCancelGraceEscalated: false,
+      confirmedCancelPending: false,
     };
     inFlight.set(key, entry);
     armEntryIdle(entry);
@@ -3439,6 +3447,15 @@ function runCodexPassthrough({
     const nativeThreadId = msg.result?.structuredContent?.threadId ?? entry.threadId ?? job.threadId;
     if (job.state === "canceling" || entry.state === "canceled") {
       transitionJobTerminal(job, "canceled", "canceled", { threadId: nativeThreadId });
+      return;
+    }
+    if (entry.terminalOutcome === "aborted") {
+      transitionJobTerminal(
+        job,
+        "failed",
+        `${entry.terminalEventType ?? "turn_aborted"}: Codex aborted the turn before completion`,
+        { threadId: nativeThreadId },
+      );
       return;
     }
     if (msg.error) {
@@ -4087,10 +4104,25 @@ function runCodexPassthrough({
       },
     };
   };
-  const synthesizeTerminalResult = (entry) => {
+  const terminalAbortErrorFrame = (entry) => ({
+    jsonrpc: "2.0",
+    id: entry.id,
+    error: {
+      code: -32001,
+      message:
+        `mcp-agents: Codex reported ${entry.terminalEventType ?? "turn_aborted"}; ` +
+        `the turn did not complete. Any writes it made are in the tree — verify ` +
+        `the workspace before continuing.` +
+        (entry.threadId ? ` Codex thread: ${entry.threadId}.` : ""),
+    },
+  });
+  const terminalFrameForOutcome = (entry, outcome) =>
+    outcome === "aborted" ? terminalAbortErrorFrame(entry) : terminalResultFrame(entry);
+  const synthesizeTerminalResult = (entry, outcome) => {
     if (
       finalizing || inFlight.get(idKey(entry.id)) !== entry ||
-      entry.state !== "terminal_grace"
+      entry.state !== "terminal_grace" || entry.terminalOutcome !== outcome ||
+      (outcome !== "completed" && outcome !== "aborted")
     ) return;
     if (entry.internalJob) {
       const key = idKey(entry.id);
@@ -4099,6 +4131,13 @@ function runCodexPassthrough({
       suppressedResponseIds.add(key);
       if (job?.state === "canceling") {
         transitionJobTerminal(job, "canceled", "canceled", { threadId: entry.threadId });
+      } else if (job && outcome === "aborted") {
+        transitionJobTerminal(
+          job,
+          "failed",
+          `${entry.terminalEventType ?? "turn_aborted"}: Codex aborted the turn before completion`,
+          { threadId: entry.threadId },
+        );
       } else if (job) {
         transitionJobTerminal(job, "completed", "completed", {
           resultText: entry.lastAgentMessage ?? "",
@@ -4118,11 +4157,11 @@ function runCodexPassthrough({
     suppressedResponseIds.add(key);
     settleInFlight(entry.id);
     queueGeneratedFrame(
-      terminalResultFrame(entry),
+      terminalFrameForOutcome(entry, outcome),
       { kind: "terminal_result" },
     );
     logErr(
-      `[mcp-agents] recovered missing codex response for request ` +
+      `[mcp-agents] settled ${outcome} codex request from terminal event for request ` +
         `${JSON.stringify(entry.id)} (thread_id=${entry.threadId ?? "unknown"})`,
     );
     finalizeOnSuppressionCap();
@@ -4255,21 +4294,23 @@ function runCodexPassthrough({
   const flushReadyTerminalResults = () => {
     if (!canInjectGeneratedFrame()) return;
     for (const entry of [...inFlight.values()]) {
-      if (entry.fallbackReady) synthesizeTerminalResult(entry);
-      else if (entry.timeoutPending) {
+      if (entry.fallbackReady) {
+        synthesizeTerminalResult(entry, entry.terminalOutcome);
+      } else if (entry.timeoutPending) {
         abortRequestNoTeardown(entry, entry.timeoutPending);
       }
     }
   };
-  const beginTerminalGrace = (entry, message) => {
+  const beginTerminalGrace = (entry, message, outcome) => {
     if (entry.state !== "open") return;
     if (entry.internalJob) finishJobCommentary(jobs.get(entry.jobId));
     entry.state = "terminal_grace";
+    entry.terminalOutcome = outcome;
     stopEntryProgress(entry);
     entry.lastAgentMessage = typeof message === "string" ? message : "";
     clearTimer(entry, "idleTimer");
     entry.terminalTimer = setTimeout(
-      () => synthesizeTerminalResult(entry),
+      () => synthesizeTerminalResult(entry, outcome),
       terminalGraceMs,
     );
   };
@@ -4310,6 +4351,73 @@ function runCodexPassthrough({
         `job_id=${info.jobId ?? "none"}); any writes it made are in the tree`,
     );
   };
+  const releaseSuppressedResponse = (key) => {
+    const entry = inFlight.get(key);
+    if (entry?.state === "canceled") entry.suppressedNativeResponseSeen = true;
+    suppressedResponseIds.delete(key);
+    noteAbandonedTurnSettled(key);
+  };
+  const confirmedCancellationMessage = (entry) =>
+    entry.terminalOutcome === "completed"
+      ? `completed after cancellation was requested ` +
+        `(${entry.terminalEventType}; result discarded)`
+      : `canceled (confirmed by ${entry.terminalEventType})`;
+  const settleConfirmedCancellation = (entry) => {
+    if (
+      finalizing || inFlight.get(idKey(entry.id)) !== entry ||
+      entry.state !== "canceled" || entry.confirmedCancelPending
+    ) return;
+    clearTimer(entry, "cancelTimer");
+    const key = idKey(entry.id);
+    if (entry.internalJob) {
+      const job = jobs.get(entry.jobId);
+      privateJobRequestIds.delete(key);
+      if (!entry.suppressedNativeResponseSeen) suppressedResponseIds.add(key);
+      if (job && !isTerminalJob(job)) {
+        transitionJobTerminal(
+          job,
+          "canceled",
+          confirmedCancellationMessage(entry),
+          { threadId: entry.threadId },
+        );
+      }
+      settleInFlight(entry.id);
+      finalizeOnSuppressionCap();
+      return;
+    }
+    if (entry.suppressedNativeResponseSeen) {
+      settleInFlight(entry.id);
+      return;
+    }
+    if (canArmResponseSuppression()) {
+      suppressedResponseIds.add(key);
+      settleInFlight(entry.id);
+      finalizeOnSuppressionCap();
+      return;
+    }
+    // The terminal event proves the turn stopped, but a response suppression
+    // latch still cannot start in the middle of a native frame. Give that frame
+    // one bounded window to finish; only a continuing framing wedge can escalate.
+    if (!entry.confirmedCancelGraceEscalated) {
+      entry.confirmedCancelGraceEscalated = true;
+      entry.confirmedCancelPending = true;
+      entry.cancelTimer = setTimeout(
+        () => {
+          entry.confirmedCancelPending = false;
+          settleConfirmedCancellation(entry);
+        },
+        cancelGraceMs,
+      );
+      return;
+    }
+    finalize({
+      reason:
+        `request ${JSON.stringify(entry.id)} cancellation was confirmed by ` +
+        `${entry.terminalEventType}, but codex left a frame unterminated`,
+      emit: true,
+      exitCode: 1,
+    });
+  };
   // A cancellation grace expiry used to tear the WHOLE bridge down, which killed
   // every other in-flight request and every background job in this process, and
   // destroyed the isolated CODEX_HOME (so no thread could ever be resumed). A
@@ -4322,6 +4430,10 @@ function runCodexPassthrough({
   const onCancelGraceExpired = (entry) => {
     if (finalizing || inFlight.get(idKey(entry.id)) !== entry) return;
     const key = idKey(entry.id);
+    if (entry.suppressedNativeResponseSeen) {
+      settleInFlight(entry.id);
+      return;
+    }
     if (entry.internalJob) {
       // Background job: the client polls by jobId and never sees this native id,
       // so there is no client frame to place and no boundary to wait for. Drive
@@ -4390,6 +4502,9 @@ function runCodexPassthrough({
       settleInFlight(id);
       return true;
     }
+    const terminalEvidenceRecorded =
+      entry.state === "terminal_grace" &&
+      (entry.terminalOutcome === "completed" || entry.terminalOutcome === "aborted");
     entry.state = "canceled";
     stopEntryProgress(entry);
     clearTimer(entry, "idleTimer");
@@ -4401,6 +4516,13 @@ function runCodexPassthrough({
     // though nothing will ever read its result.
     requestNativeCancel(entry, "mcp-agents: client cancelled the request");
     entry.cancelGraceEscalated = false;
+    entry.confirmedCancelGraceEscalated = false;
+    entry.confirmedCancelPending = false;
+    entry.suppressedNativeResponseSeen = false;
+    if (terminalEvidenceRecorded) {
+      settleConfirmedCancellation(entry);
+      return false;
+    }
     entry.cancelTimer = setTimeout(
       () => onCancelGraceExpired(entry),
       cancelGraceMs,
@@ -4429,11 +4551,27 @@ function runCodexPassthrough({
       msg && typeof msg === "object" && "id" in msg &&
       ("result" in msg || "error" in msg)
     ) {
-      const entry = inFlight.get(idKey(msg.id));
+      const key = idKey(msg.id);
+      const entry = inFlight.get(key);
+      if (
+        entry && !entry.internalJob && entry.state === "terminal_grace" &&
+        entry.terminalOutcome === "aborted"
+      ) {
+        logErr(
+          `[mcp-agents] WARNING native codex response settled aborted request ` +
+            `${JSON.stringify(entry.id)}; forwarding unchanged because foreground ` +
+            `Codex calls are byte-for-byte passthrough ` +
+            `(thread_id=${entry.threadId ?? "unknown"})`,
+        );
+      }
       if (entry?.internalJob) handlePrivateResponse(entry, msg);
-      const privateJob = jobsByNativeRequest.get(idKey(msg.id));
+      const privateJob = jobsByNativeRequest.get(key);
+      // Forwarding leads observation. A cancellation that began mid-frame may
+      // arm suppression only after this response was already forwarded in the
+      // same chunk; release that newly-created latch before settling the entry.
+      if (suppressedResponseIds.has(key)) releaseSuppressedResponse(key);
       settleInFlight(msg.id);
-      if (privateJob) jobsByNativeRequest.delete(idKey(msg.id));
+      if (privateJob) jobsByNativeRequest.delete(key);
       return;
     }
     if (msg?.id != null && typeof msg.method === "string") {
@@ -4479,7 +4617,15 @@ function runCodexPassthrough({
     if (msg?.method !== "codex/event") return;
     const requestId = msg.params?._meta?.requestId;
     const entry = requestId == null ? undefined : inFlight.get(idKey(requestId));
-    if (!entry || entry.state !== "open") return;
+    const event = msg.params?.msg;
+    const eventType = event?.type;
+    const terminalOutcome = SUCCESS_TERMINAL_EVENTS.has(eventType)
+      ? "completed"
+      : ABORT_TERMINAL_EVENTS.has(eventType) ? "aborted" : undefined;
+    if (
+      !entry ||
+      (entry.state !== "open" && !(entry.state === "canceled" && terminalOutcome))
+    ) return;
     const job = entry.internalJob ? jobs.get(entry.jobId) : undefined;
     const threadId = msg.params?._meta?.threadId;
     if (typeof threadId === "string" && threadId) {
@@ -4489,9 +4635,17 @@ function runCodexPassthrough({
       if (!entry.cwdInferred) rememberThreadWorkspace(threadId, entry.cwd, entry.sandbox);
     }
     if (job && typeof threadId === "string" && threadId) job.threadId = threadId;
-    const event = msg.params?.msg;
-    const eventType = event?.type;
     entry.lastActivityAt = Date.now();
+    if (terminalOutcome) {
+      entry.terminalEventType = eventType;
+      entry.terminalEventObservedAt = entry.lastActivityAt;
+      entry.terminalOutcome = terminalOutcome;
+    }
+    if (entry.state === "canceled") {
+      if (job) finishJobCommentary(job);
+      settleConfirmedCancellation(entry);
+      return;
+    }
     if (job) {
       job.lastActivityAt = entry.lastActivityAt;
       captureJobCommentary(job, event);
@@ -4506,9 +4660,9 @@ function runCodexPassthrough({
       }
     }
     if (progressMessage) scheduleProgress(entry, progressMessage);
-    if (eventType === "task_complete" || eventType === "turn_complete") {
+    if (terminalOutcome) {
       if (job) finishJobCommentary(job);
-      beginTerminalGrace(entry, event?.last_agent_message);
+      beginTerminalGrace(entry, event?.last_agent_message, terminalOutcome);
     }
   };
 
@@ -4723,14 +4877,14 @@ function runCodexPassthrough({
             settleInFlight(m.id);
             jobsByNativeRequest.delete(idKey(m.id));
             privateJobRequestIds.delete(idKey(m.id));
-            suppressedResponseIds.delete(idKey(m.id));
+            releaseSuppressedResponse(idKey(m.id));
             outStr = null;
           } else if (
             m && typeof m === "object" && "id" in m &&
             ("result" in m || "error" in m) &&
             suppressedResponseIds.has(idKey(m.id))
           ) {
-            suppressedResponseIds.delete(idKey(m.id));
+            releaseSuppressedResponse(idKey(m.id));
             outStr = null;
           } else if (
             m && typeof m === "object" && "id" in m &&
@@ -4772,12 +4926,30 @@ function runCodexPassthrough({
 
       for (const entry of [...inFlight.values()]) {
         if (entry.state !== "terminal_grace") continue;
-        try {
-          process.stdout.write(`${JSON.stringify(terminalResultFrame(entry))}\n`);
-        } catch {}
+        const outcome = entry.terminalOutcome;
+        const outcomeLabel = outcome === "completed" || outcome === "aborted"
+          ? outcome
+          : "terminal";
+        const job = entry.internalJob ? jobs.get(entry.jobId) : undefined;
+        if (job?.state === "canceling") {
+          transitionJobTerminal(job, "canceled", "canceled", { threadId: entry.threadId });
+        } else if (job && outcome === "aborted") {
+          transitionJobTerminal(
+            job,
+            "failed",
+            `${entry.terminalEventType ?? "turn_aborted"}: Codex aborted the turn before completion`,
+            { threadId: entry.threadId },
+          );
+        } else if (!entry.internalJob && (outcome === "completed" || outcome === "aborted")) {
+          try {
+            process.stdout.write(
+              `${JSON.stringify(terminalFrameForOutcome(entry, outcome))}\n`,
+            );
+          } catch {}
+        }
         settleInFlight(entry.id);
         logErr(
-          `[mcp-agents] recovered completed codex request ` +
+          `[mcp-agents] recovered ${outcomeLabel} codex request ` +
             `${JSON.stringify(entry.id)} during teardown ` +
             `(thread_id=${entry.threadId ?? "unknown"})`,
         );
@@ -4913,11 +5085,10 @@ function runCodexPassthrough({
       }
       rewriteBuf = rewriteBuf.subarray(nl + 1);
       if (rewriteDropReleaseId !== undefined) {
-        suppressedResponseIds.delete(rewriteDropReleaseId);
+        releaseSuppressedResponse(rewriteDropReleaseId);
         // The response finally landed, oversized or not — the turn is no longer
         // abandoned. Without this an over-limit result left its record forever and
         // abandonedTurnsProcessWide only ever climbed.
-        noteAbandonedTurnSettled(rewriteDropReleaseId);
         rewriteDropReleaseId = undefined;
       }
       rewriteDropUntilNewline = false;
@@ -4951,8 +5122,7 @@ function runCodexPassthrough({
         const privateJob = key === undefined ? undefined : jobsByNativeRequest.get(key);
         if (privateJob) {
           privateJobRequestIds.delete(key);
-          suppressedResponseIds.delete(key);
-          noteAbandonedTurnSettled(key);
+          releaseSuppressedResponse(key);
           jobsByNativeRequest.delete(key);
           transitionJobTerminal(
             privateJob,
@@ -4969,8 +5139,7 @@ function runCodexPassthrough({
           continue;
         }
         if (key !== undefined && suppressedResponseIds.has(key)) {
-          suppressedResponseIds.delete(key);
-          noteAbandonedTurnSettled(key);
+          releaseSuppressedResponse(key);
           continue;
         }
         if (key !== undefined && pendingToolsListIds.has(key)) {
@@ -4997,16 +5166,14 @@ function runCodexPassthrough({
           const key = idKey(msg.id);
           if (jobsByNativeRequest.has(key)) {
             privateJobRequestIds.delete(key);
-            suppressedResponseIds.delete(key);
+            releaseSuppressedResponse(key);
             // A job's late native response settles its abandonment just as a plain
             // call's does. Without this the record survived for the life of the
             // process, so codex-peek's abandonedTurnsProcessWide only ever climbed and
             // its "may still be writing" warning stopped meaning anything.
-            noteAbandonedTurnSettled(key);
             outBuf = null;
           } else if (suppressedResponseIds.has(key)) {
-            suppressedResponseIds.delete(key);
-            noteAbandonedTurnSettled(key);
+            releaseSuppressedResponse(key);
             outBuf = null;
           } else if (pendingToolsListIds.has(key)) {
             pendingToolsListIds.delete(key);
@@ -5040,8 +5207,9 @@ function runCodexPassthrough({
             "native result exceeded the 10 MiB background-job capture limit",
           );
           privateJobRequestIds.delete(key);
-          suppressedResponseIds.delete(key);
           jobsByNativeRequest.delete(key);
+          // Keep suppression until the oversized response reaches its newline;
+          // rewriteDropReleaseId then releases it through the common helper.
           rewriteDropReleaseId = key;
         } else {
           rewriteDropReleaseId = undefined;

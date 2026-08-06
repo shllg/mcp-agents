@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- Treat Codex `turn_aborted` events as terminal failures when the bridge answers
+  on Codex's behalf: synthesized foreground responses are errors, background jobs
+  fail, and teardown recovery never reports success. Native foreground responses
+  remain byte-for-byte passthrough; if one settles an aborted turn, the bridge now
+  warns on stderr instead of silently implying the native result was bridge-owned.
+  Abort errors also warn that applied writes remain in the workspace.
+- A terminal event that acknowledges a requested cancellation now gets its own
+  bounded frame-boundary grace instead of inheriting the pre-confirmation wait;
+  duplicate terminal events cannot consume that grace. Only a stream still wedged
+  after the post-confirmation grace retains the existing bounded escalation. Job
+  status distinguishes an honored abort from a turn that completed after
+  cancellation was requested and whose result was discarded. An unacknowledged
+  cancellation remains explicitly abandoned and may still be writing to the
+  workspace.
+- Preserve terminal evidence that arrives just before a cancellation, so an
+  already-aborted turn is confirmed immediately instead of being downgraded to
+  an unacknowledged cancellation. A cancellation that starts mid-frame also
+  releases response suppression when the already-forwarded native response is
+  observed, preventing phantom request-id reservations and bridge teardown.
+
 ## [0.25.0] - 2026-07-25
 
 ### Added

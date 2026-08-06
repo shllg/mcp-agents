@@ -2368,7 +2368,7 @@ const eventMessage = (requestId, type, extra = {}) => ({
 });
 const event = (requestId, type, extra = {}, callback) =>
   send(eventMessage(requestId, type, extra), callback);
-const result = (id, content) => send({
+const resultMessage = (id, content) => ({
   jsonrpc: "2.0",
   id,
   result: {
@@ -2376,10 +2376,11 @@ const result = (id, content) => send({
     structuredContent: { threadId: threadId(id), content },
   },
 });
+const result = (id, content) => send(resultMessage(id, content));
 const later = (delay, fn) => timers.push(setTimeout(fn, delay));
 const every = (delay, fn) => timers.push(setInterval(fn, delay));
 
-function startCall(id) {
+function startCall(id, prompt) {
   if (mode !== "asyncwaitcancel") {
     event(id, "session_configured", { thread_id: threadId(id) });
   }
@@ -2494,9 +2495,39 @@ function startCall(id) {
       later(80, () => event(id, "task_complete", { last_agent_message: "FALLBACK_RESULT" }));
       later(260, () => result(id, "LATE_PRIVATE_RESULT"));
       break;
+    case "asyncabort":
+      event(id, "task_started");
+      later(40, () => event(id, "turn_aborted", { last_agent_message: "MUST_NOT_SUCCEED" }));
+      break;
+    case "asyncabortnative":
+      event(id, "task_started");
+      later(40, () => event(id, "turn_aborted", { last_agent_message: "MUST_NOT_SUCCEED" }));
+      later(60, () => result(id, "MUST_NOT_COMPLETE_AFTER_ABORT"));
+      break;
+    case "asyncabortexit":
+      event(id, "task_started");
+      later(40, () => event(
+        id,
+        "turn_aborted",
+        { last_agent_message: "MUST_NOT_SUCCEED" },
+        () => process.exit(0),
+      ));
+      break;
+    case "asyncabortcancel":
+      event(id, "task_started");
+      later(30, () => event(id, "turn_aborted"));
+      break;
     case "asynccancel":
       event(id, "task_started");
       later(30, () => event(id, "agent_message", { phase: "commentary", message: "Waiting for cancellation" }));
+      break;
+    case "asynccancelabort":
+      event(id, "task_started");
+      later(50, () => event(id, "turn_aborted"));
+      break;
+    case "asynccancelcomplete":
+      event(id, "task_started");
+      later(50, () => event(id, "task_complete", { last_agent_message: "COMPLETE_BUILD" }));
       break;
     case "asyncprivacy":
       event(id, "item_started", { item: { type: "AgentMessage", id: `private-safe-${id}`, phase: "commentary" } });
@@ -2563,12 +2594,25 @@ function startCall(id) {
     case "terminal":
       later(40, () => event(id, "task_complete", { last_agent_message: "DONE" }));
       break;
+    case "suppressioncap":
+      later(20, () => event(id, "task_complete", { last_agent_message: `DONE_${id}` }));
+      break;
+    case "aborted":
+      later(40, () => event(id, "turn_aborted", { last_agent_message: "MUST_NOT_SUCCEED" }));
+      break;
     case "terminalexit":
       later(40, () => event(id, "task_complete", { last_agent_message: "DONE" }, () => process.exit(0)));
+      break;
+    case "abortedexit":
+      later(40, () => event(id, "turn_aborted", { last_agent_message: "MUST_NOT_SUCCEED" }, () => process.exit(0)));
       break;
     case "native":
       later(40, () => event(id, "turn_complete", { last_agent_message: "DONE" }));
       later(80, () => result(id, "NATIVE"));
+      break;
+    case "nativeabort":
+      later(40, () => event(id, "turn_aborted"));
+      later(80, () => result(id, "NATIVE_AFTER_ABORT"));
       break;
     case "late":
       later(40, () => event(id, "task_complete", { last_agent_message: "DONE" }));
@@ -2586,6 +2630,80 @@ function startCall(id) {
       event(id, "task_started");
       every(30, () => event(id, "exec_command_begin", { command: "SENTINEL_CANCEL" }));
       break;
+    case "cancelconfirmedlate": {
+      if (id !== 2) {
+        later(20, () => result(id, "SURVIVED_CONFIRMED_CANCEL"));
+        break;
+      }
+      event(id, "task_started");
+      const before = JSON.stringify(eventMessage(id, "warning", { message: "BEFORE_CONFIRM" }));
+      const beforeSplit = before.length - 5;
+      const after = JSON.stringify(eventMessage(id, "warning", { message: "AFTER_CONFIRM" }));
+      const afterSplit = after.length - 5;
+      later(100, () => process.stdout.write(before.slice(0, beforeSplit)));
+      later(180, () => process.stdout.write(
+        `${before.slice(beforeSplit)}\n${JSON.stringify(eventMessage(id, "turn_aborted"))}\n${after.slice(0, afterSplit)}`,
+      ));
+      later(230, () => process.stdout.write(`${after.slice(afterSplit)}\n`));
+      break;
+    }
+    case "cancelconfirmedwedge": {
+      event(id, "task_started");
+      const before = JSON.stringify(eventMessage(id, "warning", { message: "BEFORE_WEDGED_CONFIRM" }));
+      const beforeSplit = before.length - 5;
+      const after = JSON.stringify(eventMessage(id, "warning", { message: "AFTER_WEDGED_CONFIRM" }));
+      const afterSplit = after.length - 5;
+      // Cancellation arrives while `before` is partial. Its first grace expires
+      // before this chunk supplies a boundary and the abort acknowledgement, then
+      // `after` keeps the stream wedged through the confirmation-specific grace.
+      later(40, () => process.stdout.write(before.slice(0, beforeSplit)));
+      later(180, () => process.stdout.write(
+        `${before.slice(beforeSplit)}\n${JSON.stringify(eventMessage(id, "turn_aborted"))}\n` +
+        after.slice(0, afterSplit),
+      ));
+      break;
+    }
+    case "canceldoubleterminal": {
+      if (id !== 2) {
+        later(20, () => result(id, "SURVIVED_DOUBLE_TERMINAL"));
+        break;
+      }
+      event(id, "task_started");
+      const trailing = JSON.stringify(eventMessage(id, "warning", { message: "AFTER_TERMINALS" }));
+      const splitAt = trailing.length - 5;
+      later(80, () => process.stdout.write(
+        `${JSON.stringify(eventMessage(id, "task_complete"))}\n` +
+        `${JSON.stringify(eventMessage(id, "turn_complete"))}\n${trailing.slice(0, splitAt)}`,
+      ));
+      later(130, () => process.stdout.write(`${trailing.slice(splitAt)}\n`));
+      break;
+    }
+    case "cancelcoalesced":
+      if (prompt === "REUSED") {
+        later(20, () => result(id, "REUSED_AFTER_COALESCED_CANCEL"));
+        break;
+      }
+      event(id, "task_started");
+      later(80, () => process.stdout.write(
+        `${JSON.stringify(eventMessage(id, "turn_aborted"))}\n` +
+        `${JSON.stringify(resultMessage(id, "SUPPRESSED_NATIVE_CANCEL_RESULT"))}\n`,
+      ));
+      break;
+    case "cancelcoalescedunsafe": {
+      if (prompt === "REUSED") {
+        later(20, () => result(id, "REUSED_AFTER_UNSAFE_CANCEL"));
+        break;
+      }
+      event(id, "task_started");
+      const partial = JSON.stringify(eventMessage(id, "warning", { message: "MID_FRAME_CANCEL" }));
+      const splitAt = partial.length - 5;
+      later(40, () => process.stdout.write(partial.slice(0, splitAt)));
+      later(80, () => process.stdout.write(
+        `${partial.slice(splitAt)}\n${JSON.stringify(eventMessage(id, "turn_aborted"))}\n` +
+        `${JSON.stringify(resultMessage(id, "ALREADY_FORWARDED_CANCEL_RESULT"))}\n`,
+      ));
+      break;
+    }
     case "clientgone":
       // Keeps working forever and deliberately ignores stdin EOF, standing in
       // for a codex mid-turn that does not wind down when the client vanishes.
@@ -2607,7 +2725,7 @@ process.stdin.on("data", (data) => {
       send({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "lifecycle-stub", version: "0" } } });
     } else if (message.method === "tools/call") {
       fs.appendFileSync(process.env.MCP_AGENTS_TEST_CALL_CAPTURE, `${JSON.stringify({ id: message.id, prompt: message.params?.arguments?.prompt })}\n`);
-      startCall(message.id);
+      startCall(message.id, message.params?.arguments?.prompt);
     } else if (message.method === "ping") {
       send({ jsonrpc: "2.0", id: message.id, result: {} });
     }
@@ -2691,10 +2809,17 @@ const startScenario = () => {
     call(3, 42);
     call(4);
     call(5, { invalid: true });
-  } else if (mode === "cancel") {
+  } else if (["cancel", "cancelconfirmedlate", "cancelconfirmedwedge", "canceldoubleterminal", "cancelcoalesced", "cancelcoalescedunsafe"].includes(mode)) {
     call(2, "cancel-2");
-    call(3);
+    if (mode === "cancel") call(3);
     setTimeout(() => send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 2, reason: "test" } }), 60);
+    if (mode === "cancelconfirmedlate") setTimeout(() => call(3), 340);
+    if (mode === "canceldoubleterminal") setTimeout(() => call(3), 240);
+    if (["cancelcoalesced", "cancelcoalescedunsafe"].includes(mode)) {
+      setTimeout(() => call(2, undefined, "REUSED"), 180);
+    }
+  } else if (mode === "suppressioncap") {
+    for (let id = 2; id < 34; id += 1) call(id);
   } else {
     const tokenModes = new Set([
       "hard", "visibility", "coalesce", "wait", "partial", "partialstall", "settled", "terminalstop", "progressstall",
@@ -2771,7 +2896,7 @@ child.once("close", (code, signal) => {
     let calls = [];
     try { calls = readFileSync(callFile, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line)); } catch {}
     const timerAudits = [...err.matchAll(/settled timer count=(\d+)/g)].map((match) => Number(match[1]));
-    process.stdout.write(`${JSON.stringify({ code, signal, elapsedMs: Date.now() - started, stubAlive, calls, frames, parseErrors, rawHasProgress: out.includes('"method":"notifications/progress"'), timerAudits })}\n`);
+    process.stdout.write(`${JSON.stringify({ code, signal, elapsedMs: Date.now() - started, stubAlive, calls, frames, parseErrors, rawHasProgress: out.includes('"method":"notifications/progress"'), timerAudits, stderr: err })}\n`);
     process.exit(0);
   }, 80);
 });
@@ -2787,11 +2912,38 @@ EOF
 write_codex_job_driver() {
   cat >"$1/job-driver.mjs" <<'EOF'
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 
 const [stubDir, serverDir, mode = "async"] = process.argv.slice(2);
 const pidFile = `${stubDir}/codex.pid`;
 const callFile = `${stubDir}/calls.jsonl`;
+const terminalProbeFile = `${stubDir}/terminal-probe.cjs`;
+const terminalProbeOutput = `${stubDir}/terminal-probe.jsonl`;
+if (mode === "asyncabortexit") {
+  // Teardown intentionally cannot deliver a newly-woken status waiter: the MCP
+  // transport is closing. Observe the exact local-response frame at its queue
+  // boundary so this test can distinguish the abort-specific terminal message
+  // from the generic bridge-stopped sweep that follows it.
+  writeFileSync(terminalProbeFile, [
+    'const fs = require("node:fs");',
+    "const originalBufferFrom = Buffer.from;",
+    "let recording = false;",
+    "Buffer.from = function(value, ...args) {",
+    "  const buffer = Reflect.apply(originalBufferFrom, Buffer, [value, ...args]);",
+    "  if (!recording && typeof value === \"string\") {",
+    "    try {",
+    "      const structured = JSON.parse(value).result?.structuredContent;",
+    "      if (structured?.jobId && [\"completed\", \"failed\", \"canceled\"].includes(structured.state)) {",
+    "        recording = true;",
+    "        fs.appendFileSync(process.env.MCP_AGENTS_TEST_TERMINAL_PROBE, `${JSON.stringify(structured)}\\n`);",
+    "        recording = false;",
+    "      }",
+    "    } catch { recording = false; }",
+    "  }",
+    "  return buffer;",
+    "};",
+  ].join("\n"));
+}
 const child = spawn(
   "node",
   // --codex_status_interval 1.5 (=1500ms) is passed on the CLI while the env var below
@@ -2828,6 +2980,10 @@ const child = spawn(
       MCP_AGENTS_CODEX_WAIT_INTERVAL_MS: "100",
       MCP_AGENTS_TEST_PRIVATE_PREFIX: "mcp-agents/job/test/",
       ...(mode === "asynctruncate" ? { MCP_AGENTS_TEST_COMMENTARY_BYTES: "64" } : {}),
+      ...(mode === "asyncabortexit" ? {
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${terminalProbeFile}`.trim(),
+        MCP_AGENTS_TEST_TERMINAL_PROBE: terminalProbeOutput,
+      } : {}),
     },
     stdio: ["pipe", "pipe", "pipe"],
   },
@@ -2889,7 +3045,10 @@ const onFrame = (frame) => {
   const structured = frame.result.structuredContent ?? {};
   if (requestName === "codex-start") {
     jobId = structured.jobId;
-    if (mode === "asynccancel") {
+    if (mode === "asyncabortcancel") {
+      poll(structured.cursor);
+      setTimeout(() => callTool("codex-cancel", { jobId }), 70);
+    } else if (["asynccancel", "asynccancelabort", "asynccancelcomplete"].includes(mode)) {
       callTool("codex-cancel", { jobId });
     } else if (mode === "asyncwaitcancel") {
       canceledWaitId = callTool("codex-status", {
@@ -3014,6 +3173,11 @@ child.once("close", (code, signal) => {
     calls = readFileSync(callFile, "utf8")
       .split("\n").filter(Boolean).map((line) => JSON.parse(line));
   } catch {}
+  let terminalProbeResults = [];
+  try {
+    terminalProbeResults = readFileSync(terminalProbeOutput, "utf8")
+      .split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  } catch {}
   const privateIds = calls.map((call) => call.id).filter((id) => typeof id === "string");
   const rawFrames = JSON.stringify(frames);
   process.stdout.write(`${JSON.stringify({
@@ -3031,6 +3195,7 @@ child.once("close", (code, signal) => {
     parseErrors,
     privateIds,
     privateIdLeaked: privateIds.some((id) => rawFrames.includes(id)),
+    terminalProbeResults,
     stderr: err,
   })}\n`);
 });
@@ -3907,17 +4072,41 @@ test_codex_lifecycle "codex terminal event synthesizes result with early thread 
   '(.code == 0) and (.stubAlive == false) and
    ([.frames[] | select(.id == 2 and .result.content[0].text == "DONE" and .result.structuredContent == {"threadId":"00000000-0000-4000-8000-000000000002","content":"DONE"})] | length == 1) and
    ([.frames[] | select(.id == 2 and has("error"))] | length == 0)'
+test_codex_lifecycle "codex turn_aborted settles an open call as an error, never success" \
+  "aborted" "0.3" "2" "350" "80" "100" "0" \
+  '(.code == 0) and (.stubAlive == false) and
+   ([.frames[] | select(.id == 2 and .error.code == -32001 and
+     (.error.message | contains("turn_aborted")) and
+     (.error.message | ascii_downcase | contains("did not complete")) and
+     (.error.message | contains("Any writes it made are in the tree")) and
+     (.error.message | contains("verify the workspace")))] | length == 1) and
+   ([.frames[] | select(.id == 2 and has("result"))] | length == 0)'
 test_codex_lifecycle "codex terminal event survives immediate child exit" \
   "terminalexit" "0.3" "2" "350" "80" "100" "0" \
   '(.code == 0) and (.stubAlive == false) and
    ([.calls[] | select(.id == 2 and .prompt == "call 2")] | length == 1) and
    ([.frames[] | select(.id == 2 and .result.content[0].text == "DONE" and .result.structuredContent == {"threadId":"00000000-0000-4000-8000-000000000002","content":"DONE"})] | length == 1) and
    ([.frames[] | select(.id == 2 and has("error"))] | length == 0)'
+test_codex_lifecycle "codex teardown recovers turn_aborted as an error, never success" \
+  "abortedexit" "0.3" "2" "350" "80" "100" "0" \
+  '(.code == 0) and (.stubAlive == false) and
+   ([.calls[] | select(.id == 2 and .prompt == "call 2")] | length == 1) and
+   ([.frames[] | select(.id == 2 and .error.code == -32001 and
+     (.error.message | contains("turn_aborted")) and
+     (.error.message | ascii_downcase | contains("did not complete")))] | length == 1) and
+   ([.frames[] | select(.id == 2 and has("result"))] | length == 0)'
 test_codex_lifecycle "codex native result inside terminal grace wins" \
   "native" "0.3" "2" "300" "150" "100" "0" \
   '(.code == 0) and (.stubAlive == false) and
    ([.frames[] | select(.id == 2 and .result.structuredContent.content == "NATIVE")] | length == 1) and
    ([.frames[] | select(.id == 2 and (.result.structuredContent.content // "") == "DONE")] | length == 0)'
+test_codex_lifecycle "codex warns when a native response settles an aborted foreground turn" \
+  "nativeabort" "0.3" "2" "300" "150" "100" "0" \
+  '(.code == 0) and (.stubAlive == false) and
+   ([.frames[] | select(.id == 2 and .result.structuredContent.content == "NATIVE_AFTER_ABORT")] | length == 1) and
+   ([.frames[] | select(.id == 2 and has("error"))] | length == 0) and
+   (.stderr | contains("native codex response settled aborted request")) and
+   (.stderr | contains("forwarding unchanged"))'
 test_codex_lifecycle "codex late native result is suppressed after terminal fallback" \
   "late" "0.3" "2" "400" "70" "100" "0" \
   '(.code == 0) and (.stubAlive == false) and
@@ -3958,6 +4147,51 @@ test_codex_lifecycle "codex cancellation abandons only its own request and keeps
   '(.code == 0) and (.elapsedMs > 500) and (.stubAlive == false) and
    ([.frames[] | select(.id == 2 and (has("result") or has("error")))] | length == 0) and
    ([.frames[] | select(.params?._meta?.requestId == 3)] | length > 5)'
+test_codex_lifecycle "codex confirmed cancellation gets its own frame-boundary grace" \
+  "cancelconfirmedlate" "2" "2" "700" "80" "100" "0" \
+  '(.code == 0) and (.stubAlive == false) and
+   ([.frames[] | select(.id == 3 and .result.structuredContent.content == "SURVIVED_CONFIRMED_CANCEL")] | length == 1) and
+   (.stderr | contains("cancellation was confirmed by") | not) and
+   (.stderr | contains("NOT confirmed stopped") | not)'
+# Positive counterpart to the clean-settlement cases above and below: after the
+# first cancel grace expires mid-frame, an abort acknowledgement starts its own
+# frame-boundary grace. If the new partial remains wedged, that second bounded
+# wait must escalate instead of recurring forever or silently returning.
+test_codex_lifecycle "codex confirmed cancellation escalates a sustained framing wedge" \
+  "cancelconfirmedwedge" "2" "2" "900" "80" "100" "0" \
+  '(.code == 1) and (.stubAlive == false) and
+   (.elapsedMs >= 240) and (.elapsedMs < 700) and
+   (.stderr | contains("request 2 cancellation was confirmed by turn_aborted, but codex left a frame unterminated"))'
+test_codex_lifecycle "codex ignores duplicate terminal events while confirmed cancellation is pending" \
+  "canceldoubleterminal" "2" "2" "550" "80" "100" "0" \
+  '(.code == 0) and (.stubAlive == false) and
+   ([.frames[] | select(.id == 3 and .result.structuredContent.content == "SURVIVED_DOUBLE_TERMINAL")] | length == 1) and
+   (.stderr | contains("cancellation was confirmed by") | not)'
+test_codex_lifecycle "coalesced canceled terminal event and response release suppression before id reuse" \
+  "cancelcoalesced" "2" "2" "500" "80" "100" "0" \
+  '(.code == 0) and (.stubAlive == false) and
+   ([.calls[] | select(.id == 2)] | length == 2) and
+   ([.frames[] | select(.id == 2 and .result.structuredContent.content == "REUSED_AFTER_COALESCED_CANCEL")] | length == 1) and
+   ([.frames[] | select(.id == 2 and .result.structuredContent.content == "SUPPRESSED_NATIVE_CANCEL_RESULT")] | length == 0) and
+   (.stderr | contains("reused before the prior Codex response settled") | not)'
+test_codex_lifecycle "unsafe-boundary cancel releases suppression after coalesced abort and response" \
+  "cancelcoalescedunsafe" "2" "2" "500" "80" "100" "0" \
+  '(.code == 0) and (.stubAlive == false) and
+   ([.calls[] | select(.id == 2)] | length == 2) and
+   ([.frames[] | select(.id == 2 and .result.structuredContent.content == "ALREADY_FORWARDED_CANCEL_RESULT")] | length == 1) and
+   ([.frames[] | select(.id == 2 and .result.structuredContent.content == "REUSED_AFTER_UNSAFE_CANCEL")] | length == 1) and
+   ([.frames[] | select(.id == 2 and has("error"))] | length == 0) and
+   (.stderr | contains("reused before the prior Codex response settled") | not)'
+
+# Each terminal fallback must suppress the native response it answered for, but
+# that bounded set cannot grow forever when Codex never sends those responses.
+# Drive exactly the production limit (32 distinct ids) and require the bridge's
+# documented process-level backstop to fire.
+test_codex_lifecycle "codex tears down when late-response suppression reaches its limit" \
+  "suppressioncap" "2" "2" "1000" "40" "100" "0" \
+  '(.code == 1) and (.stubAlive == false) and (.elapsedMs < 700) and
+   (.calls | length == 32) and
+   (.stderr | contains("codex passthrough finalize: late-response suppression limit reached"))'
 
 test_codex_job_lifecycle "Codex background job exposes status, commentary, and result without private-id leakage" \
   '(.code == 0) and (.parseErrors == 0) and
@@ -3983,12 +4217,72 @@ test_codex_job_lifecycle "Codex background job terminal fallback suppresses its 
    (.resultResults | length == 1) and (.resultResults[0].text == "FALLBACK_RESULT") and
    ([.frames[] | select(.result.structuredContent.content == "LATE_PRIVATE_RESULT")] | length == 0)' \
   "asyncfallback"
+test_codex_job_lifecycle "Codex turn_aborted fails an open background job, never completes it" \
+  '(.code == 0) and (.parseErrors == 0) and (.privateIdLeaked == false) and
+   ([.statusResults[] | select(
+     .state == "failed" and (.message | contains("turn_aborted"))
+   )] | length == 1) and
+   ([.statusResults[] | select(.state == "completed")] | length == 0) and
+   (.resultResults | length == 1) and (.resultResults[0].state == "failed")' \
+  "asyncabort"
+test_codex_job_lifecycle "Codex native success after turn_aborted still fails the background job" \
+  '(.code == 0) and (.parseErrors == 0) and (.privateIdLeaked == false) and
+   ([.statusResults[] | select(
+     .state == "failed" and (.message | contains("turn_aborted"))
+   )] | length == 1) and
+   ([.statusResults[] | select(.state == "completed")] | length == 0) and
+   (.resultResults | length == 1) and
+   (.resultResults[0].state == "failed") and
+   ((.frames | tostring) | contains("MUST_NOT_COMPLETE_AFTER_ABORT") | not)' \
+  "asyncabortnative"
+test_codex_job_lifecycle "Codex teardown preserves the abort-specific background-job message" \
+  '(.code == 0) and (.parseErrors == 0) and (.privateIdLeaked == false) and
+   (.terminalProbeResults | length == 1) and
+   (.terminalProbeResults[0].state == "failed") and
+   (.terminalProbeResults[0].message == "Codex: turn_aborted: Codex aborted the turn before completion") and
+   (.terminalProbeResults[0].threadId == "00000000-0000-4000-8000-999999999999")' \
+  "asyncabortexit"
+test_codex_job_lifecycle "Codex cancellation preserves a turn_aborted observed before the request" \
+  '(.code == 0) and (.parseErrors == 0) and (.privateIdLeaked == false) and
+   ([.statusResults[] | select(
+     .state == "canceled" and (.message | contains("confirmed by turn_aborted"))
+   )] | length >= 1) and
+   ([.statusResults[] | select(
+     (.message | contains("did not acknowledge"))
+   )] | length == 0) and
+   (.resultResults | length == 1) and (.resultResults[0].state == "canceled") and
+   (.stderr | contains("NOT confirmed stopped") | not) and
+   (.stderr | contains("abandoned while possibly still running") | not)' \
+  "asyncabortcancel"
+test_codex_job_lifecycle "Codex turn_aborted confirms a requested cancellation before grace expiry" \
+  '(.code == 0) and (.parseErrors == 0) and (.privateIdLeaked == false) and
+   (.cancelResults | length == 1) and (.cancelResults[0].state == "canceling") and
+   ([.statusResults[] | select(
+     .state == "canceled" and (.message | contains("confirmed by turn_aborted"))
+   )] | length == 1) and
+   (.resultResults | length == 1) and (.resultResults[0].state == "canceled") and
+   (.stderr | contains("NOT confirmed stopped") | not) and
+   (.stderr | contains("abandoned while possibly still running") | not)' \
+  "asynccancelabort"
+test_codex_job_lifecycle "Codex completion after requested cancellation is distinct from an honored abort" \
+  '(.code == 0) and (.parseErrors == 0) and (.privateIdLeaked == false) and
+   (.cancelResults | length == 1) and (.cancelResults[0].state == "canceling") and
+   ([.statusResults[] | select(
+     .state == "canceled" and
+     (.message | contains("completed after cancellation was requested")) and
+     (.message | contains("task_complete")) and
+     (.message | contains("result discarded")) and
+     (.message | contains("confirmed by") | not)
+   )] | length == 1) and
+   (.resultResults | length == 1) and (.resultResults[0].state == "canceled")' \
+  "asynccancelcomplete"
 test_codex_job_lifecycle "Codex background job cancellation is visible and never emits a private-id error" \
   '(.code == 0) and (.parseErrors == 0) and (.privateIdLeaked == false) and
    (.cancelResults | length == 1) and (.cancelResults[0].state == "canceling") and
    ([.statusResults[] | select(.state == "canceled")] | length >= 1) and
    ([.frames[] | select(.method == "codex/event")] | length == 0) and
-   ([.frames[] | select((.error.message? // "") | contains("request was still open"))] | length == 0)' \
+   ([.frames[] | select((.error.message? // "") | contains("request was still open"))] | length == 0) and
+   (.stderr | contains("NOT confirmed stopped"))' \
   "asynccancel"
 test_codex_job_lifecycle "Codex commentary exposes only explicit commentary and strips unsafe controls" \
   '(.code == 0) and (.parseErrors == 0) and
