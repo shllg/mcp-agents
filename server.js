@@ -4,9 +4,12 @@
 import { randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import {
+  chmodSync,
   closeSync,
   copyFileSync,
   existsSync,
+  lstatSync,
+  mkdirSync,
   mkdtempSync,
   openSync,
   readFileSync,
@@ -29,6 +32,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const STARTUP_CWD = process.cwd();
 const VERSION = JSON.parse(
   readFileSync(join(__dirname, "package.json"), "utf8"),
 ).version;
@@ -97,6 +101,12 @@ const CLAUDE_JOB_RETENTION_MS = 60 * 60 * 1_000;
 const DEFAULT_CLAUDE_CANCEL_TERM_MS = 1_000;
 const DEFAULT_CLAUDE_CANCEL_KILL_MS = 1_000;
 const MAX_SUPPRESSED_CODEX_RESPONSES = 32;
+const CODEX_AUTH_FAILURE_CODE = "codex_auth_invalidated";
+const CODEX_AUTH_FAILURE_ACTION = "reauthenticate_and_restart";
+const CODEX_AUTH_FAILURE_MESSAGE =
+  "Codex authentication is invalid for this MCP process. Stop this " +
+  "mcp-agents bridge, run `codex logout` and `codex login` as the same OS " +
+  "user, verify with `codex exec`, then restart or reconnect the bridge.";
 // Isolated Codex homes older than this are assumed to belong to a bridge that
 // died without cleanup and are swept at startup. Comfortably longer than the
 // hard timeout so a live long-running session is never touched.
@@ -1803,16 +1813,41 @@ function buildCodexBridgeConfig({
 }
 
 /**
+ * Prepare the private parent for isolated Codex homes inside the startup cwd.
+ * Keeping it outside the OS temp directory allows Codex to create its PATH
+ * helper aliases without weakening the isolation between bridge instances.
+ * @returns {string}
+ */
+function prepareIsolatedCodexHomesRoot() {
+  const projectTmp = join(STARTUP_CWD, "tmp");
+  const root = join(projectTmp, "codex-homes");
+
+  mkdirSync(projectTmp, { recursive: true });
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+
+  const rootStat = lstatSync(root);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new Error(`isolated Codex home root is not a directory: ${root}`);
+  }
+  chmodSync(root, 0o700);
+
+  return root;
+}
+
+/**
  * Remove isolated Codex homes left behind by bridges that died without running
  * their cleanup (SIGKILL, a hard crash, a machine restart). Each one holds a
  * copy of auth.json, so they are both disk litter and credential sprawl. Only
  * directories older than the cutoff are touched, so a concurrently starting
  * bridge is never disturbed. Entirely best-effort.
+ * @param {string} root
  * @param {number} [maxAgeMs]
  * @returns {number} count removed
  */
-function sweepStaleCodexHomes(maxAgeMs = STALE_CODEX_HOME_MAX_AGE_MS) {
-  const root = tmpdir();
+function sweepStaleCodexHomes(
+  root,
+  maxAgeMs = STALE_CODEX_HOME_MAX_AGE_MS,
+) {
   const cutoff = Date.now() - maxAgeMs;
   let removed = 0;
   let names;
@@ -1835,10 +1870,11 @@ function sweepStaleCodexHomes(maxAgeMs = STALE_CODEX_HOME_MAX_AGE_MS) {
 
 /**
  * Create an isolated Codex home that preserves auth but strips inherited MCP servers.
- * @param {{ sourceCodexHome: string, model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean, agentsEnabledKeySupported: boolean }} opts
+ * @param {{ homesRoot: string, sourceCodexHome: string, model: string, modelReasoningEffort: string, sandboxMode: string, approvalPolicy: string, workspaceNetworkAccess: boolean, fastModeEnabled: boolean, agentsEnabledKeySupported: boolean }} opts
  * @returns {string}
  */
 function createIsolatedCodexHome({
+  homesRoot,
   sourceCodexHome,
   model,
   modelReasoningEffort,
@@ -1848,16 +1884,18 @@ function createIsolatedCodexHome({
   fastModeEnabled,
   agentsEnabledKeySupported,
 }) {
-  const codexHome = mkdtempSync(join(tmpdir(), "mcp-agents-codex-"));
+  const codexHome = mkdtempSync(join(homesRoot, "mcp-agents-codex-"));
   // If auth copy or config write throws after the dir exists, remove the
   // partially-prepared dir before rethrowing so it is never leaked.
   try {
+    chmodSync(codexHome, 0o700);
     const sourceAuthPath = join(sourceCodexHome, "auth.json");
     const targetAuthPath = join(codexHome, "auth.json");
     const configPath = join(codexHome, "config.toml");
 
     if (existsSync(sourceAuthPath)) {
       copyFileSync(sourceAuthPath, targetAuthPath);
+      chmodSync(targetAuthPath, 0o600);
     }
 
     // Seed the model catalogue from the real CODEX_HOME. Without it every bridge
@@ -1868,7 +1906,9 @@ function createIsolatedCodexHome({
     try {
       const sourceModelsCache = join(sourceCodexHome, "models_cache.json");
       if (existsSync(sourceModelsCache)) {
-        copyFileSync(sourceModelsCache, join(codexHome, "models_cache.json"));
+        const targetModelsCache = join(codexHome, "models_cache.json");
+        copyFileSync(sourceModelsCache, targetModelsCache);
+        chmodSync(targetModelsCache, 0o600);
       }
     } catch {}
 
@@ -1883,7 +1923,7 @@ function createIsolatedCodexHome({
         fastModeEnabled,
         agentsEnabledKeySupported,
       }),
-      "utf8",
+      { encoding: "utf8", mode: 0o600 },
     );
 
     return codexHome;
@@ -1905,18 +1945,34 @@ function createIsolatedCodexHome({
  * Best-effort and synchronous (runs from the process "exit" path). Writes
  * atomically via an exclusive same-directory temp + rename so the canonical
  * auth.json is never left truncated and never inherits stale temp permissions.
- * No-ops when auth was never copied in (API-key mode) or when the token is
- * unchanged.
+ * No-ops when auth was never copied in (API-key mode), when the isolated token
+ * is unchanged, or when the canonical file changed after this bridge copied
+ * it. That startup-snapshot conflict guard prevents a stale bridge from
+ * overwriting a newer manual login or another bridge's successful rotation
+ * during ordinary cleanup.
+ * @param {string} isolatedCodexHome
+ * @param {Buffer | undefined} initialAuth
  */
-function persistIsolatedCodexAuth(isolatedCodexHome) {
+function persistIsolatedCodexAuth(isolatedCodexHome, initialAuth) {
   try {
+    if (!Buffer.isBuffer(initialAuth)) return;
     const realHome = resolveCodexHome();
     const canonical = join(realHome, "auth.json");
     const rotated = join(isolatedCodexHome, "auth.json");
     if (!existsSync(rotated) || !existsSync(canonical)) return;
 
     const rotatedBuf = readFileSync(rotated);
-    if (rotatedBuf.equals(readFileSync(canonical))) return; // unchanged → skip
+    if (rotatedBuf.equals(initialAuth)) return; // isolated auth never rotated
+
+    const canonicalBuf = readFileSync(canonical);
+    if (rotatedBuf.equals(canonicalBuf)) return; // already persisted elsewhere
+    if (!canonicalBuf.equals(initialAuth)) {
+      logErr(
+        "[mcp-agents] skipped refreshed Codex auth.json write-back because " +
+          "canonical auth changed while this bridge was running",
+      );
+      return;
+    }
 
     const tmp = join(
       realHome,
@@ -1928,6 +1984,18 @@ function persistIsolatedCodexAuth(isolatedCodexHome) {
       writeFileSync(fd, rotatedBuf);
       closeSync(fd);
       fd = undefined;
+
+      // Narrow the non-atomic compare/rename window: another bridge or a manual
+      // login may have replaced canonical auth while this temp file was being
+      // prepared. POSIX has no portable rename-if-contents-still-match primitive.
+      if (!readFileSync(canonical).equals(initialAuth)) {
+        unlinkSync(tmp);
+        logErr(
+          "[mcp-agents] skipped refreshed Codex auth.json write-back because " +
+            "canonical auth changed while this bridge was running",
+        );
+        return;
+      }
       renameSync(tmp, canonical); // atomic replace on the same filesystem
     } catch (err) {
       if (fd !== undefined) {
@@ -2641,7 +2709,21 @@ function runCodexPassthrough({
   const fastModeEnabled = readCodexFastModeOptIn(sourceCodexHome);
   const codexVersion = readCodexBinaryVersion();
   const agentsEnabledKeySupported = codexSupportsAgentsEnabledKey(codexVersion);
-  const sweptHomes = sweepStaleCodexHomes();
+  let codexAuthInvalidated = false;
+  let isolatedCodexHomesRoot;
+
+  try {
+    isolatedCodexHomesRoot = prepareIsolatedCodexHomesRoot();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logErr(`[mcp-agents] failed to prepare isolated codex home root: ${msg}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const sweptHomes =
+    sweepStaleCodexHomes(isolatedCodexHomesRoot) +
+    sweepStaleCodexHomes(tmpdir());
   if (sweptHomes > 0) {
     logErr(
       `[mcp-agents] swept ${sweptHomes} stale isolated codex home(s) left by ` +
@@ -2652,6 +2734,7 @@ function runCodexPassthrough({
 
   try {
     isolatedCodexHome = createIsolatedCodexHome({
+      homesRoot: isolatedCodexHomesRoot,
       sourceCodexHome,
       model: resolvedModel,
       modelReasoningEffort: resolvedModelReasoningEffort,
@@ -2669,14 +2752,27 @@ function runCodexPassthrough({
   }
 
   const args = ["mcp-server"];
+  let initialIsolatedAuth;
+  try {
+    const isolatedAuthPath = join(isolatedCodexHome, "auth.json");
+    if (existsSync(isolatedAuthPath)) initialIsolatedAuth = readFileSync(isolatedAuthPath);
+  } catch {}
   let cleanedUp = false;
   const cleanupIsolatedCodexHome = () => {
     if (cleanedUp || !isolatedCodexHome) return;
     cleanedUp = true;
 
     // Write any rotated OAuth token back to the real CODEX_HOME before the temp
-    // home (and its refreshed auth.json) is removed.
-    persistIsolatedCodexAuth(isolatedCodexHome);
+    // home is removed. A credential Codex classified as unauthorized is never
+    // eligible: copying it back could clobber the manual login this error asks
+    // the operator to perform.
+    if (codexAuthInvalidated) {
+      logErr(
+        "[mcp-agents] skipped Codex auth.json write-back after authentication invalidation",
+      );
+    } else {
+      persistIsolatedCodexAuth(isolatedCodexHome, initialIsolatedAuth);
+    }
     try {
       rmSync(isolatedCodexHome, { recursive: true, force: true });
     } catch (err) {
@@ -2770,6 +2866,11 @@ function runCodexPassthrough({
   const generatedFrames = [];
   const locallyHandledResponseIds = new Set();
   const privateJobRequestIds = new Set();
+  // Foreground turns normally remain byte-for-byte passthrough. Their ids keep
+  // the existing bounded frame path active only until the terminal response so
+  // a typed Codex authentication failure can be replaced before it reaches the
+  // client. Every unrelated frame is still forwarded with its original bytes.
+  const foregroundTurnRequestIds = new Set();
   let flushGeneratedFrames = () => {};
 
   // ── In-flight request tracking ──────────────────────────────────────────
@@ -2805,7 +2906,56 @@ function runCodexPassthrough({
   const privateRequestPrefix = process.env.MCP_AGENTS_TEST_PRIVATE_PREFIX ??
     `mcp-agents/job/${randomUUID()}/`;
   let privateRequestSequence = 0;
+  let authFailureLogged = false;
   const idKey = (id) => `${typeof id}:${id}`;
+  const authFailureToolResult = (threadId) => ({
+    content: [{ type: "text", text: CODEX_AUTH_FAILURE_MESSAGE }],
+    structuredContent: {
+      code: CODEX_AUTH_FAILURE_CODE,
+      action: CODEX_AUTH_FAILURE_ACTION,
+      content: CODEX_AUTH_FAILURE_MESSAGE,
+      ...(threadId ? { threadId } : {}),
+    },
+    isError: true,
+  });
+  const hasAuthInvalidationMarker = (value) => {
+    if (typeof value !== "string") return false;
+    const normalized = value.toLowerCase();
+    return normalized.includes("refresh_token_invalidated") ||
+      normalized.includes("refresh token was revoked") ||
+      normalized.includes("refresh token has been revoked") ||
+      normalized.includes("authentication token has been invalidated");
+  };
+  const isTypedCodexAuthFailure = (msg) =>
+    msg?.method === "codex/event" &&
+    msg.params?.msg?.type === "error" &&
+    msg.params.msg.codex_error_info === "unauthorized";
+  const isKnownCodexTurnKey = (key) =>
+    key !== undefined &&
+    (foregroundTurnRequestIds.has(key) || jobsByNativeRequest.has(key) ||
+      suppressedResponseIds.has(key));
+  const isCodexAuthFailureResult = (msg) => {
+    if (msg?.result?.isError !== true) return false;
+    const texts = [
+      msg.result.structuredContent?.content,
+      ...(Array.isArray(msg.result.content)
+        ? msg.result.content
+          .filter((part) => part?.type === "text")
+          .map((part) => part.text)
+        : []),
+    ];
+    return texts.some(hasAuthInvalidationMarker);
+  };
+  const markCodexAuthInvalidated = (entry) => {
+    codexAuthInvalidated = true;
+    if (entry) entry.codexAuthInvalidated = true;
+    if (authFailureLogged) return;
+    authFailureLogged = true;
+    logErr(
+      `[mcp-agents] ${CODEX_AUTH_FAILURE_CODE}: Codex rejected this process's ` +
+        "cached authentication; reauthenticate, then restart or reconnect the bridge",
+    );
+  };
   const rememberLocallyHandledResponse = (requestKey) => {
     locallyHandledResponseIds.add(requestKey);
     if (locallyHandledResponseIds.size > MAX_SUPPRESSED_CODEX_RESPONSES) {
@@ -2877,6 +3027,7 @@ function runCodexPassthrough({
     }
     inFlight.delete(key);
     pendingToolsListIds.delete(key);
+    foregroundTurnRequestIds.delete(key);
     for (const [serverRequestKey, parentKey] of serverRequestParents) {
       if (parentKey === key) serverRequestParents.delete(serverRequestKey);
     }
@@ -3176,6 +3327,7 @@ function runCodexPassthrough({
       Math.floor((Date.now() - job.lastActivityAt) / 1_000),
     ),
     ...(job.threadId ? { threadId: job.threadId } : {}),
+    ...(job.errorCode ? { code: job.errorCode } : {}),
     resultAvailable: job.state === "completed",
     resultTruncated: false,
     commentaryStartOffset: job.commentaryStartOffset,
@@ -3413,7 +3565,12 @@ function runCodexPassthrough({
   };
   const activeJobCount = () =>
     [...jobs.values()].filter((job) => !isTerminalJob(job)).length;
-  const transitionJobTerminal = (job, state, message, { resultText, threadId } = {}) => {
+  const transitionJobTerminal = (
+    job,
+    state,
+    message,
+    { resultText, threadId, code } = {},
+  ) => {
     if (!job || isTerminalJob(job)) return;
     if (job.statusTimer) clearTimeout(job.statusTimer);
     job.statusTimer = undefined;
@@ -3425,6 +3582,7 @@ function runCodexPassthrough({
     job.terminalAt = Date.now();
     job.expiresAt = job.terminalAt + CODEX_JOB_RETENTION_MS;
     if (typeof threadId === "string" && threadId) job.threadId = threadId;
+    if (typeof code === "string" && code) job.errorCode = code;
     if (state === "completed") {
       job.resultText = typeof resultText === "string" ? resultText : "";
       job.resultEndOffset = codePointLength(job.resultText);
@@ -3456,6 +3614,14 @@ function runCodexPassthrough({
         `${entry.terminalEventType ?? "turn_aborted"}: Codex aborted the turn before completion`,
         { threadId: nativeThreadId },
       );
+      return;
+    }
+    if (entry.codexAuthInvalidated || isCodexAuthFailureResult(msg)) {
+      markCodexAuthInvalidated(entry);
+      transitionJobTerminal(job, "failed", CODEX_AUTH_FAILURE_MESSAGE, {
+        threadId: nativeThreadId,
+        code: CODEX_AUTH_FAILURE_CODE,
+      });
       return;
     }
     if (msg.error) {
@@ -3542,7 +3708,12 @@ function runCodexPassthrough({
       job.terminalRead = true;
       return localToolResult(
         `Codex job ${job.jobId} ${job.state}: ${job.statusMessage}`,
-        { jobId: job.jobId, state: job.state, resultAvailable: false },
+        {
+          jobId: job.jobId,
+          state: job.state,
+          ...(job.errorCode ? { code: job.errorCode } : {}),
+          resultAvailable: false,
+        },
         { isError: true },
       );
     }
@@ -3603,6 +3774,7 @@ function runCodexPassthrough({
       terminalRead: false,
       terminalAt: undefined,
       expiresAt: Number.POSITIVE_INFINITY,
+      errorCode: undefined,
     };
   };
   const startResult = (job) => localToolResult(
@@ -4619,6 +4791,9 @@ function runCodexPassthrough({
     const entry = requestId == null ? undefined : inFlight.get(idKey(requestId));
     const event = msg.params?.msg;
     const eventType = event?.type;
+    if (entry && isTypedCodexAuthFailure(msg)) {
+      markCodexAuthInvalidated(entry);
+    }
     const terminalOutcome = SUCCESS_TERMINAL_EVENTS.has(eventType)
       ? "completed"
       : ABORT_TERMINAL_EVENTS.has(eventType) ? "aborted" : undefined;
@@ -4834,7 +5009,14 @@ function runCodexPassthrough({
     // harmless ESRCH (swallowed by killGroup).
     killGroup("SIGKILL");
 
-    if (emit && (hasEmittableInFlight() || generatedFrames.length > 0)) {
+    const shouldEmitTeardownResponses =
+      emit && (hasEmittableInFlight() || generatedFrames.length > 0);
+    const shouldInspectBufferedOutput =
+      shouldEmitTeardownResponses || rewriteBuf.length > 0 ||
+      stdoutObsBuf.length > 0 || rewriteSkipUntilNewline ||
+      rewriteDropUntilNewline;
+
+    if (shouldInspectBufferedOutput) {
       // Framing recovery. Precedence handles bytes WITHHELD by buffer mode (which
       // the plain stdoutObsBuf recovery would mis-handle). EVERY write here is
       // try/catch-guarded: finalize runs synchronously from close/exit/idle/signal
@@ -4847,7 +5029,7 @@ function runCodexPassthrough({
         rewriteBuf = Buffer.alloc(0);
         rewriteSkipUntilNewline = false;
         stdoutObsBuf = Buffer.alloc(0);
-        if (!lastForwardedByteWasNewline) {
+        if (shouldEmitTeardownResponses && !lastForwardedByteWasNewline) {
           try { process.stdout.write("\n"); } catch {}
           lastForwardedByteWasNewline = true;
         }
@@ -4867,10 +5049,20 @@ function runCodexPassthrough({
         try {
           const m = JSON.parse(frameStr);
           outStr = frameStr;
+          const correlatedId = m?.params?._meta?.requestId;
+          const correlatedKey = correlatedId == null ? undefined : idKey(correlatedId);
+          const correlatedEntry = correlatedKey == null
+            ? undefined
+            : inFlight.get(correlatedKey);
           const privateEntry = m && typeof m === "object" && "id" in m
             ? inFlight.get(idKey(m.id))
             : undefined;
           if (
+            isKnownCodexTurnKey(correlatedKey) && isTypedCodexAuthFailure(m)
+          ) {
+            markCodexAuthInvalidated(correlatedEntry);
+            outStr = null;
+          } else if (
             privateEntry?.internalJob && ("result" in m || "error" in m)
           ) {
             handlePrivateResponse(privateEntry, m);
@@ -4879,6 +5071,19 @@ function runCodexPassthrough({
             privateJobRequestIds.delete(idKey(m.id));
             releaseSuppressedResponse(idKey(m.id));
             outStr = null;
+          } else if (
+            m && typeof m === "object" && "id" in m &&
+            ("result" in m || "error" in m) &&
+            foregroundTurnRequestIds.has(idKey(m.id))
+          ) {
+            if (privateEntry?.codexAuthInvalidated || isCodexAuthFailureResult(m)) {
+              markCodexAuthInvalidated(privateEntry);
+              m.result = authFailureToolResult(
+                m.result?.structuredContent?.threadId ?? privateEntry?.threadId,
+              );
+              delete m.error;
+              outStr = JSON.stringify(m);
+            }
           } else if (
             m && typeof m === "object" && "id" in m &&
             ("result" in m || "error" in m) &&
@@ -4897,24 +5102,34 @@ function runCodexPassthrough({
         } catch { outStr = null; }
         rewriteBuf = Buffer.alloc(0);
         stdoutObsBuf = Buffer.alloc(0);
-        if (outStr !== null) {
+        if (outStr !== null && shouldEmitTeardownResponses) {
           try { process.stdout.write(`${outStr}\n`); } catch {}
           observeOutgoingLine(frameStr); // clear its id -> no synthetic error for it
           lastForwardedByteWasNewline = true;
-        } else if (!lastForwardedByteWasNewline) {
+        } else if (
+          shouldEmitTeardownResponses && !lastForwardedByteWasNewline
+        ) {
           try { process.stdout.write("\n"); } catch {}
           lastForwardedByteWasNewline = true;
         }
       } else if (stdoutObsBuf.length > 0) {
-        observeOutgoingLine(stdoutObsBuf.toString("utf8"));
+        if (shouldEmitTeardownResponses) {
+          observeOutgoingLine(stdoutObsBuf.toString("utf8"));
+        }
         stdoutObsBuf = Buffer.alloc(0);
-        try { process.stdout.write("\n"); } catch {}
-        lastForwardedByteWasNewline = true;
-      } else if (!lastForwardedByteWasNewline) {
+        if (shouldEmitTeardownResponses) {
+          try { process.stdout.write("\n"); } catch {}
+          lastForwardedByteWasNewline = true;
+        }
+      } else if (
+        shouldEmitTeardownResponses && !lastForwardedByteWasNewline
+      ) {
         try { process.stdout.write("\n"); } catch {}
         lastForwardedByteWasNewline = true;
       }
+    }
 
+    if (shouldEmitTeardownResponses) {
       while (generatedFrames.length > 0 && lastForwardedByteWasNewline) {
         const frame = generatedFrames.shift();
         if (!generatedFrameIsLive(frame)) continue;
@@ -4957,7 +5172,15 @@ function runCodexPassthrough({
 
       for (const job of jobs.values()) {
         if (!isTerminalJob(job)) {
-          transitionJobTerminal(job, "failed", `bridge stopped: ${reason}`);
+          const nativeEntry = inFlight.get(job.nativeRequestKey);
+          if (nativeEntry?.codexAuthInvalidated) {
+            transitionJobTerminal(job, "failed", CODEX_AUTH_FAILURE_MESSAGE, {
+              threadId: nativeEntry.threadId,
+              code: CODEX_AUTH_FAILURE_CODE,
+            });
+          } else {
+            transitionJobTerminal(job, "failed", `bridge stopped: ${reason}`);
+          }
         }
       }
 
@@ -4966,18 +5189,24 @@ function runCodexPassthrough({
           entry.internalJob || entry.state === "canceled" ||
           entry.state === "local_response"
         ) continue;
-        const frame = {
-          jsonrpc: "2.0",
-          id: entry.id,
-          error: {
-            code: -32001,
-            message:
-              `mcp-agents: codex pass-through aborted before responding ` +
-              `(${reason}); the request was still open. Any applied edits may ` +
-              `exist — verify the tree.` +
-              (entry.threadId ? ` Codex thread: ${entry.threadId}.` : ""),
-          },
-        };
+        const frame = entry.codexAuthInvalidated
+          ? {
+            jsonrpc: "2.0",
+            id: entry.id,
+            result: authFailureToolResult(entry.threadId),
+          }
+          : {
+            jsonrpc: "2.0",
+            id: entry.id,
+            error: {
+              code: -32001,
+              message:
+                `mcp-agents: codex pass-through aborted before responding ` +
+                `(${reason}); the request was still open. Any applied edits may ` +
+                `exist — verify the tree.` +
+                (entry.threadId ? ` Codex thread: ${entry.threadId}.` : ""),
+            },
+          };
         try { process.stdout.write(`${JSON.stringify(frame)}\n`); } catch {}
       }
     }
@@ -4987,6 +5216,7 @@ function runCodexPassthrough({
     suppressedResponseIds.clear();
     abandonedTurns.clear();
     privateJobRequestIds.clear();
+    foregroundTurnRequestIds.clear();
     locallyHandledResponseIds.clear();
     serverRequestParents.clear();
     rewriteSkipUntilNewline = false;
@@ -5050,8 +5280,8 @@ function runCodexPassthrough({
     if (generatedFrames.length === 0) clearFlushStallGuard();
   };
 
-  // Once no tools/list id is outstanding (and not mid-skip), a trailing partial in
-  // rewriteBuf is a NON-tools/list frame (no response expected), so it must not stay
+  // Once no rewrite/filter id is outstanding (and not mid-skip), a trailing partial in
+  // rewriteBuf has no response expected, so it must not stay
   // withheld in buffer mode — raw mode forwards partials as they arrive, and
   // withholding it would byte-lose it if codex dies before its newline. Forward it
   // raw and drop back to the fast path. Called from BOTH paths that can clear the
@@ -5061,6 +5291,7 @@ function runCodexPassthrough({
     if (
       !finalizing && pendingToolsListIds.size === 0 &&
       suppressedResponseIds.size === 0 && privateJobRequestIds.size === 0 &&
+      foregroundTurnRequestIds.size === 0 &&
       !rewriteSkipUntilNewline &&
       !rewriteDropUntilNewline && rewriteBuf.length > 0
     ) {
@@ -5070,7 +5301,7 @@ function runCodexPassthrough({
   };
 
   // Flush every COMPLETE frame from rewriteBuf, rewriting only the matched
-  // tools/list response and forwarding everything else byte-for-byte. NEVER
+  // tools/list/auth response and forwarding everything else byte-for-byte. NEVER
   // early-returns on backpressure: forwardChunk pauses codex on the first `!ok`,
   // but this chunk's frames are all queued (Node buffers regardless), so no
   // COMPLETE frame is ever stranded — exactly today's "one write(chunk), then
@@ -5105,6 +5336,7 @@ function runCodexPassthrough({
       rewriteBuf = rewriteBuf.subarray(nl + 1);
       if (rewriteSkipReleaseId !== undefined) {
         pendingToolsListIds.delete(rewriteSkipReleaseId);
+        foregroundTurnRequestIds.delete(rewriteSkipReleaseId);
         rewriteSkipReleaseId = undefined;
       }
       rewriteSkipUntilNewline = false;
@@ -5145,6 +5377,9 @@ function runCodexPassthrough({
         if (key !== undefined && pendingToolsListIds.has(key)) {
           pendingToolsListIds.delete(key);
         }
+        if (key !== undefined && foregroundTurnRequestIds.has(key)) {
+          foregroundTurnRequestIds.delete(key);
+        }
         forwardChunk(frameBytes);
         continue;
       }
@@ -5154,16 +5389,37 @@ function runCodexPassthrough({
           frameBytes.subarray(0, frameBytes.length - 1).toString("utf8"),
         );
         const correlatedId = msg?.params?._meta?.requestId;
+        const correlatedKey = correlatedId == null ? undefined : idKey(correlatedId);
+        const correlatedEntry = correlatedKey == null
+          ? undefined
+          : inFlight.get(correlatedKey);
         const privateCorrelatedJob = correlatedId == null
           ? undefined
-          : jobsByNativeRequest.get(idKey(correlatedId));
-        if (privateCorrelatedJob && typeof msg.method === "string") {
+          : jobsByNativeRequest.get(correlatedKey);
+        if (isKnownCodexTurnKey(correlatedKey) && isTypedCodexAuthFailure(msg)) {
+          markCodexAuthInvalidated(correlatedEntry);
+          // Codex duplicates this error in the terminal tool result. Suppress
+          // the event so the client receives exactly one wrapper-owned failure.
+          outBuf = null;
+        } else if (privateCorrelatedJob && typeof msg.method === "string") {
           outBuf = null;
         } else if (
           msg && typeof msg === "object" && "id" in msg &&
           ("result" in msg || "error" in msg)
         ) {
           const key = idKey(msg.id);
+          const entry = inFlight.get(key);
+          if (foregroundTurnRequestIds.has(key)) {
+            foregroundTurnRequestIds.delete(key);
+            if (entry?.codexAuthInvalidated || isCodexAuthFailureResult(msg)) {
+              markCodexAuthInvalidated(entry);
+              msg.result = authFailureToolResult(
+                msg.result?.structuredContent?.threadId ?? entry?.threadId,
+              );
+              delete msg.error;
+              outBuf = Buffer.from(`${JSON.stringify(msg)}\n`, "utf8");
+            }
+          }
           if (jobsByNativeRequest.has(key)) {
             privateJobRequestIds.delete(key);
             releaseSuppressedResponse(key);
@@ -5222,7 +5478,10 @@ function runCodexPassthrough({
         rewriteDropUntilNewline = true;
       } else {
         rewriteSkipReleaseId =
-          key !== undefined && pendingToolsListIds.has(key) ? key : undefined;
+          key !== undefined &&
+          (pendingToolsListIds.has(key) || foregroundTurnRequestIds.has(key))
+            ? key
+            : undefined;
         forwardChunk(rewriteBuf);
         rewriteBuf = Buffer.alloc(0);
         rewriteSkipUntilNewline = true;
@@ -5248,7 +5507,8 @@ function runCodexPassthrough({
 
     if (
       pendingToolsListIds.size > 0 || suppressedResponseIds.size > 0 ||
-      privateJobRequestIds.size > 0 || rewriteBuf.length > 0 ||
+      privateJobRequestIds.size > 0 || foregroundTurnRequestIds.size > 0 ||
+      rewriteBuf.length > 0 ||
       rewriteSkipUntilNewline || rewriteDropUntilNewline
     ) {
       bufferModeForward(chunk);
@@ -5371,8 +5631,33 @@ function runCodexPassthrough({
         flushGeneratedFrames();
         return false;
       }
+      const toolName = msg.method === "tools/call" ? msg.params?.name : undefined;
+      const startsCodexTurn = Boolean(
+        CODEX_TOOL_CONTRACTS[toolName] ||
+        toolName === "codex-start" || toolName === "codex-reply-start",
+      );
+      if (codexAuthInvalidated && startsCodexTurn) {
+        queueLocalToolResponse(
+          inFlight.get(idKey(msg.id)),
+          authFailureToolResult(),
+        );
+        return false;
+      }
       if (msg.method === "tools/call" && handleJobToolCall(msg, inFlight.get(idKey(msg.id)))) {
         return false;
+      }
+      if (msg.method === "tools/call" && CODEX_TOOL_CONTRACTS[toolName]) {
+        const key = idKey(msg.id);
+        if (
+          pendingToolsListIds.size === 0 && suppressedResponseIds.size === 0 &&
+          privateJobRequestIds.size === 0 && foregroundTurnRequestIds.size === 0 &&
+          rewriteBuf.length === 0 && !rewriteSkipUntilNewline &&
+          !rewriteDropUntilNewline && !lastForwardedByteWasNewline
+        ) {
+          rewriteSkipUntilNewline = true;
+          rewriteSkipReleaseId = undefined;
+        }
+        foregroundTurnRequestIds.add(key);
       }
       if (msg.method === "tools/list") {
         // Arm the curated-schema rewrite latch for this tools/list response. If

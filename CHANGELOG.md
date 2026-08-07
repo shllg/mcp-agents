@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.27.0] - 2026-08-07
+
+### Fixed
+
+- Create isolated Codex homes under the server startup directory's private
+  `tmp/codex-homes/` tree instead of the OS temp directory. Codex 0.147 refuses
+  to create its PATH helper aliases beneath `/tmp`; the new `0700` directories
+  and `0600` runtime files preserve isolation without triggering that safety
+  check. Startup still sweeps stale homes from the legacy OS-temp location.
+- Interpret Codex's correlated `unauthorized` event as a process-wide auth
+  failure, replace its duplicate native event/result with one structured
+  `codex_auth_invalidated` tool error, fail background jobs with the same stable
+  code, and reject new turns locally until the bridge reconnects. State-only
+  tools remain available for inspecting or collecting existing jobs.
+- Prevent stale isolated auth from overwriting a newer `codex login` or another
+  bridge's token rotation during cleanup. Auth write-back now requires the
+  isolated copy to have changed while canonical auth still matches this
+  bridge's startup snapshot, and known-invalidated auth is never persisted.
+
 ## [0.26.0] - 2026-08-06
 
 ### Fixed

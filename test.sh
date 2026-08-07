@@ -6,6 +6,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+TEST_REPO_ROOT=$(pwd)
+TEST_CODEX_HOME_ROOT="$TEST_REPO_ROOT/tmp/codex-homes"
 SERVER="node server.js"
 TIMEOUT_CMD="timeout"
 if ! command -v timeout >/dev/null 2>&1; then
@@ -45,6 +47,7 @@ on_test_exit() {
   local status=$?
   trap - EXIT
   cleanup_registered_test_children
+  rmdir "$TEST_CODEX_HOME_ROOT" "$TEST_REPO_ROOT/tmp" 2>/dev/null || true
   rm -f "$TEST_CHILD_REGISTRY"
   exit "$status"
 }
@@ -1248,9 +1251,89 @@ write_codex_config_stub() {
 if [ "$1" = "--version" ]; then printf '%s\n' "${MCP_STUB_CODEX_VERSION:-codex-cli 0.145.0}"; exit 0; fi
 printf '%s\n' "$$" >> "$MCP_AGENTS_TEST_CHILD_REGISTRY"
 cp "$CODEX_HOME/config.toml" "$MCP_AGENTS_TEST_CONFIG_CAPTURE"
+if [ -n "${MCP_AGENTS_TEST_HOME_CAPTURE:-}" ]; then
+  file_mode() {
+    stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null
+  }
+  root=${CODEX_HOME%/*}
+  {
+    printf 'home=%s\n' "$CODEX_HOME"
+    printf 'root_mode=%s\n' "$(file_mode "$root")"
+    printf 'home_mode=%s\n' "$(file_mode "$CODEX_HOME")"
+    printf 'auth_mode=%s\n' "$(file_mode "$CODEX_HOME/auth.json")"
+    printf 'config_mode=%s\n' "$(file_mode "$CODEX_HOME/config.toml")"
+    printf 'models_mode=%s\n' "$(file_mode "$CODEX_HOME/models_cache.json")"
+  } > "$MCP_AGENTS_TEST_HOME_CAPTURE"
+fi
 while IFS= read -r _line; do :; done
 EOF
   chmod +x "$1/codex"
+}
+
+# ── Helper: verify isolated Codex homes use the private project tmp root ──
+test_codex_home_location_and_permissions() {
+  local label="$1"
+  local tmpdir startup_cwd expected_root real_home config_capture home_capture
+  local output_file status home ok
+
+  echo "--- $label ---"
+
+  tmpdir=$(mktemp -d)
+  mkdir -p "$TEST_REPO_ROOT/tmp"
+  startup_cwd=$(mktemp -d "$TEST_REPO_ROOT/tmp/codex-home-test.XXXXXX")
+  expected_root="$startup_cwd/tmp/codex-homes"
+  real_home="$tmpdir/real-codex"
+  config_capture="$tmpdir/config.toml"
+  home_capture="$tmpdir/home.txt"
+  output_file="$tmpdir/output.txt"
+  mkdir "$real_home"
+  printf '%s' '{"token":"original"}' > "$real_home/auth.json"
+  printf '%s' '{"models":[]}' > "$real_home/models_cache.json"
+  chmod 0644 "$real_home/auth.json" "$real_home/models_cache.json"
+  mkdir -p "$expected_root"
+  chmod 0755 "$expected_root"
+  write_codex_config_stub "$tmpdir"
+
+  set +e
+  (
+    cd "$startup_cwd"
+    {
+      sleep 0.2
+    } | PATH="$tmpdir:$PATH" CODEX_HOME="$real_home" \
+      MCP_AGENTS_TEST_CONFIG_CAPTURE="$config_capture" \
+      MCP_AGENTS_TEST_HOME_CAPTURE="$home_capture" \
+      $TIMEOUT_CMD 10 node "$TEST_REPO_ROOT/server.js" --provider codex \
+      >"$output_file" 2>/dev/null
+  )
+  status=$?
+  set -e
+
+  home=$(sed -n 's/^home=//p' "$home_capture" 2>/dev/null || true)
+  ok=1
+  [ "$status" -eq 0 ] || ok=0
+  case "$home" in
+    "$expected_root"/mcp-agents-codex-*) ;;
+    *) ok=0 ;;
+  esac
+  grep -Fxq 'root_mode=700' "$home_capture" 2>/dev/null || ok=0
+  grep -Fxq 'home_mode=700' "$home_capture" 2>/dev/null || ok=0
+  grep -Fxq 'auth_mode=600' "$home_capture" 2>/dev/null || ok=0
+  grep -Fxq 'config_mode=600' "$home_capture" 2>/dev/null || ok=0
+  grep -Fxq 'models_mode=600' "$home_capture" 2>/dev/null || ok=0
+  [ -n "$home" ] && [ ! -e "$home" ] || ok=0
+
+  if [ "$ok" -eq 1 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (status=$status)"
+    echo "  Home: $home"
+    echo "  Capture: $(cat "$home_capture" 2>/dev/null || true)"
+    echo "  Output: $(cat "$output_file")"
+    FAIL=$((FAIL + 1))
+  fi
+
+  rm -rf "$tmpdir" "$startup_cwd"
 }
 
 # ── Helper: stub `codex` that simulates auth rotation and creates the stale ──
@@ -1264,6 +1347,21 @@ stale="$MCP_AGENTS_TEST_REAL_CODEX_HOME/.auth.json.mcp-agents-${PPID}.tmp"
 printf '%s' '{"token":"stale"}' > "$stale"
 chmod 0644 "$stale"
 printf '%s' '{"token":"rotated"}' > "$CODEX_HOME/auth.json"
+while IFS= read -r _line; do :; done
+EOF
+  chmod +x "$1/codex"
+}
+
+# ── Helper: stub `codex` that simulates a manual login replacing canonical ──
+# auth while an older bridge is still alive. The isolated copy deliberately
+# stays unchanged; shutdown must never copy it back over the newer login.
+write_codex_auth_conflict_stub() {
+  cat >"$1/codex" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "--version" ]; then printf '%s\n' "${MCP_STUB_CODEX_VERSION:-codex-cli 0.145.0}"; exit 0; fi
+printf '%s\n' "$$" >> "$MCP_AGENTS_TEST_CHILD_REGISTRY"
+printf '%s' '{"token":"fresh-login"}' > "$MCP_AGENTS_TEST_REAL_CODEX_HOME/auth.json"
+chmod 0600 "$MCP_AGENTS_TEST_REAL_CODEX_HOME/auth.json"
 while IFS= read -r _line; do :; done
 EOF
   chmod +x "$1/codex"
@@ -1417,6 +1515,48 @@ test_codex_auth_persistence_secure_temp() {
     PASS=$((PASS + 1))
   else
     red "FAIL: $label (status=$status mode=${mode:-<missing>})"
+    echo "  auth.json: $content"
+    echo "  Output: $(cat "$output_file")"
+    FAIL=$((FAIL + 1))
+  fi
+
+  rm -rf "$tmpdir"
+}
+
+# ── Helper: verify an older isolated auth snapshot cannot clobber a newer ──
+# canonical login when the bridge shuts down.
+test_codex_auth_persistence_conflict() {
+  local label="$1"
+  local tmpdir real_home output_file status content ok
+
+  echo "--- $label ---"
+
+  tmpdir=$(mktemp -d)
+  real_home="$tmpdir/real-codex"
+  output_file="$tmpdir/output.txt"
+  mkdir "$real_home"
+  printf '%s' '{"token":"original"}' > "$real_home/auth.json"
+  chmod 0600 "$real_home/auth.json"
+  write_codex_auth_conflict_stub "$tmpdir"
+
+  set +e
+  {
+    sleep 0.2
+  } | PATH="$tmpdir:$PATH" CODEX_HOME="$real_home" MCP_AGENTS_TEST_REAL_CODEX_HOME="$real_home" \
+    $TIMEOUT_CMD 10 $SERVER --provider codex >"$output_file" 2>/dev/null
+  status=$?
+  set -e
+
+  content=$(cat "$real_home/auth.json" 2>/dev/null || true)
+  ok=1
+  [ "$status" -eq 0 ] || ok=0
+  [ "$content" = '{"token":"fresh-login"}' ] || ok=0
+
+  if [ "$ok" -eq 1 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (status=$status)"
     echo "  auth.json: $content"
     echo "  Output: $(cat "$output_file")"
     FAIL=$((FAIL + 1))
@@ -2377,6 +2517,22 @@ const resultMessage = (id, content) => ({
   },
 });
 const result = (id, content) => send(resultMessage(id, content));
+const authFailureMessage =
+  "Your access token could not be refreshed because your refresh token was revoked. " +
+  "Please log out and sign in again.";
+const authFailureEvent = (requestId) => eventMessage(requestId, "error", {
+  message: authFailureMessage,
+  codex_error_info: "unauthorized",
+});
+const authFailureResult = (id) => ({
+  jsonrpc: "2.0",
+  id,
+  result: {
+    isError: true,
+    content: [{ type: "text", text: authFailureMessage }],
+    structuredContent: { threadId: threadId(id), content: authFailureMessage },
+  },
+});
 const later = (delay, fn) => timers.push(setTimeout(fn, delay));
 const every = (delay, fn) => timers.push(setInterval(fn, delay));
 
@@ -2387,6 +2543,49 @@ function startCall(id, prompt) {
   switch (mode) {
     case "stderr":
       every(30, () => process.stderr.write("still noisy\n"));
+      break;
+    case "authfailure":
+    case "asyncauthfailure":
+      // Codex 0.147 validates refresh_token_invalidated internally and emits a
+      // typed, correlated unauthorized event followed by an isError tool result.
+      // Coalesce both frames to prove the wrapper catches them before forwarding.
+      later(30, () => {
+        if (process.env.MCP_AGENTS_TEST_MUTATE_ISOLATED_AUTH === "1") {
+          fs.writeFileSync(`${process.env.CODEX_HOME}/auth.json`, '{"token":"known-invalidated"}');
+        }
+        process.stdout.write(
+          `${JSON.stringify(authFailureEvent(id))}\n${JSON.stringify(authFailureResult(id))}\n`,
+        );
+      });
+      break;
+    case "authconcurrent":
+      if (id === 2) {
+        later(30, () => process.stdout.write(
+          `${JSON.stringify(authFailureEvent(id))}\n${JSON.stringify(authFailureResult(id))}\n`,
+        ));
+      } else {
+        later(120, () => result(id, "ALREADY_RUNNING_SURVIVED"));
+      }
+      break;
+    case "authtextsuccess":
+      later(30, () => result(id, `ordinary output mentions: ${authFailureMessage}`));
+      break;
+    case "authunterminatedexit":
+      later(30, () => process.stdout.write(
+        `${JSON.stringify(authFailureEvent(id))}\n${JSON.stringify(authFailureResult(id))}`,
+        () => process.exit(0),
+      ));
+      break;
+    case "authcancelunterminatedexit":
+      // The client has already canceled and the bridge has settled this id into
+      // late-response suppression before Codex reports the auth failure. Exit
+      // without a delimiter to exercise finalize's correlated-event path.
+      later(220, () => {
+        if (process.env.MCP_AGENTS_TEST_MUTATE_ISOLATED_AUTH === "1") {
+          fs.writeFileSync(`${process.env.CODEX_HOME}/auth.json`, '{"token":"known-invalidated"}');
+        }
+        process.stdout.write(JSON.stringify(authFailureEvent(id)), () => process.exit(0));
+      });
       break;
     case "unrelated":
       every(30, () => event(999, "agent_message_content_delta", { delta: "noise" }));
@@ -2809,7 +3008,7 @@ const startScenario = () => {
     call(3, 42);
     call(4);
     call(5, { invalid: true });
-  } else if (["cancel", "cancelconfirmedlate", "cancelconfirmedwedge", "canceldoubleterminal", "cancelcoalesced", "cancelcoalescedunsafe"].includes(mode)) {
+  } else if (["cancel", "cancelconfirmedlate", "cancelconfirmedwedge", "canceldoubleterminal", "cancelcoalesced", "cancelcoalescedunsafe", "authcancelunterminatedexit"].includes(mode)) {
     call(2, "cancel-2");
     if (mode === "cancel") call(3);
     setTimeout(() => send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 2, reason: "test" } }), 60);
@@ -2820,6 +3019,9 @@ const startScenario = () => {
     }
   } else if (mode === "suppressioncap") {
     for (let id = 2; id < 34; id += 1) call(id);
+  } else if (mode === "authconcurrent") {
+    call(2);
+    call(3);
   } else {
     const tokenModes = new Set([
       "hard", "visibility", "coalesce", "wait", "partial", "partialstall", "settled", "terminalstop", "progressstall",
@@ -2870,6 +3072,21 @@ child.stdout.on("data", (data) => {
     if (mode === "gracesafe" && frame.id === 2 && frame.result && !surviveSent) {
       surviveSent = true;
       call(3);
+    }
+    if (mode === "authfailure" && frame.id === 2 && frame.result?.isError && !surviveSent) {
+      surviveSent = true;
+      call(3);
+      send({ jsonrpc: "2.0", id: 100, method: "ping", params: {} });
+      send({
+        jsonrpc: "2.0",
+        id: 101,
+        method: "tools/call",
+        params: { name: "codex-peek", arguments: {} },
+      });
+    }
+    if (mode === "authconcurrent" && frame.id === 2 && frame.result?.isError && !surviveSent) {
+      surviveSent = true;
+      call(4);
     }
   }
 });
@@ -3252,6 +3469,49 @@ test_codex_lifecycle() {
   rm -rf "$tmpdir"
 }
 
+test_codex_auth_failure_never_persists() {
+  local label="$1" mode="${2:-authfailure}"
+  local tmpdir real_home status summary content ok
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  real_home="$tmpdir/real-codex"
+  mkdir "$real_home"
+  printf '%s' '{"token":"original"}' > "$real_home/auth.json"
+  chmod 0600 "$real_home/auth.json"
+  write_codex_lifecycle_stub "$tmpdir"
+  write_codex_lifecycle_driver "$tmpdir"
+  set +e
+  summary=$(CODEX_HOME="$real_home" MCP_AGENTS_TEST_MUTATE_ISOLATED_AUTH=1 \
+    $TIMEOUT_CMD 8 node "$tmpdir/driver.mjs" "$tmpdir" "$(pwd)" \
+    "$mode" "2" "2" "650" "80" "100" "0" 2>/dev/null)
+  status=$?
+  set -e
+  content=$(cat "$real_home/auth.json" 2>/dev/null || true)
+  ok=1
+  [ "$status" -eq 0 ] || ok=0
+  [ "$content" = '{"token":"original"}' ] || ok=0
+  if [ "$mode" = "authfailure" ]; then
+    printf '%s' "$summary" | jq -e \
+      '([.frames[] | select(.id == 2 and .result.structuredContent.code == "codex_auth_invalidated")] | length == 1)' \
+      >/dev/null 2>&1 || ok=0
+  else
+    printf '%s' "$summary" | jq -e \
+      '([.frames[] | select(.method == "codex/event" and .params.msg.codex_error_info == "unauthorized")] | length == 0) and
+       (.stderr | contains("codex_auth_invalidated"))' \
+      >/dev/null 2>&1 || ok=0
+  fi
+  if [ "$ok" -eq 1 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (status=$status)"
+    echo "  auth.json: $content"
+    echo "  Summary: ${summary:0:10000}"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
+}
+
 test_no_registered_child_leaks() {
   local label="$1" survivors="" pid
   echo "--- $label ---"
@@ -3557,6 +3817,8 @@ test_claude_job \
      select(.state == "completed" and .done == true)] | length == 3)'
 
 # Stub-based strict Codex contract tests (fast — no real Codex needed).
+test_codex_home_location_and_permissions \
+  "codex bridge uses a private project-local home root"
 test_codex_bridge_config \
   "codex bridge enables workspace network by default" \
   "true" "" "__unset__"
@@ -3648,6 +3910,7 @@ test_codex_bridge_config \
   "present"
 unset MCP_STUB_CODEX_VERSION
 test_codex_auth_persistence_secure_temp "codex auth write-back uses secure exclusive temp"
+test_codex_auth_persistence_conflict "codex auth write-back preserves a newer canonical login"
 test_codex_call_passes_through_unmodified \
   "codex-reply forwards an accepted no-goal call byte-for-byte" \
   "codex-reply" \
@@ -3933,6 +4196,42 @@ test_codex_lifecycle "codex stderr does not reset request idle deadline" \
   '(.code == 0) and (.stubAlive == false) and
    ([.frames[] | select(.id == 2 and .error.code == -32001 and (.error.message | ascii_downcase | contains("idle")) and (.error.message | ascii_downcase | contains("stayed connected")))] | length == 1) and
    ([.frames[] | select(.id == 2 and has("result"))] | length == 0)'
+test_codex_lifecycle "codex interprets typed auth failure and latches new turns" \
+  "authfailure" "2" "2" "650" "80" "100" "0" \
+  '(.code == 0) and (.stubAlive == false) and (.parseErrors == 0) and
+   (.calls | length == 1) and (.calls[0].id == 2) and
+   ([.frames[] | select(.method == "codex/event" and .params.msg.codex_error_info == "unauthorized")] | length == 0) and
+   ([.frames[] | select(.id == 2 and .result.isError == true and
+     .result.structuredContent.code == "codex_auth_invalidated" and
+     .result.structuredContent.action == "reauthenticate_and_restart")] | length == 1) and
+   ([.frames[] | select(.id == 3 and .result.isError == true and
+     .result.structuredContent.code == "codex_auth_invalidated")] | length == 1) and
+   ([.frames[] | select(.id == 100 and has("result"))] | length == 1) and
+   ([.frames[] | select(.id == 101 and .result.structuredContent.count == 0)] | length == 1) and
+   ((.frames | tostring | contains("refresh token was revoked")) | not)'
+test_codex_auth_failure_never_persists \
+  "codex never writes known-invalidated isolated auth back to canonical"
+test_codex_auth_failure_never_persists \
+  "canceled Codex auth failure still blocks invalid auth write-back" \
+  "authcancelunterminatedexit"
+test_codex_lifecycle "codex auth latch lets an already-running sibling finish" \
+  "authconcurrent" "2" "2" "500" "80" "100" "0" \
+  '(.code == 0) and (.stubAlive == false) and
+   ([.calls[] | select(.id == 2 or .id == 3)] | length == 2) and
+   ([.calls[] | select(.id == 4)] | length == 0) and
+   ([.frames[] | select(.id == 2 and .result.structuredContent.code == "codex_auth_invalidated")] | length == 1) and
+   ([.frames[] | select(.id == 3 and .result.structuredContent.content == "ALREADY_RUNNING_SURVIVED")] | length == 1) and
+   ([.frames[] | select(.id == 4 and .result.structuredContent.code == "codex_auth_invalidated")] | length == 1)'
+test_codex_lifecycle "successful Codex output mentioning revoked auth stays untouched" \
+  "authtextsuccess" "2" "2" "300" "80" "100" "0" \
+  '(.code == 0) and (.stubAlive == false) and
+   ([.frames[] | select(.id == 2 and .result.isError != true and
+     (.result.structuredContent.content | contains("refresh token was revoked")))] | length == 1)'
+test_codex_lifecycle "codex recovers an unterminated auth result during child exit" \
+  "authunterminatedexit" "2" "2" "500" "80" "100" "0" \
+  '(.code == 0) and (.stubAlive == false) and (.parseErrors == 0) and
+   ([.frames[] | select(.method == "codex/event" and .params.msg.codex_error_info == "unauthorized")] | length == 0) and
+   ([.frames[] | select(.id == 2 and .result.structuredContent.code == "codex_auth_invalidated")] | length == 1)'
 # Proof the transport SURVIVES the timeout: after id 2 idles out, the bridge
 # keeps answering the driver's ping flood (ids >= 100) — many round-trips, not one.
 test_codex_lifecycle "codex unrelated pings/events do not reset request idle deadline" \
@@ -4210,6 +4509,17 @@ test_codex_job_lifecycle "Codex background job exposes status, commentary, and r
     (.nextOffset == 12) and (.endOffset == 12) and (.done == true) and
     (.resultTruncated == false) and (.text == "ASYNC_RESULT") and
     (.structuredText == "ASYNC_RESULT"))'
+test_codex_job_lifecycle "Codex background auth failure is sanitized and classified" \
+  '(.code == 0) and (.parseErrors == 0) and (.privateIdLeaked == false) and
+   ([.frames[] | select(.method == "codex/event")] | length == 0) and
+   ([.statusResults[] | select(.state == "failed" and
+     .code == "codex_auth_invalidated" and
+     (.message | contains("restart")))] | length == 1) and
+   (.resultResults | length == 1) and
+   (.resultResults[0].state == "failed") and
+   (.resultResults[0].code == "codex_auth_invalidated") and
+   ((.frames | tostring | contains("refresh token was revoked")) | not)' \
+  "asyncauthfailure"
 test_codex_job_lifecycle "Codex background job terminal fallback suppresses its late native response" \
   '(.code == 0) and (.parseErrors == 0) and (.privateIdLeaked == false) and
    ([.frames[] | select(.method == "codex/event")] | length == 0) and

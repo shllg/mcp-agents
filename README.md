@@ -118,10 +118,24 @@ Any additional `tools/call` arguments are ignored (for example `model` or `model
 ### `codex` (pass-through)
 
 The codex provider passes through to Codex's native MCP server (`codex mcp-server`)
-inside an isolated `CODEX_HOME`. The bridge copies `auth.json` into a temporary Codex
-home, writes a minimal `config.toml`, and does not inherit your normal external MCP
-server list. That keeps Codex from recursively starting other agent tools like Claude
-or Gemini during bridge calls.
+inside an isolated `CODEX_HOME`. The bridge creates each home beneath the server
+startup directory's private `tmp/codex-homes/` tree, copies `auth.json`, writes a
+minimal `config.toml`, and does not inherit your normal external MCP server list.
+That keeps Codex from recursively starting other agent tools like Claude or Gemini
+during bridge calls. The parent and generated home directories use mode `0700`;
+copied credentials and generated runtime files use mode `0600`.
+
+The isolated home is an authentication snapshot: it cannot see a later
+`codex login` until the bridge reconnects. If Codex reports its typed
+`unauthorized` terminal event, the wrapper suppresses the duplicate event and
+returns one MCP tool error with `structuredContent.code` set to
+`codex_auth_invalidated` and `action` set to `reauthenticate_and_restart`.
+New Codex turns are rejected locally while status, result, cancel, peek, ping,
+and other MCP operations stay available. Stop the bridge, run `codex logout`
+and `codex login` as the same OS user, verify with `codex exec`, then reconnect.
+On cleanup, rotated auth is written back only when the isolated copy changed
+and canonical auth still matches the startup snapshot; a stale bridge therefore
+cannot overwrite a newer manual login or another bridge's token rotation.
 
 The one allowlisted user preference is Fast mode. At startup, the bridge reads the
 source `$CODEX_HOME/config.toml` and enables Fast mode in the isolated home only when
@@ -269,9 +283,11 @@ tool has no developer-instructions field. Direct developer instructions are not
 exposed: `goal` is the narrow, auditable standing-objective interface. A per-call
 goal overrides the server default; `""` suppresses that default for one call.
 
-The bridge rewrites only `tools/list` responses to advertise these curated
-schemas. Normal native frames remain byte-for-byte pass-through; locally generated
-validation errors use the same frame-safe queue as progress and recovery messages.
+The bridge rewrites `tools/list` responses to advertise these curated schemas.
+Normal native frames remain byte-for-byte pass-through except for the typed
+authentication failure described above; locally generated validation and auth
+errors use the same frame-safe queue/boundary discipline as progress and recovery
+messages.
 
 **Precedence within a thread.** The objective set on the initial `codex` call is
 a developer-role message and persists for the whole thread, so it takes
@@ -360,8 +376,9 @@ MCP tools, web/image work, and subagents. It does not expose final-answer text,
 reasoning, prompts, command strings or output, tool arguments, search queries,
 file paths, or token telemetry. Messages are whitespace-normalized and capped
 at 200 Unicode code points. Native `codex/event` frames remain byte-for-byte
-unchanged; progress is a parallel MCP channel and is normally UI status rather
-than additional tool-result/model context.
+unchanged except that a typed `unauthorized` error event is replaced by the
+single structured auth failure above; progress is a parallel MCP channel and is
+normally UI status rather than additional tool-result/model context.
 
 **Optional background jobs.** Existing `codex` and `codex-reply` calls remain
 blocking and keep their current behavior. Clients that need transcript-visible
