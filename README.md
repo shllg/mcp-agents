@@ -1,6 +1,6 @@
 # mcp-agents
 
-MCP server that wraps AI CLI tools — [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Antigravity CLI](https://antigravity.google/) (`agy`), and [Codex CLI](https://github.com/openai/codex) — so any MCP client can call them as tools.
+MCP server that wraps AI CLI tools — [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Antigravity CLI](https://antigravity.google/) (`agy`), and [Codex CLI](https://github.com/openai/codex) — and can proxy [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp) to a remotely leased browser.
 
 ## Prerequisites
 
@@ -37,6 +37,10 @@ mcp-agents
 # Specific provider
 mcp-agents --provider claude
 mcp-agents --provider gemini
+
+# Browser provider (example injected lease helper)
+mcp-agents --provider browser \
+  --browser_lease_command '["bin/box","--browser"]'
 ```
 
 The server speaks [JSON-RPC over stdio](https://modelcontextprotocol.io/docs/concepts/transports#stdio). It prints `[mcp-agents] ready (provider: <name>)` to stderr when it's listening.
@@ -50,6 +54,7 @@ Each `--provider` flag selects one CLI backend:
 | `claude` | `claude_code`, `claude-start`, `claude-status`, `claude-result`, `claude-cancel` | `claude --model claude-opus-4-8 --effort xhigh` |
 | `gemini` | `gemini` | `agy --sandbox -p <prompt>` |
 | `codex` | *(pass-through)* | `codex mcp-server` |
+| `browser` | *(pass-through)* | `chrome-devtools-mcp --browserUrl <leased-loopback-CDP-url>` |
 
 ### Claude reviews
 
@@ -114,6 +119,131 @@ smaller `timeout_ms`, and server operators can override the default with
 Any additional `tools/call` arguments are ignored (for example `model` or `model_reasoning_effort`).
 
 `agy` always runs with `--sandbox` (terminal restrictions enabled); there is no per-call sandbox toggle.
+
+### `browser` (remote Chrome pass-through)
+
+The browser provider starts a local `chrome-devtools-mcp` server immediately,
+then lazily acquires a remote Chrome lease on the first advertised browser tool
+call. The MCP server and all files it writes remain local; only CDP crosses the
+operator-provided loopback tunnel. Calls arriving during acquisition share one
+provisioning attempt and remain in FIFO order. There are no wrapper-owned
+acquire, status, release, job, or cancellation tools.
+
+#### Quick setup with crabbox
+
+Best paired with **crabbox**: ephemeral, single-tenant boxes that die on their
+own caps — the lifetime a browser lease wants, without a teardown you have to
+get right.
+
+Your `acquire` helper does four things: lease a box; start Chromium on it with
+`--remote-debugging-port=<remote>`; open
+`ssh -L 127.0.0.1:<local-cdp-port>:127.0.0.1:<remote>` (add a matching `-R` for
+`--app-port` when the page under test is served on your machine); then, once
+`/json/version` answers on the local port, print:
+
+```text
+record_version=1
+state=ready
+generation=<opaque token>
+local_cdp_port=<the port you were given>
+browser_url=http://127.0.0.1:<that same port>
+```
+
+`status` re-checks that lease, `release` tears it down, and any exit `69` keeps
+the lane fail-closed.
+
+The provider has no cloud or SSH knowledge. An injected command owns the lease
+and receives these argv forms:
+
+```text
+acquire --session <id> --local-cdp-port <port> --viewport <WxH> [--app-port <port>]
+status --session <id> [--generation <token>]
+release --session <id> --generation <token> --reason idle|shutdown
+```
+
+Successful acquire output is inert UTF-8 `key=value` data containing a version-1
+ready record, generation, selected local CDP port, and matching browser URL.
+Exit `69` is fail-closed: the call returns “GUI not verified — no browser box
+available” and never launches a local browser. A helper-reported local dev-server
+preflight error is preserved verbatim. Exit `75` reports a loopback bind race;
+mcp-agents chooses a new port, restarts the downstream, replays the original MCP
+initialize capabilities (including `roots`) and initialized notification, and
+retries at most three times without exposing a duplicate initialize result.
+
+`chrome-devtools-mcp` is deliberately **not pinned** — the fallback floats to the
+latest release. Nothing here depends on a particular version's reconnect
+behavior: every browser tool result is verified against the lease generation it
+was issued under whether or not the downstream reports a reconnect, so a newer
+release cannot quietly weaken the fail-closed contract. Resolution is
+deterministic in this order:
+
+1. `--browser_command` or `MCP_AGENTS_BROWSER_COMMAND` (command string or JSON
+   argv).
+2. A package-local resolvable `chrome-devtools-mcp`, then
+   `node_modules/.bin/chrome-devtools-mcp`.
+3. `npx -y chrome-devtools-mcp@latest`.
+
+The third path may make the first initialize wait on npm resolution. For faster
+startup, install `chrome-devtools-mcp` alongside mcp-agents, or install it
+elsewhere and point `--browser_command` at its executable. Pin it there if you
+need a fixed version for a particular deployment. The browser downstream
+requires the Node versions supported by the `chrome-devtools-mcp` release it
+resolves to, which is currently newer than this package's Node 18 floor; the
+other mcp-agents providers retain that floor.
+
+`chrome-devtools-mcp` is intentionally a development dependency, not a runtime
+dependency. A developer checkout therefore exercises the package-local path,
+while consumers of the published package use the npx fallback unless they
+install the package alongside mcp-agents or provide an explicit command.
+
+| CLI flag | Default | Environment |
+|----------|---------|-------------|
+| `--browser_lease_command <command-or-json-argv>` | required | `MCP_AGENTS_BROWSER_LEASE_COMMAND` |
+| `--browser_command <command-or-json-argv>` | resolution order above | `MCP_AGENTS_BROWSER_COMMAND` |
+| `--browser_idle_timeout <seconds>` | `600`; `0` disables | `MCP_AGENTS_BROWSER_IDLE_TIMEOUT` |
+| `--browser_viewport <WxH>` | `1440x900` | `MCP_AGENTS_BROWSER_VIEWPORT` |
+| `--browser_app_port <port>` | omitted | `MCP_AGENTS_BROWSER_APP_PORT` |
+| `--browser_log_file <path>` | omitted | `MCP_AGENTS_BROWSER_LOG_FILE` |
+| `--browser_allowed_url_pattern <pattern>` | omitted; repeatable | `MCP_AGENTS_BROWSER_ALLOWED_URL_PATTERN` |
+
+The viewport is passed to the lease helper so it can set remote Chromium's
+window size; Chrome DevTools MCP's `--viewport` is intentionally omitted because
+it is inert when attaching through `--browserUrl`.
+
+Every complete downstream JSON-RPC frame resets the generation idle timer;
+stderr and partial output do not. Idle release has a 60-second cleanup bound so
+remote Chromium, SSH tunnels, and the box can actually stop. Shutdown release
+uses a separate 15-second bound and remains tracked and reaped. Both are
+best-effort cost optimizations. If Chrome disappears, the interrupted native
+connect error is not replayed. A helper status of `69` enriches it with
+`browser_lease_replaced`, explicitly warning that the browser was replaced, state
+was lost, the interrupted outcome is unknown, and callers must inspect state
+instead of blindly replaying. Status `0` preserves the native error; status `70`
+remains unknown rather than being misreported as a lost lease. The next browser
+call reacquires and uses Chrome DevTools MCP's reconnect path.
+
+The client initialize frame and downstream `roots/list` request/response are
+forwarded without ID or URI rewriting. On a downstream restart, responses owed
+to the terminated process are discarded and its request correlations are
+retired before the replacement can reuse an ID. This preserves Chrome DevTools
+MCP's local file-write allowlist, so `--allowUnrestrictedPaths` is intentionally
+never passed. App and MinIO preflight failures are surfaced separately and
+verbatim. Performance trace and Lighthouse descriptions warn that a remote-link
+measurement is not a gate, and `upload_file` warns that a local path cannot be
+handed directly to remote Chromium.
+
+URL restrictions are opt-in because a loopback-only default would break OAuth
+and third-party assets. A hardened, loopback-only deployment can repeat, for
+example:
+
+```bash
+--browser_allowed_url_pattern 'http://127.0.0.1/*' \
+--browser_allowed_url_pattern 'https://127.0.0.1/*'
+```
+
+Use the narrowest patterns compatible with the target application. The provider
+does not enable experimental page-ID routing: one process owns one lease,
+profile, and port.
 
 ### `codex` (pass-through)
 
