@@ -9,14 +9,12 @@ cd "$(dirname "$0")"
 TEST_REPO_ROOT=$(pwd)
 TEST_CODEX_HOME_ROOT="$TEST_REPO_ROOT/tmp/codex-homes"
 SERVER="node server.js"
-TIMEOUT_CMD="timeout"
-if ! command -v timeout >/dev/null 2>&1; then
-  if command -v gtimeout >/dev/null 2>&1; then
-    TIMEOUT_CMD="gtimeout"
-  else
-    echo "Error: 'timeout' (coreutils) is required. Install via: brew install coreutils"
-    exit 1
-  fi
+# Resolve once to an ABSOLUTE path: tests that restrict PATH to simulate a
+# published install must not lose the harness's own timeout binary.
+TIMEOUT_CMD="$(command -v timeout || command -v gtimeout || true)"
+if [ -z "$TIMEOUT_CMD" ]; then
+  echo "Error: 'timeout' (coreutils) is required. Install via: brew install coreutils"
+  exit 1
 fi
 PASS=0
 FAIL=0
@@ -4040,9 +4038,14 @@ const child = spawn("node", [
     MCP_AGENTS_BROWSER_LEASE_COMMAND: '["/definitely/not-the-cli-lease"]',
     MCP_AGENTS_TEST_BROWSER_PROGRESS_INTERVAL_MS: "45",
     ...(leaseMode === "acquire-derived-timeout" ? {} : {
+      // 180ms lost a race with process spawn: a freshly written file costs
+      // ~210ms on its first exec here (~29ms once warm), so the helper was
+      // killed before it recorded its invocation. The helper hangs forever in
+      // these modes, so a larger budget still times out -- it just stops
+      // killing the stub before it can install its SIGTERM handler.
       MCP_AGENTS_TEST_BROWSER_HELPER_TIMEOUT_MS:
         ["acquire-term-timeout", "acquire-ignore-term-timeout"].includes(leaseMode)
-          ? "180"
+          ? "1200"
           : "1500",
     }),
     MCP_AGENTS_TEST_BROWSER_IDENTITY_TIMEOUT_MS: "500",
@@ -4338,7 +4341,11 @@ try {
     await delay(220);
   } else if (scenario === "stderr") {
     send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "navigate_page", arguments: { url: "http://127.0.0.1/stderr" } } });
-    await delay(360);
+    // Hold the noise window open well past the idle release. The release
+    // helper stamps its own start time, so its spawn cost must still land
+    // inside the noise for the ordering assertion -- release-before-last-noise
+    // -- to mean "stderr did not reset idle".
+    await delay(900);
   } else if (scenario === "idle-release" || scenario === "release-69" || scenario === "release-70" || scenario === "cap-only") {
     await call(3);
     await delay(260);
@@ -4405,13 +4412,25 @@ EOF
 test_browser_case() {
   local label="$1" scenario="$2" browser_mode="$3" lease_mode="$4"
   local idle="$5" hard="$6" predicate="$7"
-  local tmpdir status summary ok
+  local tmpdir status summary ok warmdir
   echo "--- $label ---"
   tmpdir=$(mktemp -d)
   mkdir "$tmpdir/captures"
   write_browser_mcp_stub "$tmpdir"
   write_browser_lease_stub "$tmpdir"
   write_browser_driver "$tmpdir"
+  # macOS pays a one-off scan on a file's FIRST exec: measured here at ~210ms
+  # per freshly written file, dropping to ~29ms once that same file is warm.
+  # Every case writes its stubs into a new mktemp dir, so cases with sub-second
+  # budgets spend that scan inside the window they measure -- the deferred
+  # hard-timeout case has 550ms minus a deliberate 280ms wait, leaving ~60ms of
+  # headroom cold and ~240ms warm. Pay it up front. acquire-empty-70 exits
+  # immediately and the throwaway capture dir keeps it out of this case's
+  # captures.
+  warmdir=$(mktemp -d)
+  MCP_STUB_BROWSER_CAPTURE_DIR="$warmdir" MCP_STUB_LEASE_MODE=acquire-empty-70 \
+    "$tmpdir/browser-lease-stub" acquire >/dev/null 2>&1 || true
+  rm -rf "$warmdir"
   set +e
   summary=$($TIMEOUT_CMD 9 node "$tmpdir/browser-driver.mjs" \
     "$tmpdir" "$(pwd)" "$scenario" "$browser_mode" "$lease_mode" \
