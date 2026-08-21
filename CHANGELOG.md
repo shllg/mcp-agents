@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.28.0] - 2026-08-21
+
+### Added
+
+- Add a separate `browser` passthrough provider that starts
+  `chrome-devtools-mcp` locally and attaches it to a remote CDP endpoint
+  supplied by an injected lease command, so browser automation can run against
+  a Chromium on another machine while the MCP server and every screenshot stay
+  local. Acquisition is lazy on the first advertised tool call, concurrent
+  calls share one FIFO provisioning barrier, and idle/shutdown release is
+  bounded and best-effort.
+- Add browser-prefixed command, lease, idle, viewport, app-port, log-file, and
+  repeatable URL allow-pattern settings with CLI-over-environment precedence.
+  The lease command accepts JSON argv, so a path containing a space survives
+  intact. The downstream resolves from an explicit command, a package-local
+  install, or an `npx …@latest` fallback; Chrome DevTools MCP remains a dev
+  dependency only and is deliberately unpinned, since result verification does
+  not depend on any single release's reconnect behavior.
+- Annotate remote-invalid performance, Lighthouse, and upload tools directly in
+  their advertised descriptions without changing schemas or other metadata, so
+  callers see why a tool cannot work over a tunnel rather than finding it
+  missing.
+- Preserve the complete MCP roots negotiation through the proxy, including raw
+  `roots/list` server requests and client responses. A port-race restart
+  replays the client's original initialize capabilities into the replacement
+  child, so local screenshot paths retain their negotiated roots.
+
+### Security
+
+- Never forward a browser tool result that cannot be proven to have come from
+  the leased browser. Every result is checked against the lease generation its
+  call was issued under, and a mismatch, an unverifiable identity, a discarded
+  generation, an unrecoverable frame id, a cancelled-but-outstanding call, a
+  downstream restart, or a hard timeout all resolve as a typed
+  `browser_lease_replaced` error instead. The classifiers default to that
+  fail-closed result and assign the native frame only on an affirmative
+  still-live match, so a code path that omits the check fails safe rather than
+  leaking. A silently substituted browser would otherwise make a passing UI
+  check meaningless.
+- Fail browser provisioning closed on unavailable, malformed, mismatched, or
+  exhausted port attempts without ever launching a local browser.
+- Keep Chrome DevTools MCP's roots-based file allowlist enabled by never
+  passing `--allowUnrestrictedPaths`. URL allow patterns are configurable for
+  hardened deployments but remain opt-in for general browser compatibility.
+
 ## [0.27.0] - 2026-08-07
 
 ### Fixed

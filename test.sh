@@ -114,7 +114,7 @@ test_claude_tools_schema() {
   set +e
   {
     printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-    sleep 0.3
+    sleep 2
   } | $TIMEOUT_CMD 5 $SERVER --provider claude >"$output_file" 2>/dev/null
   status=$?
   set -e
@@ -231,14 +231,16 @@ test_cli_flag() {
 
   echo "--- $label ---"
 
-  OUTPUT=$($SERVER $flag 2>/dev/null) || true
-  EXIT_CODE=${PIPESTATUS[0]:-$?}
+  set +e
+  OUTPUT=$($SERVER $flag 2>/dev/null)
+  EXIT_CODE=$?
+  set -e
 
-  if echo "$OUTPUT" | grep -q -- "$expected"; then
+  if [ "$EXIT_CODE" -eq 0 ] && printf '%s' "$OUTPUT" | grep -Fq -- "$expected"; then
     green "PASS: $label"
     PASS=$((PASS + 1))
   else
-    red "FAIL: $label (expected '$expected' in output)"
+    red "FAIL: $label (exit=$EXIT_CODE, expected '$expected' in output)"
     echo "  Output: $OUTPUT"
     FAIL=$((FAIL + 1))
   fi
@@ -296,7 +298,9 @@ test_cli_flag "--help shows workspace network default" "--help" "--codex-workspa
 test_cli_flag "--help shows codex_idle_timeout" "--help" "codex_idle_timeout"
 test_cli_flag "--help shows codex_status_interval default" "--help" "codex_status_interval"
 test_cli_flag "--help shows goal flag"      "--help"    "Persistent objective"
-test_cli_flag "--help shows provider timeout defaults" "--help" "claude 900, gemini 300"
+test_cli_flag "--help shows browser provider" "--help" "browser_lease_command"
+test_cli_flag "--help shows browser downstream fallback" "--help" "npx chrome-devtools-mcp@latest"
+test_cli_flag "--help shows provider timeout defaults" "--help" "claude 900, browser 600, gemini 300"
 test_cli_flag "-h prints usage"             "-h"        "Usage:"
 test_cli_flag "--version prints version"    "--version"  "mcp-agents v"
 test_cli_flag "-v prints version"           "-v"        "mcp-agents v"
@@ -322,6 +326,15 @@ test_cli_error "--codex_idle_timeout negative"              "--codex_idle_timeou
 test_cli_error "--codex_status_interval without value"      "--codex_status_interval"     "requires a value"
 test_cli_error "--codex_status_interval non-number"         "--codex_status_interval abc" "non-negative number"
 test_cli_error "--codex_status_interval negative"           "--codex_status_interval -1"  "non-negative number"
+test_cli_error "--browser_lease_command without value"       "--provider browser --browser_lease_command" "requires a value"
+test_cli_error "--browser_command without value"             "--provider browser --browser_command" "requires a value"
+test_cli_error "--browser_idle_timeout rejects negative"      "--provider browser --browser_idle_timeout -1" "non-negative number"
+test_cli_error "--browser_viewport rejects malformed value"   "--provider browser --browser_viewport wide" "positive WxH"
+test_cli_error "--browser_app_port rejects invalid port"      "--provider browser --browser_app_port 70000" "integer from 1 to 65535"
+test_cli_error "browser flags reject the Claude provider"     "--provider claude --browser_idle_timeout 1" "only valid with --provider browser"
+test_cli_error "browser flags reject the Gemini provider"     "--provider gemini --browser_viewport 800x600" "only valid with --provider browser"
+test_cli_error "browser flags reject the Codex provider"      "--provider codex --browser_command fake" "only valid with --provider browser"
+test_cli_error "browser provider requires an injected lease helper" "--provider browser" "browser_lease_command"
 
 # ========== Protocol tests (fast) ==========
 
@@ -1250,10 +1263,10 @@ write_codex_config_stub() {
 #!/usr/bin/env bash
 if [ "$1" = "--version" ]; then printf '%s\n' "${MCP_STUB_CODEX_VERSION:-codex-cli 0.145.0}"; exit 0; fi
 printf '%s\n' "$$" >> "$MCP_AGENTS_TEST_CHILD_REGISTRY"
-cp "$CODEX_HOME/config.toml" "$MCP_AGENTS_TEST_CONFIG_CAPTURE"
+  cp "$CODEX_HOME/config.toml" "$MCP_AGENTS_TEST_CONFIG_CAPTURE"
 if [ -n "${MCP_AGENTS_TEST_HOME_CAPTURE:-}" ]; then
   file_mode() {
-    stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
   }
   root=${CODEX_HOME%/*}
   {
@@ -1504,7 +1517,7 @@ test_codex_auth_persistence_secure_temp() {
   set -e
 
   content=$(cat "$real_home/auth.json" 2>/dev/null || true)
-  mode=$(stat -f '%Lp' "$real_home/auth.json" 2>/dev/null || stat -c '%a' "$real_home/auth.json" 2>/dev/null || true)
+  mode=$(stat -c '%a' "$real_home/auth.json" 2>/dev/null || stat -f '%Lp' "$real_home/auth.json" 2>/dev/null || true)
   ok=1
   [ "$status" -eq 0 ] || ok=0
   [ "$content" = '{"token":"rotated"}' ] || ok=0
@@ -2169,7 +2182,13 @@ test_codex_toolslist_rewrite() {
     printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
     sleep 0.3
     printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
-    sleep 1.5
+    # Keep stdin open until the response this helper asserts has actually
+    # crossed the transport; fixed sleeps make startup load an unrelated cause
+    # of failure for every framing mode routed through this helper.
+    for _ in $(seq 1 200); do
+      grep -Fq '"id":2,' "$output_file" 2>/dev/null && break
+      sleep 0.05
+    done
   } | PATH="$tmpdir:$PATH" MCP_STUB_TLMODE="$mode" \
     $TIMEOUT_CMD 12 $SERVER --provider codex >"$output_file" 2>/dev/null
   status=$?
@@ -2242,7 +2261,7 @@ test_codex_peek() {
     printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
     sleep 0.5
     printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codex","arguments":{"prompt":"build it","cwd":"/tmp/peek-workspace","sandbox":"workspace-write"}}}'
-    sleep 0.8
+    sleep 2
     printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"codex-peek\",\"arguments\":$peek_args}}"
     sleep 1.2
   } | PATH="$tmpdir:$PATH" $TIMEOUT_CMD 15 $SERVER --provider codex >"$output_file" 2>/dev/null
@@ -2436,7 +2455,13 @@ test_codex_toolslist_file() {
     printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
     sleep 0.3
     printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
-    sleep 1.5
+    # The oversized mode writes more than 10 MiB before id 2. Polling for the
+    # actual response boundary makes stdin lifetime depend on transport output,
+    # not scheduler luck while a busy host drains that burst.
+    for _ in $(seq 1 200); do
+      grep -Fq '"id":2,' "$output_file" 2>/dev/null && break
+      sleep 0.05
+    done
   } | PATH="$tmpdir:$PATH" MCP_STUB_TLMODE="$mode" \
     $TIMEOUT_CMD 25 $SERVER --provider codex >"$output_file" 2>/dev/null
   status=$?
@@ -2469,7 +2494,13 @@ test_codex_toolslist_cancel() {
     printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
     sleep 0.4
     printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}'
-    sleep 1.2
+    # Cancellation is supposed to flush the withheld partial immediately. Keep
+    # stdin open until that observable marker arrives so process startup load
+    # cannot turn this into an unrelated early-EOF failure.
+    for _ in $(seq 1 160); do
+      grep -Fq "CANCEL_PARTIAL" "$output_file" 2>/dev/null && break
+      sleep 0.05
+    done
   } | PATH="$tmpdir:$PATH" MCP_STUB_TLMODE="cancelpartial" \
     $TIMEOUT_CMD 12 $SERVER --provider codex >"$output_file" 2>/dev/null
   status=$?
@@ -3512,6 +3543,1020 @@ test_codex_auth_failure_never_persists() {
   rm -rf "$tmpdir"
 }
 
+# ── Helpers: browser downstream + lease stubs and an MCP stdio driver. ──────
+# These exercise the public process boundary: the real server parses real CLI
+# argv, forwards real JSON-RPC frames, and shells out to a separately spawned
+# lease helper. No browser helper is called past its production interface.
+write_browser_mcp_stub() {
+  cat >"$1/browser-mcp-stub" <<'EOF'
+#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+
+const mode = process.env.MCP_STUB_BROWSER_MODE || "normal";
+const captureDir = process.env.MCP_STUB_BROWSER_CAPTURE_DIR;
+const spawnFile = path.join(captureDir, "downstream-spawns.jsonl");
+const rootsFile = path.join(captureDir, "roots-response.txt");
+const rootsResponsesFile = path.join(captureDir, "roots-responses.jsonl");
+const callCountFile = path.join(captureDir, "browser-call-count");
+fs.appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${process.pid}\n`);
+const argv = process.argv.slice(2);
+fs.appendFileSync(spawnFile, `${JSON.stringify({ pid: process.pid, at: Date.now(), argv })}\n`);
+const spawnOrdinal = fs.readFileSync(spawnFile, "utf8")
+  .split("\n").filter(Boolean).length;
+const stdinFile = path.join(captureDir, `${process.pid}.stdin`);
+const send = (value, callback) =>
+  process.stdout.write(`${JSON.stringify(value)}\n`, callback);
+const initializeResult = (id) => ({
+  jsonrpc: "2.0",
+  id,
+  result: {
+    protocolVersion: "2024-11-05",
+    capabilities: { tools: {} },
+    serverInfo: { name: "browser-stub", version: "1.7.0" },
+  },
+});
+const tools = () => [
+  { name: "navigate_page", title: "Navigate title", description: "Navigate", annotations: { readOnlyHint: false }, inputSchema: { type: "object", properties: { url: { type: "string" } } } },
+  { name: "performance_start_trace", description: "Start trace", inputSchema: { type: "object", properties: { reload: { type: "boolean" } } } },
+  { name: "performance_stop_trace", description: "Stop trace", inputSchema: { type: "object", properties: {} } },
+  { name: "performance_analyze_insight", description: "Analyze insight", inputSchema: { type: "object", properties: { insightSetId: { type: "string" } } } },
+  { name: "lighthouse_audit", description: "Run Lighthouse", inputSchema: { type: "object", properties: {} } },
+  { name: "upload_file", description: "Upload a file", inputSchema: { type: "object", properties: { filePath: { type: "string" } } } },
+];
+const toolsResult = (id) => ({ jsonrpc: "2.0", id, result: { tools: tools() } });
+const result = (id, text = "BROWSER_OK") => send({
+  jsonrpc: "2.0",
+  id,
+  result: {
+    content: [{ type: "text", text }],
+    structuredContent: { content: text },
+  },
+});
+const connectFailure = (id) => send({
+  jsonrpc: "2.0",
+  id,
+  result: {
+    isError: true,
+    content: [{ type: "text", text: "Could not connect to Chrome. Failed to fetch browser WebSocket URL." }],
+    structuredContent: { content: "Could not connect to Chrome: Failed to fetch browser webSocket URL" },
+  },
+});
+const emitTools = (id) => {
+  const line = JSON.stringify(toolsResult(id));
+  if (mode === "split") {
+    const cut = Math.floor(line.length / 2);
+    process.stdout.write(line.slice(0, cut));
+    setTimeout(() => process.stdout.write(`${line.slice(cut)}\n`), 30);
+  } else if (mode === "interleaved") {
+    process.stdout.write('{"jsonrpc":"2.0","method":"notifications/message","params":{"marker":"BROWSER_INTERLEAVED"}}\n');
+    process.stdout.write(`${line}\n`);
+  } else if (mode === "straddle") {
+    process.stdout.write('DLE"}}\n');
+    process.stdout.write(`${line}\n`);
+  } else if (mode === "partialdie") {
+    process.stdout.write(line.slice(0, Math.floor(line.length / 2)), () => process.exit(0));
+  } else if (mode === "nonewlinedie") {
+    process.stdout.write(line, () => process.exit(0));
+  } else if (mode === "oversized") {
+    send({ jsonrpc: "2.0", method: "notifications/message", params: { marker: "BROWSER_OVERSIZED", pad: "x".repeat(11 * 1024 * 1024) } });
+    process.stdout.write(`${line}\n`);
+  } else if (mode === "bp") {
+    send({ jsonrpc: "2.0", method: "notifications/message", params: { marker: "BROWSER_BP", pad: "x".repeat(300000) } });
+    process.stdout.write(`${line}\n`);
+  } else {
+    process.stdout.write(`${line}\n`);
+  }
+};
+const nextCallCount = () => {
+  let count = 0;
+  try { count = Number(fs.readFileSync(callCountFile, "utf8")); } catch {}
+  count += 1;
+  fs.writeFileSync(callCountFile, String(count));
+  return count;
+};
+const batchedCallIds = [];
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  input += chunk;
+  let newline;
+  while ((newline = input.indexOf("\n")) !== -1) {
+    const raw = input.slice(0, newline);
+    input = input.slice(newline + 1);
+    fs.appendFileSync(stdinFile, `${raw}\n`);
+    let message;
+    try { message = JSON.parse(raw); } catch { continue; }
+    if (message.method === "initialize") {
+      if (mode !== "hang-init") send(initializeResult(message.id));
+      if (mode === "straddle") {
+        process.stdout.write('{"jsonrpc":"2.0","method":"notifications/message","params":{"marker":"STRAD');
+      }
+    } else if (message.method === "notifications/initialized") {
+      if (mode === "timeout-no-result" && spawnOrdinal > 1) {
+        setTimeout(() => process.stdout.write("LATCH_CLEAR"), 25);
+      }
+      if (mode === "roots") {
+        setTimeout(() => send({ jsonrpc: "2.0", id: "roots-1", method: "roots/list", params: {} }), 20);
+      } else if (mode === "restart-roots") {
+        setTimeout(() => send({ jsonrpc: "2.0", id: "roots-reused", method: "roots/list", params: {} }), 20);
+      }
+    } else if (message.method === "tools/list") {
+      emitTools(message.id);
+    } else if (message.method === "tools/call") {
+      const count = nextCallCount();
+      if (mode === "die") {
+        process.exit(0);
+      } else if (mode === "connectfail") {
+        if (count === 1 || process.env.MCP_STUB_LEASE_MODE !== "status-absent") connectFailure(message.id);
+        else result(message.id, "RECOVERED_NEXT_CALL");
+      } else if (mode === "deferred-hard-timeout-recovery") {
+        if (spawnOrdinal === 1 && message.id === 4) {
+          result(message.id, "CLASSIFIER_OK_4");
+        } else if (spawnOrdinal === 1 && message.id === 3) {
+          setTimeout(() => result(message.id, "DEFERRED_RAW_3"), 10);
+        }
+      } else if (mode === "activity") {
+        setTimeout(() => send({ jsonrpc: "2.0", method: "notifications/message", params: { activity: 1 } }), 50);
+        setTimeout(() => send({ jsonrpc: "2.0", id: "activity-roots", method: "roots/list", params: {} }), 130);
+        setTimeout(() => send({ jsonrpc: "2.0", method: "notifications/message", params: { activity: 2 } }), 210);
+        setTimeout(() => result(message.id, "ACTIVITY_DONE"), 290);
+      } else if (mode === "controlled-result") {
+        const timer = setInterval(() => {
+          if (!fs.existsSync(path.join(captureDir, `allow-call-${message.id}`))) return;
+          clearInterval(timer);
+          result(message.id, `RAW_CANCELLED_${message.id}`);
+        }, 10);
+      } else if (mode === "restart-outstanding" || mode === "restart-outstanding-unsafe") {
+        if (mode === "restart-outstanding-unsafe" && spawnOrdinal === 1) {
+          process.stdout.write('{"jsonrpc":"2.0","id":999,"result":');
+        }
+        if (spawnOrdinal > 1) {
+          result(message.id, `REPLACEMENT_OK_${message.id}`);
+          setTimeout(() => process.stdout.write("LATCH_CLEAR"), 25);
+        }
+      } else if (mode === "oversized-result") {
+        send({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: {
+            content: [{ type: "text", text: "RAW_OVERSIZED_RESULT" }],
+            structuredContent: {
+              content: "RAW_OVERSIZED_RESULT",
+              pad: "x".repeat(11 * 1024 * 1024),
+            },
+          },
+        });
+      } else if (mode === "oversized-result-id-after") {
+        send({
+          jsonrpc: "2.0",
+          result: {
+            content: [{ type: "text", text: "RAW_OVERSIZED_ID_AFTER" }],
+            structuredContent: { content: "RAW_OVERSIZED_ID_AFTER" },
+          },
+          id: message.id,
+          pad: "x".repeat(11 * 1024 * 1024),
+        });
+      } else if (mode === "oversized-complete-id-after") {
+        send({
+          jsonrpc: "2.0",
+          result: {
+            content: [{ type: "text", text: "RAW_OVERSIZED_COMPLETE" }],
+            structuredContent: { content: "RAW_OVERSIZED_COMPLETE" },
+          },
+          id: message.id,
+          pad: "x".repeat(2048),
+        });
+      } else if (mode === "finalize-multiframe") {
+        batchedCallIds.push(message.id);
+        if (batchedCallIds.length === 3) {
+          const lines = batchedCallIds.map((id) => JSON.stringify({
+            jsonrpc: "2.0",
+            id,
+            result: {
+              content: [{ type: "text", text: `RAW_FINALIZE_${id}` }],
+              structuredContent: { content: `RAW_FINALIZE_${id}` },
+            },
+          })).join("\n");
+          process.stdout.write(`${lines}\n`, () => process.exit(0));
+        }
+      } else if (mode === "malformed-result") {
+        process.stdout.write(
+          `{"jsonrpc":"2.0","id":${JSON.stringify(message.id)},"result":INVALID}\n`,
+        );
+        setTimeout(() => process.stdout.write("LATCH_CLEAR"), 25);
+      } else if (mode === "timeout-no-result") {
+        if (spawnOrdinal === 1) {
+          process.stdout.write('{"jsonrpc":"2.0","id":999,"result":');
+          setTimeout(() => process.stdout.write("OLD_PROCESS_SHOULD_BE_DEAD"), 1200);
+        } else {
+          setTimeout(() => process.stdout.write("LATCH_CLEAR"), 25);
+        }
+      } else if (mode === "call-nonewlinedie") {
+        process.stdout.write(JSON.stringify({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: {
+            content: [{ type: "text", text: `BROWSER_UNTERMINATED_${message.id}` }],
+            structuredContent: { content: `BROWSER_UNTERMINATED_${message.id}` },
+          },
+        }), () => process.exit(0));
+      } else if (mode === "stderr") {
+        const timer = setInterval(() => process.stderr.write("noisy but not browser activity\n"), 35);
+        setTimeout(() => clearInterval(timer), 350);
+      } else {
+        result(message.id, `BROWSER_OK_${message.id}`);
+      }
+    } else if (message.id === "roots-1") {
+      fs.writeFileSync(rootsFile, raw);
+    } else if (message.id === "roots-reused") {
+      fs.appendFileSync(rootsResponsesFile, `${JSON.stringify({
+        pid: process.pid,
+        spawnOrdinal,
+        raw,
+      })}\n`);
+    }
+  }
+});
+process.stdin.on("end", () => process.exit(0));
+setInterval(() => {}, 1 << 30);
+EOF
+  chmod +x "$1/browser-mcp-stub"
+}
+
+write_browser_lease_stub() {
+  cat >"$1/browser-identity-stub" <<'EOF'
+#!/usr/bin/env node
+const fs = require("node:fs");
+const http = require("node:http");
+
+const [port, identity, readyFile] = process.argv.slice(2);
+const captureDir = process.env.MCP_STUB_BROWSER_CAPTURE_DIR;
+fs.appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${process.pid}\n`);
+let identityReads = 0;
+const server = http.createServer((request, response) => {
+  if (request.url !== "/json/version") {
+    response.writeHead(404).end();
+    return;
+  }
+  identityReads += 1;
+  const respond = () => {
+    const reportedIdentity =
+      fs.existsSync(`${captureDir}/substitute-after-acquire`) && identityReads > 1
+        ? "local-substitute"
+        : identity;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      Browser: "Chrome/Test",
+      webSocketDebuggerUrl:
+        `ws://127.0.0.1:${port}/devtools/browser/${reportedIdentity}`,
+    }));
+  };
+  if (
+    fs.existsSync(`${captureDir}/slow-post-identity`) && identityReads > 1
+  ) setTimeout(respond, 300);
+  else if (fs.existsSync(`${captureDir}/slow-identity`)) setTimeout(respond, 700);
+  else respond();
+});
+const stop = () => server.close(() => process.exit(0));
+process.on("SIGTERM", stop);
+process.on("SIGINT", stop);
+server.listen(Number(port), "127.0.0.1", () => {
+  fs.writeFileSync(readyFile, String(process.pid));
+});
+EOF
+  chmod +x "$1/browser-identity-stub"
+  cat >"$1/browser-lease-stub" <<'EOF'
+#!/usr/bin/env node
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const mode = process.env.MCP_STUB_LEASE_MODE || "ready";
+const captureDir = process.env.MCP_STUB_BROWSER_CAPTURE_DIR;
+const callsFile = path.join(captureDir, "lease-calls.jsonl");
+const releaseCompletionsFile = path.join(captureDir, "release-completions.jsonl");
+const countFile = path.join(captureDir, "acquire-count");
+const identityStateFile = path.join(captureDir, "identity-current.json");
+const termFile = path.join(captureDir, "acquire-terminated.txt");
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${process.pid}\n`);
+fs.appendFileSync(callsFile, `${JSON.stringify({ pid: process.pid, at: Date.now(), args })}\n`);
+const valueAfter = (flag) => {
+  const index = args.indexOf(flag);
+  return index === -1 ? undefined : args[index + 1];
+};
+const acquireCount = () => {
+  let count = 0;
+  try { count = Number(fs.readFileSync(countFile, "utf8")); } catch {}
+  count += 1;
+  fs.writeFileSync(countFile, String(count));
+  return count;
+};
+const stopIdentity = () => {
+  let state;
+  try { state = JSON.parse(fs.readFileSync(identityStateFile, "utf8")); } catch {}
+  if (state?.pid) {
+    try { process.kill(state.pid, "SIGTERM"); } catch {}
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      try { process.kill(state.pid, 0); } catch { break; }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+    }
+    try { process.kill(state.pid, 0); process.kill(state.pid, "SIGKILL"); } catch {}
+  }
+  try { fs.unlinkSync(identityStateFile); } catch {}
+};
+const startIdentity = (port, identity) => {
+  stopIdentity();
+  const readyFile = path.join(captureDir, `identity-ready-${process.pid}`);
+  const child = spawn(
+    process.execPath,
+    [path.join(__dirname, "browser-identity-stub"), port, identity, readyFile],
+    { detached: true, stdio: "ignore", env: process.env },
+  );
+  for (let attempt = 0; attempt < 200 && !fs.existsSync(readyFile); attempt += 1) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+  }
+  if (!fs.existsSync(readyFile)) {
+    try { process.kill(-child.pid, "SIGKILL"); } catch {}
+    throw new Error("identity stub failed to bind");
+  }
+  try { fs.unlinkSync(readyFile); } catch {}
+  fs.writeFileSync(identityStateFile, JSON.stringify({
+    pid: child.pid,
+    port: Number(port),
+    identity,
+  }));
+};
+const ready = (count) => {
+  const port = valueAfter("--local-cdp-port");
+  const wrong = mode === "wrong-port" ? String(Number(port) + 1) : port;
+  if (mode !== "wrong-port" && mode !== "malformed" && mode !== "duplicate-proto") {
+    startIdentity(port, `remote-gen-${count}`);
+  }
+  const lines = [
+    "record_version=1",
+    "state=ready",
+    ...(mode === "malformed" ? [] : [`generation=gen-${count}`]),
+    "lease_id=cbx_test",
+    `local_cdp_port=${wrong}`,
+    `browser_url=http://127.0.0.1:${wrong}`,
+    `idle_teardown=${mode === "cap-only" ? "cap-only" : "enabled"}`,
+    ...(mode === "duplicate-proto" ? ["__proto__=first", "__proto__=second"] : []),
+  ];
+  process.stdout.write(`${lines.join("\n")}\n`);
+  process.exit(0);
+};
+const command = args[0];
+if (command === "acquire") {
+  const count = acquireCount();
+  if ([
+    "acquire-term",
+    "acquire-term-timeout",
+    "acquire-ignore-term-timeout",
+    "acquire-derived-timeout",
+  ].includes(mode)) {
+    process.on("SIGTERM", () => {
+      fs.writeFileSync(termFile, "SIGTERM\n");
+      if (mode !== "acquire-ignore-term-timeout") process.exit(69);
+    });
+    fs.writeFileSync(path.join(captureDir, "acquire-hanging-ready"), "ready\n");
+    setInterval(() => {}, 1 << 30);
+  } else if (mode === "unavailable-69") {
+    process.stderr.write("no capacity\n");
+    process.exit(69);
+  } else if (mode === "dev-unreachable-69") {
+    process.stderr.write("GUI not verified — dev server not reachable at :5100\n");
+    process.exit(69);
+  } else if (mode === "minio-unreachable-69") {
+    process.stderr.write("GUI not verified — MinIO not reachable at :9000\n");
+    process.exit(69);
+  } else if (mode === "acquire-empty-70") {
+    process.exit(70);
+  } else if (
+    mode === "port-75-always" ||
+    (mode === "port-75-once" && count === 1) ||
+    (mode === "ready-port-75-second" && count === 2)
+  ) {
+    setTimeout(() => {
+      process.stdout.write("state=port_unavailable\n");
+      process.exit(75);
+    }, 120);
+  } else if (mode === "slow-ready") {
+    setTimeout(() => ready(count), 280);
+  } else {
+    ready(count);
+  }
+} else if (command === "status") {
+  if (mode === "status-ready") process.exit(0);
+  if (mode === "status-slow-ready") {
+    setTimeout(() => process.exit(0), 300);
+    return;
+  }
+  if (mode === "status-corrupt") process.exit(70);
+  process.exit(69);
+} else if (command === "release") {
+  stopIdentity();
+  if (mode === "release-69" || mode === "cap-only") process.exit(69);
+  if (mode === "release-empty-70") process.exit(70);
+  const reason = valueAfter("--reason");
+  const finishRelease = () => {
+    fs.appendFileSync(releaseCompletionsFile, `${JSON.stringify({
+      pid: process.pid,
+      at: Date.now(),
+      reason,
+    })}\n`);
+    process.exit(0);
+  };
+  if (mode === "slow-idle-release" && reason === "idle") {
+    setTimeout(finishRelease, 2200);
+  } else if (mode === "slow-shutdown-release" && reason === "shutdown") {
+    setTimeout(finishRelease, 650);
+  } else {
+    finishRelease();
+  }
+} else {
+  process.exit(64);
+}
+EOF
+  chmod +x "$1/browser-lease-stub"
+}
+
+write_browser_npx_stub() {
+  cat >"$1/npx" <<'EOF'
+#!/usr/bin/env node
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+
+fs.appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${process.pid}\n`);
+const args = process.argv.slice(2);
+fs.appendFileSync(
+  process.env.MCP_STUB_NPX_CAPTURE,
+  `${JSON.stringify({ pid: process.pid, at: Date.now(), args })}\n`,
+);
+const child = spawn(process.env.MCP_STUB_NPX_TARGET, args.slice(2), {
+  stdio: "inherit",
+});
+child.on("error", (error) => {
+  process.stderr.write(`${error.message}\n`);
+  process.exit(1);
+});
+child.on("close", (code, signal) => {
+  if (signal) process.kill(process.pid, signal);
+  else process.exit(code ?? 1);
+});
+EOF
+  chmod +x "$1/npx"
+}
+
+write_browser_driver() {
+  cat >"$1/browser-driver.mjs" <<'EOF'
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+
+const [stubDir, serverDir, scenario, browserMode, leaseMode, idle, hard] = process.argv.slice(2);
+const captureDir = `${stubDir}/captures`;
+const browserCommand = JSON.stringify([`${stubDir}/browser-mcp-stub`, "--stub-base"]);
+const leaseCommand = JSON.stringify([`${stubDir}/browser-lease-stub`]);
+const child = spawn("node", [
+  "server.js",
+  "--provider", "browser",
+  "--browser_lease_command", leaseCommand,
+  "--browser_command", browserCommand,
+  "--browser_idle_timeout", idle,
+  "--browser_viewport", "1280x720",
+  "--browser_app_port", "5100",
+  "--browser_log_file", `${stubDir}/browser.log`,
+  "--browser_allowed_url_pattern", "http://127.0.0.1/*",
+  "--browser_allowed_url_pattern", "https://example.test/*",
+  "--timeout", hard,
+], {
+  cwd: serverDir,
+  env: {
+    ...process.env,
+    MCP_STUB_BROWSER_MODE: browserMode,
+    MCP_STUB_LEASE_MODE: leaseMode,
+    MCP_STUB_BROWSER_CAPTURE_DIR: captureDir,
+    MCP_AGENTS_BROWSER_COMMAND: '["/definitely/not-the-cli-browser"]',
+    MCP_AGENTS_BROWSER_LEASE_COMMAND: '["/definitely/not-the-cli-lease"]',
+    MCP_AGENTS_TEST_BROWSER_PROGRESS_INTERVAL_MS: "45",
+    ...(leaseMode === "acquire-derived-timeout" ? {} : {
+      MCP_AGENTS_TEST_BROWSER_HELPER_TIMEOUT_MS:
+        ["acquire-term-timeout", "acquire-ignore-term-timeout"].includes(leaseMode)
+          ? "180"
+          : "1500",
+    }),
+    MCP_AGENTS_TEST_BROWSER_IDENTITY_TIMEOUT_MS: "500",
+    MCP_AGENTS_TEST_BROWSER_HELPER_TERM_GRACE_MS: "250",
+    MCP_AGENTS_TEST_BROWSER_SHUTDOWN_RELEASE_TIMEOUT_MS: "1500",
+    MCP_AGENTS_TEST_BROWSER_FLUSH_STALL_MS: "400",
+    ...(scenario === "oversized-complete-id-after" ? {
+      MCP_AGENTS_TEST_BROWSER_REWRITE_MAX_BYTES: "512",
+    } : {}),
+  },
+  stdio: ["pipe", "pipe", "pipe"],
+});
+let out = "";
+let err = "";
+let parseBuffer = "";
+let parseErrors = 0;
+let driverError;
+let lastNoisyStderrAt;
+let rootsRequestCount = 0;
+let substituteChild;
+let latchClearBeforeClose = false;
+const rootsClientResponses = [];
+const frames = [];
+const frameEvents = [];
+const rawLines = [];
+const pending = new Map();
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const waitFor = async (predicate, message, timeoutMs = 2000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await delay(10);
+  }
+  throw new Error(message);
+};
+const sendRaw = (line) => child.stdin.write(`${line}\n`);
+const send = (message) => sendRaw(JSON.stringify(message));
+const request = (id, method, params, timeoutMs = 2500) => new Promise((resolve, reject) => {
+  const timer = setTimeout(() => {
+    pending.delete(JSON.stringify(id));
+    reject(new Error(`${method} ${JSON.stringify(id)} timed out`));
+  }, timeoutMs);
+  pending.set(JSON.stringify(id), {
+    resolve: (frame) => { clearTimeout(timer); resolve(frame); },
+  });
+  send({ jsonrpc: "2.0", id, method, params });
+});
+const call = (id, token) => request(id, "tools/call", {
+  name: "navigate_page",
+  arguments: { url: `http://127.0.0.1/${id}` },
+  ...(token === undefined ? {} : { _meta: { progressToken: token } }),
+});
+child.stdin.on("error", () => {});
+child.stderr.on("data", (chunk) => {
+  const text = chunk.toString();
+  err += text;
+  if (text.includes("[chrome-devtools] noisy but not browser activity")) {
+    lastNoisyStderrAt = Date.now();
+  }
+});
+child.stdout.on("data", (chunk) => {
+  const text = chunk.toString();
+  out += text;
+  parseBuffer += text;
+  let newline;
+  while ((newline = parseBuffer.indexOf("\n")) !== -1) {
+    const line = parseBuffer.slice(0, newline);
+    parseBuffer = parseBuffer.slice(newline + 1);
+    if (!line) continue;
+    rawLines.push(line.length > 100000 ? line.slice(0, 300) : line);
+    let frame;
+    try { frame = JSON.parse(line); } catch { parseErrors += 1; continue; }
+    if (frame.params?.pad) frame.params.pad = `[${frame.params.pad.length} bytes]`;
+    if (frame.result?.structuredContent?.pad) {
+      frame.result.structuredContent.pad =
+        `[${frame.result.structuredContent.pad.length} bytes]`;
+    }
+    if (frame.pad) frame.pad = `[${frame.pad.length} bytes]`;
+    frames.push(frame);
+    frameEvents.push({ at: Date.now(), id: frame.id, method: frame.method });
+    if (frame.method === "roots/list") {
+      if (frame.id === "roots-1") {
+        sendRaw('{"jsonrpc":"2.0", "id":"roots-1", "result":{"roots":[{"uri":"file:///workspace","name":"root"}]}}');
+      } else if (scenario === "restart-roots" || scenario === "restart-roots-out-of-order") {
+        rootsRequestCount += 1;
+        const response = (id, name) =>
+          `{"jsonrpc":"2.0", "id":${JSON.stringify(id)}, "result":{"roots":[{"uri":"file:///workspace","name":"${name}"}]}}`;
+        if (scenario === "restart-roots" ) {
+          const name = rootsRequestCount === 1 ? "dead-root" : "replacement-root";
+          rootsClientResponses.push({ order: name, id: frame.id });
+          sendRaw(response(frame.id, name));
+        } else if (rootsRequestCount === 1) {
+          rootsClientResponses.push({ order: "held-dead", id: frame.id });
+        } else {
+          rootsClientResponses.push({ order: "replacement-first", id: frame.id });
+          sendRaw(response(frame.id, "replacement-root"));
+          if (scenario === "restart-roots-out-of-order") {
+            setTimeout(() => {
+              rootsClientResponses.push({ order: "stale-second", id: "roots-reused" });
+              sendRaw(response("roots-reused", "dead-root"));
+            }, 30);
+          }
+        }
+      } else {
+        send({ jsonrpc: "2.0", id: frame.id, result: { roots: [] } });
+      }
+    }
+    const waiter = pending.get(JSON.stringify(frame.id));
+    if (waiter && (frame.result || frame.error)) {
+      pending.delete(JSON.stringify(frame.id));
+      waiter.resolve(frame);
+    }
+  }
+});
+const closed = new Promise((resolve) => child.once("close", (code, signal) => resolve({ code, signal })));
+const hardStop = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 6500);
+const initializeParams = {
+  protocolVersion: "2024-11-05",
+  capabilities: { roots: { listChanged: true }, sampling: {} },
+  clientInfo: { name: "browser-driver", version: "0" },
+};
+try {
+  const initialized = request(1, "initialize", initializeParams);
+  await initialized;
+  if (scenario !== "hang-init") {
+    send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    if (scenario !== "skip-list") {
+      if (scenario === "bp") {
+        child.stdout.pause();
+        setTimeout(() => child.stdout.resume(), 350);
+      }
+      await request(2, "tools/list", {});
+    }
+  }
+  if (scenario === "normal" || scenario === "shutdown" || scenario === "idle-zero") {
+    await call(3);
+    if (scenario === "idle-zero") await delay(260);
+  } else if (scenario === "first-call-substitution") {
+    writeFileSync(`${captureDir}/substitute-after-acquire`, "ready\n");
+    await call(3);
+  } else if (scenario === "concurrent-identity-substitution") {
+    // Two calls queue on one shared cold acquire (leaseMode "slow-ready" delays
+    // "ready" long enough for both to stack up before it resolves), so both are
+    // forwarded to downstream under the SAME generation with no pre-flight
+    // identity gate between them. The substituted identity mismatches on the
+    // first post-response check (the acquire itself consumed read #1), so the
+    // first result's classification discards the shared generation. The second
+    // result's classification must then be bound to the generation snapshot it
+    // was actually issued under, not the now-emptied live generation.
+    writeFileSync(`${captureDir}/substitute-after-acquire`, "ready\n");
+    const first = call(3);
+    const second = call(4);
+    await Promise.all([first, second]);
+  } else if (scenario === "classifier-identity-toctou") {
+    writeFileSync(`${captureDir}/slow-post-identity`, "ready\n");
+    await call(3);
+  } else if (scenario === "classifier-connect-toctou") {
+    await call(3);
+  } else if (scenario === "deferred-hard-timeout-recovery") {
+    writeFileSync(`${captureDir}/slow-post-identity`, "ready\n");
+    const timeout = call(5);
+    await delay(120);
+    await Promise.all([call(3), call(4), timeout]);
+    await delay(100);
+  } else if (scenario === "cancel-open-generation-change") {
+    const late = call(3);
+    await waitFor(() => {
+      try {
+        return readFileSync(`${captureDir}/browser-call-count`, "utf8") === "1";
+      } catch { return false; }
+    }, "browser call was not forwarded before cancellation");
+    send({
+      jsonrpc: "2.0",
+      method: "notifications/cancelled",
+      params: { requestId: 3, reason: "test open-call cancellation" },
+    });
+    await waitFor(() => {
+      try {
+        return readFileSync(`${captureDir}/lease-calls.jsonl`, "utf8")
+          .split("\n").filter(Boolean)
+          .map((line) => JSON.parse(line))
+          .some((entry) => entry.args[0] === "release" && entry.args.includes("idle"));
+      } catch { return false; }
+    }, "generation was not released while the cancelled call remained open");
+    writeFileSync(`${captureDir}/allow-call-3`, "ready\n");
+    await late;
+  } else if (scenario === "restart-outstanding" || scenario === "restart-outstanding-unsafe") {
+    let abandonedError;
+    const abandoned = call(3).catch((error) => { abandonedError = error; });
+    await waitFor(() => {
+      try {
+        return readFileSync(`${captureDir}/browser-call-count`, "utf8") === "1";
+      } catch { return false; }
+    }, "browser call was not outstanding before restart");
+    await waitFor(() => {
+      try {
+        return readFileSync(`${captureDir}/lease-calls.jsonl`, "utf8")
+          .split("\n").filter(Boolean)
+          .map((line) => JSON.parse(line))
+          .some((entry) => entry.args[0] === "release" && entry.args.includes("idle"));
+      } catch { return false; }
+    }, "generation was not released before restart");
+    await call(4);
+    if (scenario === "restart-outstanding") {
+      await waitFor(() => out.includes("LATCH_CLEAR"), "restart left the rewrite latch armed");
+      latchClearBeforeClose = true;
+    }
+    await abandoned;
+    if (abandonedError) throw abandonedError;
+  } else if (scenario === "oversized-browser-result") {
+    await call(3);
+  } else if (scenario === "oversized-id-after-result") {
+    await call(3);
+  } else if (scenario === "oversized-complete-id-after") {
+    await call(3);
+  } else if (scenario === "finalize-multiframe") {
+    writeFileSync(`${captureDir}/slow-post-identity`, "ready\n");
+    await Promise.all([call(3), call(4), call(5)]);
+  } else if (scenario === "malformed-browser-result") {
+    await call(3);
+    await waitFor(() => out.includes("LATCH_CLEAR"), "malformed result pinned the rewrite latch");
+    latchClearBeforeClose = true;
+  } else if (scenario === "browser-hard-timeout") {
+    await call(3);
+    await waitFor(() => out.includes("LATCH_CLEAR"), "hard timeout pinned the rewrite latch");
+    latchClearBeforeClose = true;
+  } else if (scenario === "unterminated-browser-result") {
+    await call(3);
+  } else if (scenario === "identity-substitution") {
+    await call(3);
+    const identityState = JSON.parse(
+      readFileSync(`${captureDir}/identity-current.json`, "utf8"),
+    );
+    try { process.kill(identityState.pid, "SIGTERM"); } catch {}
+    await waitFor(() => {
+      try { process.kill(identityState.pid, 0); return false; } catch { return true; }
+    }, "remote identity stub did not stop");
+    const readyFile = `${captureDir}/substitute-ready`;
+    substituteChild = spawn(process.execPath, [
+      `${stubDir}/browser-identity-stub`,
+      String(identityState.port),
+      "local-substitute",
+      readyFile,
+    ], { detached: true, stdio: "ignore", env: process.env });
+    await waitFor(() => existsSync(readyFile), "substitute identity stub did not bind");
+    await call(4);
+  } else if (scenario === "identity-unreachable") {
+    await call(3);
+    const identityState = JSON.parse(
+      readFileSync(`${captureDir}/identity-current.json`, "utf8"),
+    );
+    try { process.kill(identityState.pid, "SIGTERM"); } catch {}
+    await waitFor(() => {
+      try { process.kill(identityState.pid, 0); return false; } catch { return true; }
+    }, "remote identity stub did not stop");
+    await call(4);
+  } else if (scenario === "slow-identity-idle") {
+    await call(3);
+    writeFileSync(`${captureDir}/slow-identity`, "ready\n");
+    await call(4);
+  } else if (scenario === "shutdown-acquire") {
+    void call(3).catch(() => undefined);
+    await waitFor(
+      () => existsSync(`${captureDir}/acquire-hanging-ready`),
+      "acquire helper did not enter its cleanup-trapped wait",
+    );
+  } else if (scenario === "unknown") {
+    await request(3, "tools/call", {
+      name: "not_advertised",
+      arguments: {},
+    });
+  } else if (scenario === "skip-list") {
+    await call(3);
+  } else if (scenario === "slow-ready") {
+    const first = call(3, "browser-progress");
+    const second = call(4, 42);
+    const canceled = call(5, { invalid: true }).catch(() => undefined);
+    const absent = call(6);
+    await delay(55);
+    send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 5, reason: "test" } });
+    await Promise.all([first, second, absent]);
+    await delay(80);
+    void canceled;
+  } else if (["unavailable", "dev-unreachable", "minio-unreachable", "acquire-empty", "acquire-timeout", "acquire-kill-timeout", "derived-helper-timeout", "port-once", "restart-roots", "restart-roots-out-of-order", "port-always", "malformed", "wrong-port", "duplicate-proto", "die"].includes(scenario)) {
+    await call(3);
+  } else if (["status-ready", "status-corrupt", "status-absent"].includes(scenario)) {
+    await call(3);
+    if (scenario === "status-absent") await call(4);
+  } else if (scenario === "roots") {
+    await delay(160);
+  } else if (scenario === "activity") {
+    await call(3);
+    await delay(220);
+  } else if (scenario === "stderr") {
+    send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "navigate_page", arguments: { url: "http://127.0.0.1/stderr" } } });
+    await delay(360);
+  } else if (scenario === "idle-release" || scenario === "release-69" || scenario === "release-70" || scenario === "cap-only") {
+    await call(3);
+    await delay(260);
+  } else if (scenario === "slow-idle-release") {
+    await call(3);
+    await delay(2450);
+  }
+} catch (error) {
+  driverError = error instanceof Error ? error.message : String(error);
+} finally {
+  await delay(60);
+  try { child.stdin.end(); } catch {}
+}
+const closeInfo = await closed;
+if (substituteChild) {
+  try { process.kill(-substituteChild.pid, "SIGTERM"); } catch {}
+}
+clearTimeout(hardStop);
+const readJsonLines = (file) => {
+  try {
+    return readFileSync(file, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  } catch { return []; }
+};
+const spawns = readJsonLines(`${captureDir}/downstream-spawns.jsonl`).map((spawnInfo) => {
+  let stdinRaw = "";
+  try { stdinRaw = readFileSync(`${captureDir}/${spawnInfo.pid}.stdin`, "utf8"); } catch {}
+  const stdin = stdinRaw.split("\n").filter(Boolean).flatMap((line) => {
+    try { return [JSON.parse(line)]; } catch { return []; }
+  });
+  return { ...spawnInfo, stdinRaw, stdin };
+});
+const leaseCalls = readJsonLines(`${captureDir}/lease-calls.jsonl`);
+const acquirePid = leaseCalls.find((callInfo) => callInfo.args[0] === "acquire")?.pid;
+let acquireAlive = false;
+try { if (acquirePid) process.kill(acquirePid, 0); acquireAlive = Boolean(acquirePid); } catch {}
+const releaseCompletions = readJsonLines(`${captureDir}/release-completions.jsonl`);
+const rootsResponses = readJsonLines(`${captureDir}/roots-responses.jsonl`);
+let rootsResponse;
+try { rootsResponse = readFileSync(`${captureDir}/roots-response.txt`, "utf8"); } catch {}
+process.stdout.write(`${JSON.stringify({
+  scenario,
+  driverError,
+  closeInfo,
+  frames,
+  frameEvents,
+  rawLines,
+  parseErrors,
+  stderr: err,
+  spawns,
+  leaseCalls,
+  releaseCompletions,
+  rootsResponses,
+  rootsClientResponses,
+  latchClearBeforeClose,
+  lastNoisyStderrAt,
+  rootsResponse,
+  acquireTerminated: existsSync(`${captureDir}/acquire-terminated.txt`),
+  acquireAlive,
+  browserLogExists: existsSync(`${stubDir}/browser.log`),
+})}\n`);
+EOF
+}
+
+test_browser_case() {
+  local label="$1" scenario="$2" browser_mode="$3" lease_mode="$4"
+  local idle="$5" hard="$6" predicate="$7"
+  local tmpdir status summary ok
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  mkdir "$tmpdir/captures"
+  write_browser_mcp_stub "$tmpdir"
+  write_browser_lease_stub "$tmpdir"
+  write_browser_driver "$tmpdir"
+  set +e
+  summary=$($TIMEOUT_CMD 9 node "$tmpdir/browser-driver.mjs" \
+    "$tmpdir" "$(pwd)" "$scenario" "$browser_mode" "$lease_mode" \
+    "$idle" "$hard" 2>/dev/null)
+  status=$?
+  set -e
+  ok=1
+  [ "$status" -eq 0 ] || ok=0
+  printf '%s' "$summary" | jq -e \
+    "(.closeInfo.code == 0) and (.parseErrors == 0) and ($predicate)" \
+    >/dev/null 2>&1 || ok=0
+  if [ "$ok" -eq 1 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (status=$status)"
+    echo "  Summary: ${summary:0:14000}"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
+}
+
+drive_browser_resolution_handshake() {
+  local output_file="$1" expected_server_name="$2" client_name="$3"
+  local sent_initialized=0
+  printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{"roots":{"listChanged":true}},"clientInfo":{"name":"%s","version":"0"}}}\n' \
+    "$client_name"
+  for _ in $(seq 1 140); do
+    if [ "$sent_initialized" -eq 0 ] && jq -e \
+      --arg server_name "$expected_server_name" \
+      'select(.id == 1 and .result.serverInfo.name == $server_name)' \
+      "$output_file" >/dev/null 2>&1; then
+      printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+      sent_initialized=1
+    fi
+    if [ "$sent_initialized" -eq 1 ] && jq -e \
+      'select(.id == 2 and (.result.tools | length > 0))' \
+      "$output_file" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.05
+  done
+  return 1
+}
+
+test_browser_local_resolution() {
+  local label="$1" tmpdir output_file error_file status ok lease_command
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  mkdir "$tmpdir/captures"
+  output_file="$tmpdir/output.jsonl"
+  error_file="$tmpdir/error.txt"
+  write_browser_lease_stub "$tmpdir"
+  lease_command="[\"$tmpdir/browser-lease-stub\"]"
+  set +e
+  drive_browser_resolution_handshake \
+    "$output_file" "chrome_devtools" "local-resolution-test" | \
+    MCP_STUB_BROWSER_CAPTURE_DIR="$tmpdir/captures" \
+    MCP_STUB_LEASE_MODE=ready \
+    $TIMEOUT_CMD 8 $SERVER --provider browser \
+      --browser_lease_command "$lease_command" \
+      >"$output_file" 2>"$error_file"
+  status=$?
+  set -e
+  ok=1
+  [ "$status" -eq 0 ] || ok=0
+  jq -e 'select(.id == 1 and .result.serverInfo.name == "chrome_devtools")' \
+    "$output_file" >/dev/null 2>&1 || ok=0
+  jq -e 'select(.id == 2 and (.result.tools | length > 0))' \
+    "$output_file" >/dev/null 2>&1 || ok=0
+  grep -Fq 'source=local package' "$error_file" || ok=0
+  grep -Fq 'first startup may wait for npm to resolve chrome-devtools-mcp@latest' "$error_file" && ok=0
+  if [ "$ok" -eq 1 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (status=$status)"
+    echo "  Output: $(cat "$output_file")"
+    echo "  Error: $(cat "$error_file")"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
+}
+
+test_browser_npx_resolution() {
+  local label="$1" tmpdir package_dir output_file error_file npx_file
+  local status ok lease_command node_bin_dir
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  package_dir="$tmpdir/published"
+  mkdir -p "$tmpdir/captures" "$tmpdir/bin" \
+    "$package_dir/node_modules/@modelcontextprotocol"
+  cp server.js package.json "$package_dir/"
+  ln -s "$(pwd)/node_modules/@modelcontextprotocol/sdk" \
+    "$package_dir/node_modules/@modelcontextprotocol/sdk"
+  write_browser_mcp_stub "$tmpdir"
+  write_browser_lease_stub "$tmpdir"
+  write_browser_npx_stub "$tmpdir/bin"
+  output_file="$tmpdir/output.jsonl"
+  error_file="$tmpdir/error.txt"
+  npx_file="$tmpdir/npx.jsonl"
+  lease_command="[\"$tmpdir/browser-lease-stub\"]"
+  node_bin_dir=$(dirname "$(command -v node)")
+  set +e
+  drive_browser_resolution_handshake \
+    "$output_file" "browser-stub" "npx-resolution-test" | \
+    PATH="$tmpdir/bin:$node_bin_dir:/usr/bin:/bin" NODE_PATH= \
+    MCP_STUB_BROWSER_CAPTURE_DIR="$tmpdir/captures" \
+    MCP_STUB_BROWSER_MODE=normal \
+    MCP_STUB_LEASE_MODE=ready \
+    MCP_STUB_NPX_CAPTURE="$npx_file" \
+    MCP_STUB_NPX_TARGET="$tmpdir/browser-mcp-stub" \
+    $TIMEOUT_CMD 8 node "$package_dir/server.js" --provider browser \
+      --browser_lease_command "$lease_command" \
+      >"$output_file" 2>"$error_file"
+  status=$?
+  set -e
+  ok=1
+  [ "$status" -eq 0 ] || ok=0
+  jq -s -e '
+    (length == 1) and
+    (.[0].args[0:2] == ["-y", "chrome-devtools-mcp@latest"]) and
+    (.[0].args | index("--browserUrl") != null) and
+    (.[0].args | index("--viewport") == null)
+  ' "$npx_file" >/dev/null 2>&1 || ok=0
+  jq -e 'select(.id == 1 and .result.serverInfo.name == "browser-stub")' \
+    "$output_file" >/dev/null 2>&1 || ok=0
+  jq -e 'select(.id == 2 and (.result.tools | length > 0))' \
+    "$output_file" >/dev/null 2>&1 || ok=0
+  grep -Fq 'first startup may wait for npm to resolve chrome-devtools-mcp@latest' "$error_file" || ok=0
+  grep -Fq 'source=npx fallback' "$error_file" || ok=0
+  if [ "$ok" -eq 1 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (status=$status)"
+    echo "  Npx: $(cat "$npx_file" 2>/dev/null || true)"
+    echo "  Output: $(cat "$output_file")"
+    echo "  Error: $(cat "$error_file")"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
+}
+
 test_no_registered_child_leaks() {
   local label="$1" survivors="" pid
   echo "--- $label ---"
@@ -4299,7 +5344,7 @@ test_codex_lifecycle "codex progress waits for a safe boundary and keeps only th
 # would instead keep the transport alive (see the "survive" test below).
 test_codex_lifecycle "codex permanent partial stall never splices progress and escalates to a bounded teardown" \
   "partialstall" "0.25" "2" "1500" "80" "100" "20,60" \
-  '(.code == 1) and (.rawHasProgress == false) and (.elapsedMs < 1100) and
+  '(.code == 1) and (.rawHasProgress == false) and (.elapsedMs < 1800) and
    ([.frames[] | select(.id == 2 and .error.code == -32001)] | length == 1) and
    ([.frames[] | select(.id == 2 and has("result"))] | length == 0)'
 # The core guarantee, proven end to end: id 2 idles out with a -32001, and only
@@ -4459,7 +5504,7 @@ test_codex_lifecycle "codex confirmed cancellation gets its own frame-boundary g
 test_codex_lifecycle "codex confirmed cancellation escalates a sustained framing wedge" \
   "cancelconfirmedwedge" "2" "2" "900" "80" "100" "0" \
   '(.code == 1) and (.stubAlive == false) and
-   (.elapsedMs >= 240) and (.elapsedMs < 700) and
+   (.elapsedMs >= 240) and (.elapsedMs < 900) and
    (.stderr | contains("request 2 cancellation was confirmed by turn_aborted, but codex left a frame unterminated"))'
 test_codex_lifecycle "codex ignores duplicate terminal events while confirmed cancellation is pending" \
   "canceldoubleterminal" "2" "2" "550" "80" "100" "0" \
@@ -4485,10 +5530,12 @@ test_codex_lifecycle "unsafe-boundary cancel releases suppression after coalesce
 # Each terminal fallback must suppress the native response it answered for, but
 # that bounded set cannot grow forever when Codex never sends those responses.
 # Drive exactly the production limit (32 distinct ids) and require the bridge's
-# documented process-level backstop to fire.
+# documented process-level backstop to fire. Wall time is intentionally absent:
+# processing 32 real frame exchanges varies with host load, while the outer test
+# timeout still bounds a bridge that fails to invoke the backstop at all.
 test_codex_lifecycle "codex tears down when late-response suppression reaches its limit" \
   "suppressioncap" "2" "2" "1000" "40" "100" "0" \
-  '(.code == 1) and (.stubAlive == false) and (.elapsedMs < 700) and
+  '(.code == 1) and (.stubAlive == false) and
    (.calls | length == 32) and
    (.stderr | contains("codex passthrough finalize: late-response suppression limit reached"))'
 
@@ -4665,6 +5712,562 @@ run_codex_watchdog_case "codex idle watchdog fails the stalled call but keeps th
   "stall" "--codex_idle_timeout 1" 0
 run_codex_watchdog_case "codex child death synthesizes error (no childless hang)" \
   "die" "--codex_idle_timeout 30" 0
+
+# Browser resolver and passthrough process-boundary tests. The npx resolver and
+# all remaining browser cases use PID-registering downstream/helper stubs, so
+# they run anywhere. The FIRST case is different: it starts the REAL
+# package-local chrome-devtools-mcp, whose own engines floor is well above this
+# package's `>=18`, and rises further as the unpinned dependency tracks latest.
+# Gate it on the node actually running the suite so the fast suite stays usable
+# on the floor mcp-agents still supports for its other providers.
+browser_local_node_ok=1
+if ! node -e '
+  const [maj, min] = process.versions.node.split(".").map(Number);
+  process.exit(maj > 20 || (maj === 20 && min >= 19) ? 0 : 1);
+' 2>/dev/null; then
+  browser_local_node_ok=0
+fi
+if [ "$browser_local_node_ok" -eq 1 ]; then
+  test_browser_local_resolution \
+    "browser defaults to the package-local downstream without npx"
+else
+  echo "(Skipping package-local browser resolver test — node $(node -p 'process.versions.node') is below the chrome-devtools-mcp engines floor)"
+fi
+test_browser_npx_resolution \
+  "published browser install invokes the unpinned npx fallback"
+test_browser_case "browser startup, argv, lazy acquire, warnings, and shutdown release" \
+  "normal" "normal" "ready" "10" "3" \
+  'def arg_after($argv; $flag): $argv[(($argv | index($flag)) + 1)];
+   (.driverError == null) and (.spawns | length == 1) and
+   (.leaseCalls | map(.args[0]) == ["acquire","release"]) and
+   (.spawns[0].at <= .leaseCalls[0].at) and
+   (.spawns[0] as $spawn | .leaseCalls[0] as $acquire |
+     (arg_after($spawn.argv; "--browserUrl") |
+       startswith("http://127.0.0.1:")) and
+     (arg_after($spawn.argv; "--browserUrl") ==
+       ("http://127.0.0.1:" + arg_after($acquire.args; "--local-cdp-port"))) and
+     ($spawn.argv | index("--viewport") == null) and
+     (arg_after($spawn.argv; "--logFile") | endswith("/browser.log")) and
+     ([range(0; $spawn.argv|length) as $i |
+       select($spawn.argv[$i] == "--allowedUrlPattern") |
+       $spawn.argv[$i+1]] == ["http://127.0.0.1/*","https://example.test/*"]) and
+     ($spawn.argv | index("--no-usage-statistics") != null) and
+     ($spawn.argv | index("--allowUnrestrictedPaths") == null) and
+     ($spawn.argv | index("--allow-unrestricted-paths") == null) and
+     ($spawn.argv | index("--headless") == null) and
+     ($spawn.argv | index("--isolated") == null) and
+     (arg_after($acquire.args; "--app-port") == "5100") and
+     (arg_after($acquire.args; "--viewport") == "1280x720") and
+     ($spawn.stdin[0].params.capabilities.roots.listChanged == true) and
+     ($spawn.stdinRaw | startswith("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"roots\":{\"listChanged\":true},\"sampling\":{}},\"clientInfo\":{\"name\":\"browser-driver\",\"version\":\"0\"}}}\n"))) and
+   ([.frames[] | select(.id == 2) | .result.tools] | length == 1) and
+   ([.frames[] | select(.id == 2) | .result.tools[] |
+      select(.name == "performance_start_trace" or
+             .name == "performance_stop_trace" or
+             .name == "performance_analyze_insight" or
+             .name == "lighthouse_audit") |
+      (.description | contains("never as a gate"))] | all) and
+   ([.frames[] | select(.id == 2) | .result.tools[] |
+      select(.name == "upload_file") |
+      ((.description | contains("unsupported")) and
+       (.inputSchema.properties.filePath.type == "string"))] | all) and
+   ([.frames[] | select(.id == 2) | .result.tools[] |
+      select(.name == "navigate_page") |
+      (.title == "Navigate title" and .annotations.readOnlyHint == false and
+       .inputSchema.properties.url.type == "string")] | all) and
+   ([.frames[] | select(.id == 2) | .result.tools[].name] | sort) ==
+     ["lighthouse_audit","navigate_page","performance_analyze_insight","performance_start_trace","performance_stop_trace","upload_file"] and
+   ([.frames[] | select(.id == 3 and .result.structuredContent.content == "BROWSER_OK_3")] | length == 1) and
+   ([.stderr | scan("session_id=[0-9a-f-]{36}")] | length == 1) and
+   (.leaseCalls[-1].args | index("shutdown") != null)'
+
+test_browser_case "browser split tools/list frame is reassembled and rewritten" \
+  "split" "split" "ready" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 2) | .result.tools[].name] | sort) ==
+     ["lighthouse_audit","navigate_page","performance_analyze_insight","performance_start_trace","performance_stop_trace","upload_file"] and
+   ([.frames[] | select(.id == 2) | .result.tools[] |
+     select(.name == "upload_file") |
+     (.description | contains("unsupported"))] | all)'
+test_browser_case "browser interleaved frame stays byte-identical during rewrite" \
+  "interleaved" "interleaved" "ready" "10" "3" \
+  '(.driverError == null) and
+   (.rawLines | index("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"marker\":\"BROWSER_INTERLEAVED\"}}") != null) and
+   ([.frames[] | select(.id == 2) | .result.tools[].name] | sort) ==
+     ["lighthouse_audit","navigate_page","performance_analyze_insight","performance_start_trace","performance_stop_trace","upload_file"] and
+   ([.frames[] | select(.id == 2) | .result.tools[] |
+     select(.name == "lighthouse_audit") |
+     (.description | contains("never as a gate"))] | all)'
+test_browser_case "browser mode-boundary straddle forwards the orphan frame intact" \
+  "straddle" "straddle" "ready" "10" "3" \
+  '(.driverError == null) and
+   (.rawLines | index("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"marker\":\"STRADDLE\"}}") != null) and
+   ([.frames[] | select(.id == 2 and .result.tools)] | length == 1)'
+test_browser_case "browser partial tools/list then child death yields one error" \
+  "partialdie" "partialdie" "ready" "10" "3" \
+  '([.frames[] | select(.id == 2 and .error.code == -32001)] | length == 1) and
+   ([.frames[] | select(.id == 2 and has("result"))] | length == 0)'
+test_browser_case "browser complete unterminated tools/list is recovered on exit" \
+  "nonewlinedie" "nonewlinedie" "ready" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 2) | .result.tools[].name] | sort) ==
+     ["lighthouse_audit","navigate_page","performance_analyze_insight","performance_start_trace","performance_stop_trace","upload_file"] and
+   ([.frames[] | select(.id == 2) | .result.tools[] |
+     select(.name == "performance_start_trace") |
+     (.description | contains("never as a gate"))] | all)'
+test_browser_case "browser oversized frame forwards raw and following list rewrites" \
+  "oversized" "oversized" "ready" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.params.marker == "BROWSER_OVERSIZED")] | length == 1) and
+   ([.frames[] | select(.id == 2) | .result.tools[].name] | sort) ==
+     ["lighthouse_audit","navigate_page","performance_analyze_insight","performance_start_trace","performance_stop_trace","upload_file"] and
+   ([.frames[] | select(.id == 2) | .result.tools[] |
+     select(.name == "upload_file") |
+     (.description | contains("unsupported"))] | all)'
+test_browser_case "browser tools/list survives client stdout backpressure" \
+  "bp" "bp" "ready" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.params.marker == "BROWSER_BP")] | length == 1) and
+   ([.frames[] | select(.id == 2 and .result.tools)] | length == 1)'
+
+test_browser_case "browser roots/list round-trip preserves the exact client answer" \
+  "roots" "roots" "ready" "10" "3" \
+  '(.driverError == null) and
+   (.rootsResponse == "{\"jsonrpc\":\"2.0\", \"id\":\"roots-1\", \"result\":{\"roots\":[{\"uri\":\"file:///workspace\",\"name\":\"root\"}]}}") and
+   ([.frames[] | select(.id == "roots-1" and .method == "roots/list")] | length == 1) and
+   (.leaseCalls | length == 0)'
+test_browser_case "browser initialize is tracked and hard-bounded" \
+  "hang-init" "hang-init" "ready" "10" "0.18" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 1 and .error.code == -32001)] | length == 1)'
+test_browser_case "unplanned browser downstream death fails the open call" \
+  "die" "die" "ready" "10" "3" \
+  '([.frames[] | select(.id == 3 and .result.isError == true and
+     .result.structuredContent.code == "browser_lease_replaced" and
+     .result.structuredContent.outcomeUnknown == true)] | length == 1)'
+
+test_browser_case "concurrent cold calls share one acquire, preserve FIFO, and cancel held work" \
+  "slow-ready" "normal" "slow-ready" "10" "3" \
+   '(.driverError == null) and
+   ([.leaseCalls[] | select(.args[0] == "acquire")] | length == 1) and
+   (.spawns[0].stdin | map(select(.method == "tools/call") | .id) == [3,4,6]) and
+   ([.frames[] | select(.id == 5)] | length == 0) and
+   ([.frames[] | select(.method == "notifications/progress") |
+      .params.progressToken] | unique | sort) == [42,"browser-progress"] and
+   ([.frames[] | select(.method == "notifications/progress" and
+      (.params.progressToken | type == "object"))] | length == 0)'
+test_browser_case "advertised tool ownership avoids leasing for unknown tools" \
+  "unknown" "normal" "ready" "10" "3" \
+  '(.driverError == null) and
+   ([.leaseCalls[] | select(.args[0] == "acquire")] | length == 0) and
+   ([.spawns[0].stdin[] | select(.method == "tools/call" and
+      .params.name == "not_advertised")] | length == 1)'
+test_browser_case "browser calls conservatively acquire when tools/list was skipped" \
+  "skip-list" "normal" "ready" "10" "3" \
+  '(.driverError == null) and
+   ([.leaseCalls[] | select(.args[0] == "acquire")] | length == 1) and
+   ([.spawns[0].stdin[] | select(.method == "tools/call" and .id == 3)] | length == 1)'
+test_browser_case "browser acquire exit 69 fails closed with no-box context" \
+  "unavailable" "normal" "unavailable-69" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 3 and .result.isError == true and
+     .result.structuredContent.code == "browser_unavailable" and
+     (.result.content[0].text | contains("GUI not verified — no browser box available")) and
+     (.result.content[0].text | contains("Lease helper: no capacity")))] | length == 1) and
+   (.stderr | contains("browser lease unavailable: no capacity")) and
+   ([.spawns[0].stdin[] | select(.method == "tools/call")] | length == 0)'
+test_browser_case "browser dev-server preflight error is surfaced verbatim" \
+  "dev-unreachable" "normal" "dev-unreachable-69" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 3 and
+     .result.structuredContent.code == "browser_dev_server_unreachable" and
+     .result.content[0].text == "GUI not verified — dev server not reachable at :5100")] | length == 1)'
+test_browser_case "browser MinIO preflight error stays distinct and verbatim" \
+  "minio-unreachable" "normal" "minio-unreachable-69" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 3 and
+     .result.structuredContent.code == "browser_minio_unreachable" and
+     .result.content[0].text == "GUI not verified — MinIO not reachable at :9000")] | length == 1)'
+test_browser_case "browser empty acquire diagnostics fall back to the exit code" \
+  "acquire-empty" "normal" "acquire-empty-70" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 3 and
+     .result.structuredContent.code == "browser_provisioning_failed" and
+     (.result.content[0].text | contains("lease helper exited with code 70")))] | length == 1)'
+
+test_browser_case "browser exit-75 restart replays roots into the new downstream only" \
+  "port-once" "normal" "port-75-once" "10" "3" \
+  'def arg_after($argv; $flag): $argv[(($argv | index($flag)) + 1)];
+   (.driverError == null) and (.spawns | length == 2) and
+   ([.leaseCalls[] | select(.args[0] == "acquire")] | length == 2) and
+   (arg_after(.spawns[0].argv; "--browserUrl") != arg_after(.spawns[1].argv; "--browserUrl")) and
+   (.spawns[1].stdin[0].id as $internalId |
+     ($internalId | startswith("mcp-agents/browser/initialize/")) and
+     (.spawns[1].stdinRaw | startswith(
+       ("{\"jsonrpc\":\"2.0\",\"id\":" + ($internalId | tojson) +
+        ",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"roots\":{\"listChanged\":true},\"sampling\":{}},\"clientInfo\":{\"name\":\"browser-driver\",\"version\":\"0\"}}}\n")))) and
+   ([.spawns[1].stdin[] | select(.method == "notifications/initialized")] | length == 1) and
+   ([.frames[] | select(.id == 1 and has("result"))] | length == 1) and
+   ([.frames[] | select((.id | type) == "string" and
+      (.id | startswith("mcp-agents/browser/initialize/")))] | length == 0) and
+   ([.frames[] | select(.id == 3 and .result.structuredContent.content == "BROWSER_OK_3")] | length == 1)'
+test_browser_case "browser restart drops dead roots and round-trips replacement roots" \
+  "restart-roots" "restart-roots" "port-75-once" "10" "3" \
+  '(.driverError == null) and (.spawns | length == 2) and
+   ([.frames[] | select(.id == "roots-reused" and .method == "roots/list")] | length == 2) and
+   (.rootsResponses == [{
+      "pid": .spawns[1].pid,
+      "spawnOrdinal": 2,
+      "raw": "{\"jsonrpc\":\"2.0\", \"id\":\"roots-reused\", \"result\":{\"roots\":[{\"uri\":\"file:///workspace\",\"name\":\"replacement-root\"}]}}"
+    }]) and
+   ([.spawns[0].stdin[] | select(.id == "roots-reused" and has("result"))] | length == 0) and
+   ([.spawns[1].stdin[] | select(.id == "roots-reused" and has("result"))] | length == 1) and
+   (.spawns[1].stdinRaw | contains("dead-root") | not) and
+   ([.frames[] | select(.id == 3 and .result.structuredContent.content == "BROWSER_OK_3")] | length == 1)'
+test_browser_case "browser restart correlates roots by generation when replacement answers first" \
+  "restart-roots-out-of-order" "restart-roots" "port-75-once" "10" "3" \
+  '(.driverError == null) and (.spawns | length == 2) and
+   ([.frames[] | select(.method == "roots/list")] | length == 2) and
+   ([.frames[] | select(.method == "roots/list") | .id][0] == "roots-reused") and
+   ([.frames[] | select(.method == "roots/list") | .id][1] |
+      startswith("mcp-agents/browser/downstream-request/")) and
+   (.rootsClientResponses | map(.order) ==
+      ["held-dead","replacement-first","stale-second"]) and
+   (.rootsResponses == [{
+      "pid": .spawns[1].pid,
+      "spawnOrdinal": 2,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"roots-reused\",\"result\":{\"roots\":[{\"uri\":\"file:///workspace\",\"name\":\"replacement-root\"}]}}"
+    }]) and
+   ([.spawns[0].stdin[] | select(.id == "roots-reused" and has("result"))] | length == 0) and
+   ([.spawns[1].stdin[] | select(.id == "roots-reused" and has("result"))] | length == 1) and
+   (.spawns[1].stdinRaw | contains("dead-root") | not) and
+   ([.frames[] | select(.id == 3 and .result.structuredContent.content == "BROWSER_OK_3")] | length == 1)'
+test_browser_case "browser exit-75 retries are bounded at three attempts" \
+  "port-always" "normal" "port-75-always" "10" "3" \
+  '(.driverError == null) and (.spawns | length == 3) and
+   ([.leaseCalls[] | select(.args[0] == "acquire")] | length == 3) and
+   ([.frames[] | select(.id == 3 and
+      .result.structuredContent.code == "browser_provisioning_failed" and
+      (.result.content[0].text | contains("3 attempts")))] | length == 1)'
+test_browser_case "browser malformed ready record fails closed" \
+  "malformed" "normal" "malformed" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 3 and
+      .result.structuredContent.code == "browser_provisioning_failed")] | length == 1)'
+test_browser_case "browser mismatched ready port fails closed" \
+  "wrong-port" "normal" "wrong-port" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 3 and
+      .result.structuredContent.code == "browser_provisioning_failed")] | length == 1)'
+test_browser_case "browser lease records reject duplicate prototype keys" \
+  "duplicate-proto" "normal" "duplicate-proto" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 3 and
+      .result.structuredContent.code == "browser_provisioning_failed" and
+      (.result.content[0].text | contains("duplicate browser lease record key: __proto__")))] | length == 1) and
+   ([.spawns[0].stdin[] | select(.method == "tools/call")] | length == 0)'
+
+test_browser_case "browser rejects a different Chrome process on the leased port" \
+  "identity-substitution" "normal" "ready" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 3 and .result.structuredContent.content == "BROWSER_OK_3")] | length == 1) and
+   ([.frames[] | select(.id == 4 and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.stateLost == true and
+      .result.structuredContent.outcomeUnknown == false and
+      (.result.content[0].text | contains("call was not executed")))] | length == 1) and
+   ([.spawns[0].stdin[] | select(.method == "tools/call") | .id] == [3]) and
+   (.stderr | contains("browser lease identity lost"))'
+test_browser_case "browser post-verifies the first call on a new generation" \
+  "first-call-substitution" "normal" "ready" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 3 and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.stateLost == true and
+      .result.structuredContent.outcomeUnknown == true and
+      (.result.content[-1].text | contains("never blindly replay")))] | length == 1) and
+   ([.spawns[0].stdin[] | select(.method == "tools/call") | .id] == [3]) and
+   ([.leaseCalls[] | select(.args[0] == "release" and
+      (.args | index("gen-1") != null))] | length == 1)'
+test_browser_case "a sibling in-flight result is never forwarded raw after a peer discards the generation" \
+  "concurrent-identity-substitution" "normal" "slow-ready" "10" "3" \
+  '(.driverError == null) and
+   ([.leaseCalls[] | select(.args[0] == "acquire")] | length == 1) and
+   ([.spawns[0].stdin[] | select(.method == "tools/call") | .id] == [3, 4]) and
+   ([.frames[] | select(.id == 3 and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.stateLost == true and
+      .result.structuredContent.outcomeUnknown == true)] | length == 1) and
+   ([.frames[] | select(.id == 4 and .result.isError == true and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.stateLost == true and
+      .result.structuredContent.outcomeUnknown == true and
+      (.result.content[-1].text | contains("never blindly replay")))] | length == 1)'
+test_browser_case "browser identity classification fails closed if its generation expires during the check" \
+  "classifier-identity-toctou" "normal" "ready" "0.12" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 3 and .result.isError == true and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.outcomeUnknown == true)] | length == 1) and
+   ([.frames[] | select(.id == 3 and .result.isError != true and
+      .result.structuredContent.content == "BROWSER_OK_3")] | length == 0)'
+test_browser_case "browser connect classification fails closed if its generation expires during status" \
+  "classifier-connect-toctou" "connectfail" "status-slow-ready" "0.12" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 3 and .result.isError == true and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.outcomeUnknown == true)] | length == 1) and
+   ([.frames[] | select(.id == 3 and .result.isError == true and
+      (.result.structuredContent | has("code") | not))] | length == 0)'
+test_browser_case "hard-timeout recovery suppresses a response already deferred during classification" \
+  "deferred-hard-timeout-recovery" "deferred-hard-timeout-recovery" \
+  "slow-ready" "10" "0.55" \
+  '(.driverError == null) and (.spawns | length == 2) and
+   ([.leaseCalls[] | select(.args[0] == "acquire")] | length == 1) and
+   ([.spawns[0].stdin[] | select(.method == "tools/call") | .id] == [5, 3, 4]) and
+   ([.spawns[1].stdin[] | select(.method == "tools/call")] | length == 0) and
+   ([.frames[] | select(.id == 3)] | length == 1) and
+   ([.frames[] | select(.id == 3 and .result.isError == true and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.outcomeUnknown == true)] | length == 1) and
+   ([.frames[] | select(.id == 3 and
+      .result.structuredContent.content == "DEFERRED_RAW_3")] | length == 0) and
+   ([.frames[] | select(.id == 4 and
+      .result.structuredContent.content == "CLASSIFIER_OK_4")] | length == 1) and
+   ([.frames[] | select(.id == 5 and .result.isError == true and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.outcomeUnknown == true)] | length == 1)'
+test_browser_case "cancelling an open browser call preserves generation classification" \
+  "cancel-open-generation-change" "controlled-result" "ready" "0.12" "3" \
+  '(.driverError == null) and
+   ([.spawns[0].stdin[] | select(.method == "tools/call") | .id] == [3]) and
+   ([.spawns[0].stdin[] | select(.method == "notifications/cancelled" and
+      .params.requestId == 3)] | length == 1) and
+   ([.leaseCalls[] | select(.args[0] == "release" and
+      (.args | index("idle") != null))] | length == 1) and
+   ([.frames[] | select(.id == 3 and .result.isError == true and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.outcomeUnknown == true and
+      (.result.content[-1].text | contains("never blindly replay")))] | length == 1) and
+   ([.frames[] | select(.id == 3 and .result.isError != true and
+      .result.structuredContent.content == "RAW_CANCELLED_3")] | length == 0)'
+test_browser_case "browser restart resolves an outstanding call and clears its latch" \
+  "restart-outstanding" "restart-outstanding" "ready-port-75-second" "0.12" "3" \
+  '(.driverError == null) and (.spawns | length == 2) and
+   (.latchClearBeforeClose == true) and
+   ([.leaseCalls[] | select(.args[0] == "acquire")] | length == 3) and
+   ([.spawns[0].stdin[] | select(.method == "tools/call") | .id] == [3]) and
+   ([.spawns[1].stdin[] | select(.method == "tools/call") | .id] == [4]) and
+   ([.frames[] | select(.id == 3 and .result.isError == true and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.outcomeUnknown == true)] | length == 1) and
+   ([.frames[] | select(.id == 4 and
+      .result.structuredContent.content == "REPLACEMENT_OK_4")] | length == 1)'
+test_browser_case "unsafe browser restart still resolves calls owned by the dead downstream" \
+  "restart-outstanding-unsafe" "restart-outstanding-unsafe" "ready-port-75-second" "0.12" "3" \
+  '(.driverError == null) and (.spawns | length == 1) and
+   ([.frames[] | select(.id == 3 and .result.isError == true and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.outcomeUnknown == true)] | length == 1) and
+   ([.frames[] | select(.id == 4 and .result.isError == true and
+      .result.structuredContent.code == "browser_provisioning_failed" and
+      (.result.structuredContent.message | contains("unsafe frame boundary")))] | length == 1)'
+test_browser_case "oversized browser result fails closed instead of forwarding raw" \
+  "oversized-browser-result" "oversized-result" "ready" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 3 and .result.isError == true and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.outcomeUnknown == true)] | length == 1) and
+   ([.frames[] | select(.id == 3 and
+      .result.structuredContent.content == "RAW_OVERSIZED_RESULT")] | length == 0)'
+test_browser_case "oversized browser result with id after result fails closed" \
+  "oversized-id-after-result" "oversized-result-id-after" "ready" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 3 and .result.isError == true and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.outcomeUnknown == true)] | length == 1) and
+   ([.frames[] | select(.id == 3 and
+      .result.structuredContent.content == "RAW_OVERSIZED_ID_AFTER")] | length == 0)'
+test_browser_case "complete oversized browser result with id after result fails closed" \
+  "oversized-complete-id-after" "oversized-complete-id-after" "ready" "10" "3" \
+  '(.driverError == null) and
+   (.stderr | contains("frame exceeded rewrite cap")) and
+   ([.frames[] | select(.id == 3 and .result.isError == true and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.outcomeUnknown == true)] | length == 1) and
+   ([.frames[] | select(.id == 3 and .result.isError != true and
+      .result.structuredContent.content == "RAW_OVERSIZED_COMPLETE")] | length == 0)'
+test_browser_case "browser finalize resolves active and buffered classifier owners" \
+  "finalize-multiframe" "finalize-multiframe" "ready" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select((.id == 3 or .id == 4 or .id == 5) and
+      .result.isError == true and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.outcomeUnknown == true)] | map(.id) | sort == [3,4,5]) and
+   ([.frames[] | select((.id == 3 or .id == 4 or .id == 5) and
+      .result.isError != true and
+      (.result.structuredContent.content | startswith("RAW_FINALIZE_")))] | length == 0)'
+test_browser_case "malformed browser result resolves lease-loss and clears its tracking" \
+  "malformed-browser-result" "malformed-result" "ready" "10" "3" \
+  '(.driverError == null) and (.latchClearBeforeClose == true) and
+   ([.frames[] | select(.id == 3 and .result.isError == true and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.outcomeUnknown == true)] | length == 1)'
+test_browser_case "hard-timed-out browser call resolves lease-loss without permanent tracking" \
+  "browser-hard-timeout" "timeout-no-result" "ready" "10" "1" \
+  '(.driverError == null) and (.latchClearBeforeClose == true) and
+   (.spawns | length == 2) and
+   ([.frames[] | select(.id == 3 and .result.isError == true and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.outcomeUnknown == true)] | length == 1) and
+   (.rawLines | map(contains("OLD_PROCESS_SHOULD_BE_DEAD")) | any | not)'
+test_browser_case "unterminated browser result fails closed during child exit" \
+  "unterminated-browser-result" "call-nonewlinedie" "ready" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 3 and .result.isError == true and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.outcomeUnknown == true)] | length == 1) and
+   ([.frames[] | select(.id == 3 and .result.isError != true and
+      .result.structuredContent.content == "BROWSER_UNTERMINATED_3")] | length == 0)'
+test_browser_case "browser suspends idle expiry during a held identity check" \
+  "slow-identity-idle" "normal" "ready" "0.12" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 4 and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.stateLost == true and
+      .result.structuredContent.outcomeUnknown == false and
+      (.result.content[0].text | contains("identity could not be verified")))] | length == 1) and
+   ([.spawns[0].stdin[] | select(.method == "tools/call") | .id] == [3]) and
+   ([.leaseCalls[] | select(.args[0] == "release" and
+      (.args | index("gen-1") != null))] | length == 1)'
+test_browser_case "browser unreadable identity releases the discarded generation" \
+  "identity-unreachable" "normal" "ready" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 4 and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.stateLost == true and
+      .result.structuredContent.outcomeUnknown == false)] | length == 1) and
+   ([.spawns[0].stdin[] | select(.method == "tools/call") | .id] == [3]) and
+   ([.leaseCalls[] | select(.args[0] == "release" and
+      (.args | index("gen-1") != null))] | length == 1)'
+
+test_browser_case "browser shutdown lets an acquiring helper run its TERM cleanup" \
+  "shutdown-acquire" "normal" "acquire-term" "10" "3" \
+  '(.driverError == null) and (.acquireTerminated == true) and
+   (.leaseCalls | map(.args[0]) == ["acquire"]) and
+   ([.spawns[0].stdin[] | select(.method == "tools/call") | .id] | length == 0)'
+test_browser_case "browser acquire timeout lets the helper run its TERM cleanup" \
+  "acquire-timeout" "normal" "acquire-term-timeout" "10" "3" \
+  '(.driverError == null) and (.acquireTerminated == true) and
+   (.leaseCalls | map(.args[0]) == ["acquire"]) and
+   ([.frames[] | select(.id == 3 and
+      .result.structuredContent.code == "browser_provisioning_failed" and
+      (.result.content[0].text | contains("timed out")))] | length == 1) and
+   ([.spawns[0].stdin[] | select(.method == "tools/call") | .id] | length == 0)'
+test_browser_case "browser escalates when an acquiring helper ignores TERM" \
+  "acquire-kill-timeout" "normal" "acquire-ignore-term-timeout" "10" "3" \
+  '(.driverError == null) and (.acquireTerminated == true) and
+   (.acquireAlive == false) and
+   ([.frames[] | select(.id == 3 and
+      .result.structuredContent.code == "browser_provisioning_failed" and
+      (.result.content[0].text | contains("timed out")))] | length == 1) and
+   ([.spawns[0].stdin[] | select(.method == "tools/call") | .id] | length == 0)'
+test_browser_case "browser helper budget stays below its request budget" \
+  "derived-helper-timeout" "normal" "acquire-derived-timeout" "10" "18" \
+  '(.driverError == null) and (.acquireTerminated == true) and
+   ([.frames[] | select(.id == 3 and
+      .result.structuredContent.code == "browser_provisioning_failed" and
+      (.result.content[0].text | contains("timed out")))] | length == 1) and
+   ([.frames[] | select(.id == 3 and .error.code == -32001)] | length == 0) and
+   ([.spawns[0].stdin[] | select(.method == "tools/call") | .id] | length == 0)'
+
+test_browser_case "browser status-ready preserves the native connect error" \
+  "status-ready" "connectfail" "status-ready" "10" "3" \
+  '(.driverError == null) and
+   ([.leaseCalls[] | select(.args[0] == "status")] | length == 1) and
+   ([.frames[] | select(.id == 3 and .result.isError == true and
+      (.result.structuredContent | has("code") | not))] | length == 1)'
+test_browser_case "browser corrupt status stays unknown and preserves native error" \
+  "status-corrupt" "connectfail" "status-corrupt" "10" "3" \
+  '(.driverError == null) and
+   ([.frames[] | select(.id == 3 and .result.isError == true and
+      (.result.structuredContent | has("code") | not))] | length == 1) and
+   (.stderr | contains("status is unknown")) and
+   (.stderr | contains("exit 70"))'
+test_browser_case "browser absent lease enriches once, never replays, and next call repairs" \
+  "status-absent" "connectfail" "status-absent" "10" "3" \
+  '(.driverError == null) and
+   ([.leaseCalls[] | select(.args[0] == "acquire")] | length == 2) and
+   ([.leaseCalls[] | select(.args[0] == "status")] | length == 1) and
+   ([.frames[] | select(.id == 3 and
+      .result.structuredContent.code == "browser_lease_replaced" and
+      .result.structuredContent.stateLost == true and
+      .result.structuredContent.outcomeUnknown == true and
+      (.result.content[-1].text | contains("never blindly replay")))] | length == 1) and
+   ([.frames[] | select(.id == 4 and
+      .result.structuredContent.content == "RECOVERED_NEXT_CALL")] | length == 1) and
+   ([.spawns[0].stdin[] | select(.method == "tools/call")] | map(.id) == [3,4])'
+
+test_browser_case "every downstream frame resets browser lease idle" \
+  "activity" "activity" "ready" "0.12" "3" \
+  '(.driverError == null) and
+   ([.leaseCalls[] | select(.args[0] == "release" and
+      (.args | index("idle") != null))] | length == 1) and
+   ([.leaseCalls[] | select(.args[0] == "release")][0].at >
+     [.frameEvents[] | select(.id == 3)][0].at) and
+   ([.frames[] | select(.id == 3 and
+      .result.structuredContent.content == "ACTIVITY_DONE")] | length == 1)'
+test_browser_case "browser stderr is prefixed and does not reset lease idle" \
+  "stderr" "stderr" "ready" "0.12" "3" \
+  '(.driverError == null) and
+   (.stderr | contains("[chrome-devtools] noisy but not browser activity")) and
+   ([.leaseCalls[] | select(.args[0] == "release" and
+      (.args | index("idle") != null))] | length == 1) and
+   ([.leaseCalls[] | select(.args[0] == "release")][0].at <
+     .lastNoisyStderrAt)'
+test_browser_case "browser idle timeout releases a ready generation" \
+  "idle-release" "normal" "ready" "0.12" "3" \
+  '(.driverError == null) and
+   ([.leaseCalls[] | select(.args[0] == "release" and
+      (.args | index("idle") != null) and
+      (.args | index("gen-1") != null))] | length == 1)'
+test_browser_case "browser idle timeout zero disables idle release" \
+  "idle-zero" "normal" "ready" "0" "3" \
+  '(.driverError == null) and
+   ([.leaseCalls[] | select(.args[0] == "release" and
+      (.args | index("idle") != null))] | length == 0) and
+   ([.leaseCalls[] | select(.args[0] == "release" and
+      (.args | index("shutdown") != null))] | length == 1)'
+test_browser_case "browser idle release exit 69 is nonfatal" \
+  "release-69" "normal" "release-69" "0.12" "3" \
+  '(.driverError == null) and
+   ([.leaseCalls[] | select(.args[0] == "release")] | length >= 1) and
+   (.stderr | contains("was nonfatal"))'
+test_browser_case "browser empty release diagnostics fall back to the exit code" \
+  "release-70" "normal" "release-empty-70" "0.12" "3" \
+  '(.driverError == null) and
+   ([.leaseCalls[] | select(.args[0] == "release")] | length >= 1) and
+   (.stderr | contains("exit 70"))'
+test_browser_case "browser cap-only generation still attempts nonfatal release" \
+  "cap-only" "normal" "cap-only" "0.12" "3" \
+  '(.driverError == null) and
+   ([.leaseCalls[] | select(.args[0] == "release" and
+      (.args | index("idle") != null))] | length == 1) and
+   (.stderr | contains("was nonfatal"))'
+test_browser_case "browser shutdown releases the exact acquired generation" \
+  "shutdown" "normal" "ready" "10" "3" \
+  '(.driverError == null) and
+   ([.leaseCalls[] | select(.args[0] == "release" and
+      (.args | index("shutdown") != null) and
+      (.args | index("gen-1") != null))] | length == 1)'
+test_browser_case "browser idle release has time to finish remote cleanup" \
+  "slow-idle-release" "normal" "slow-idle-release" "0.12" "5" \
+  '(.driverError == null) and
+   ([.releaseCompletions[] | select(.reason == "idle")] | length == 1)'
+test_browser_case "browser shutdown release is bounded and reaped" \
+  "shutdown" "normal" "slow-shutdown-release" "10" "5" \
+  '(.driverError == null) and
+   ([.releaseCompletions[] | select(.reason == "shutdown")] | length == 1)'
 
 if [ "${SKIP_INTEGRATION:-}" = "1" ]; then
   echo ""

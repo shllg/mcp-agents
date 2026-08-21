@@ -3,6 +3,9 @@
 
 import { randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
+import { get as httpGet } from "node:http";
+import { createRequire } from "node:module";
+import { createServer as createNetServer } from "node:net";
 import {
   chmodSync,
   closeSync,
@@ -36,6 +39,7 @@ const STARTUP_CWD = process.cwd();
 const VERSION = JSON.parse(
   readFileSync(join(__dirname, "package.json"), "utf8"),
 ).version;
+const LOCAL_REQUIRE = createRequire(import.meta.url);
 
 const DEFAULT_TIMEOUT_MS = 300_000;
 const DEFAULT_CLAUDE_TIMEOUT_MS = 900_000;
@@ -91,6 +95,52 @@ const MAX_RETAINED_CODEX_JOBS = 32;
 const MAX_REMEMBERED_CODEX_THREAD_WORKSPACES = 64;
 const CODEX_JOB_RETENTION_MS = 60 * 60 * 1_000;
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
+// The npx fallback deliberately floats to the latest release. The provider no
+// longer depends on any single version's reconnect behavior: every browser tool
+// result is verified against the lease generation it was issued under, whether
+// or not the downstream reports a reconnect, so a newer release cannot quietly
+// weaken the fail-closed contract.
+const CHROME_DEVTOOLS_MCP_NPX_SPEC = "chrome-devtools-mcp@latest";
+const DEFAULT_BROWSER_IDLE_TIMEOUT_MS = 600_000;
+const DEFAULT_BROWSER_VIEWPORT = "1440x900";
+// The browser request encloses acquisition, identity verification, and the
+// first tool call, so its helper budget must leave room for the latter work.
+const DEFAULT_BROWSER_ACQUIRE_TIMEOUT_MS = 600_000;
+const DEFAULT_BROWSER_IDENTITY_TIMEOUT_MS = 3_000;
+const BROWSER_ACQUIRE_RESERVE_MS = 15_000;
+const DEFAULT_BROWSER_HELPER_TERM_GRACE_MS = 30_000;
+const DEFAULT_BROWSER_IDLE_RELEASE_TIMEOUT_MS = 60_000;
+const DEFAULT_BROWSER_SHUTDOWN_RELEASE_TIMEOUT_MS = 15_000;
+const DEFAULT_BROWSER_PROGRESS_INTERVAL_MS = 5_000;
+const DEFAULT_BROWSER_FLUSH_STALL_MS = 60_000;
+const MAX_BROWSER_HELPER_DIAGNOSTIC_CODEPOINTS = 2_000;
+const MAX_BROWSER_PORT_ATTEMPTS = 3;
+const BROWSER_LEASE_COMMAND_ENV = "MCP_AGENTS_BROWSER_LEASE_COMMAND";
+const BROWSER_COMMAND_ENV = "MCP_AGENTS_BROWSER_COMMAND";
+const BROWSER_IDLE_TIMEOUT_ENV = "MCP_AGENTS_BROWSER_IDLE_TIMEOUT";
+const BROWSER_VIEWPORT_ENV = "MCP_AGENTS_BROWSER_VIEWPORT";
+const BROWSER_APP_PORT_ENV = "MCP_AGENTS_BROWSER_APP_PORT";
+const BROWSER_LOG_FILE_ENV = "MCP_AGENTS_BROWSER_LOG_FILE";
+const BROWSER_ALLOWED_URL_PATTERN_ENV =
+  "MCP_AGENTS_BROWSER_ALLOWED_URL_PATTERN";
+const BROWSER_WARNING_DESCRIPTIONS = {
+  performance_start_trace:
+    "mcp-agents remote-browser note: this measures the remote browser link " +
+    "as well as the application. Treat it as diagnostic only, never as a gate.",
+  performance_stop_trace:
+    "mcp-agents remote-browser note: this measures the remote browser link " +
+    "as well as the application. Treat it as diagnostic only, never as a gate.",
+  performance_analyze_insight:
+    "mcp-agents remote-browser note: this measures the remote browser link " +
+    "as well as the application. Treat it as diagnostic only, never as a gate.",
+  lighthouse_audit:
+    "mcp-agents remote-browser note: this measures the remote browser link " +
+    "as well as the application. Treat it as diagnostic only, never as a gate.",
+  upload_file:
+    "mcp-agents remote-browser note: unsupported on this provider. The tool " +
+    "validates a local path but hands that same path to remote Chromium, and " +
+    "no file-staging bridge exists.",
+};
 const DEFAULT_CLAUDE_STATUS_WAIT_MS = 10_000;
 const MAX_CLAUDE_STATUS_WAIT_MS = 60_000;
 const MAX_CLAUDE_PAGE_CODEPOINTS = 32_768;
@@ -261,6 +311,10 @@ const CLI_BACKENDS = {
   codex: {
     passthrough: true,
   },
+  browser: {
+    passthrough: true,
+    defaultTimeoutMs: DEFAULT_BROWSER_ACQUIRE_TIMEOUT_MS,
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -370,8 +424,26 @@ Options:
                                  still woken by the ${MAX_CODEX_STATUS_WAIT_MS / 1000}s heartbeat ceiling, so
                                  only the status text goes stale. 0 = every change
                                  [default: ${DEFAULT_CODEX_STATUS_INTERVAL_MS / 1000}]
+  --browser_lease_command <cmd>  Required browser lease helper command or JSON
+                                 argv [env: ${BROWSER_LEASE_COMMAND_ENV}]
+  --browser_command <cmd>        chrome-devtools-mcp command or JSON argv;
+                                 defaults to local resolution, then
+                                 npx ${CHROME_DEVTOOLS_MCP_NPX_SPEC}
+                                 [env: ${BROWSER_COMMAND_ENV}]
+  --browser_idle_timeout <secs>  Release an idle browser lease; 0 disables
+                                 [default: ${DEFAULT_BROWSER_IDLE_TIMEOUT_MS / 1000};
+                                 env: ${BROWSER_IDLE_TIMEOUT_ENV}]
+  --browser_viewport <WxH>       Remote browser viewport
+                                 [default: ${DEFAULT_BROWSER_VIEWPORT}; env: ${BROWSER_VIEWPORT_ENV}]
+  --browser_app_port <port>      Optional local application port forwarded by
+                                 the lease helper [env: ${BROWSER_APP_PORT_ENV}]
+  --browser_log_file <path>      Optional chrome-devtools-mcp diagnostic log
+                                 [env: ${BROWSER_LOG_FILE_ENV}]
+  --browser_allowed_url_pattern <pattern>
+                                 Repeatable opt-in URL allow pattern
+                                 [env: ${BROWSER_ALLOWED_URL_PATTERN_ENV}]
   --timeout <seconds>            Default timeout per call
-                                 [default: codex ${DEFAULT_CODEX_TIMEOUT_MS / 1000}, claude ${DEFAULT_CLAUDE_TIMEOUT_MS / 1000}, gemini ${DEFAULT_TIMEOUT_MS / 1000}]
+                                 [default: codex ${DEFAULT_CODEX_TIMEOUT_MS / 1000}, claude ${DEFAULT_CLAUDE_TIMEOUT_MS / 1000}, browser ${DEFAULT_BROWSER_ACQUIRE_TIMEOUT_MS / 1000}, gemini ${DEFAULT_TIMEOUT_MS / 1000}]
   --help, -h                     Show this help message
   --version, -v                  Show version number`);
 }
@@ -380,9 +452,9 @@ Options:
  * Parse CLI flags from process.argv.
  * Handles --help, --version, --provider, --model, --model_reasoning_effort,
  * --sandbox_mode, --approval_policy, --codex-workspace-network, --goal,
- * --codex_idle_timeout, --codex_cancel_grace, --codex_status_interval, --timeout,
- * and unknown flags.
- * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, codexWorkspaceNetworkAccess?: boolean, goal?: string, codexIdleTimeoutMs?: number, codexCancelGraceMs?: number, codexStatusIntervalMs?: number, defaultTimeoutMs?: number }}
+ * --codex_idle_timeout, --codex_cancel_grace, --codex_status_interval, browser
+ * provider settings, --timeout, and unknown flags.
+ * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, codexWorkspaceNetworkAccess?: boolean, goal?: string, codexIdleTimeoutMs?: number, codexCancelGraceMs?: number, codexStatusIntervalMs?: number, browserLeaseCommand?: string, browserCommand?: string, browserIdleTimeoutMs?: number, browserViewport?: string, browserAppPort?: number, browserLogFile?: string, browserAllowedUrlPatterns?: string[], defaultTimeoutMs?: number }}
  */
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -396,6 +468,14 @@ function parseArgs() {
   let codexIdleTimeoutMs;
   let codexCancelGraceMs;
   let codexStatusIntervalMs;
+  let browserLeaseCommand;
+  let browserCommand;
+  let browserIdleTimeoutMs;
+  let browserViewport;
+  let browserAppPort;
+  let browserLogFile;
+  const browserAllowedUrlPatterns = [];
+  const browserFlags = [];
   let defaultTimeoutMs;
 
   for (let i = 0; i < args.length; i++) {
@@ -519,6 +599,100 @@ function parseArgs() {
         codexStatusIntervalMs = Math.round(secs * 1000);
         break;
       }
+      case "--browser_lease_command":
+        if (i + 1 >= args.length) {
+          process.stderr.write(
+            "error: --browser_lease_command requires a value\n",
+          );
+          process.exit(1);
+        }
+        browserFlags.push(arg);
+        browserLeaseCommand = args[++i];
+        break;
+      case "--browser_command":
+        if (i + 1 >= args.length) {
+          process.stderr.write("error: --browser_command requires a value\n");
+          process.exit(1);
+        }
+        browserFlags.push(arg);
+        browserCommand = args[++i];
+        break;
+      case "--browser_idle_timeout": {
+        if (i + 1 >= args.length) {
+          process.stderr.write(
+            "error: --browser_idle_timeout requires a value\n",
+          );
+          process.exit(1);
+        }
+        browserFlags.push(arg);
+        const secs = Number(args[++i]);
+        if (!Number.isFinite(secs) || secs < 0) {
+          process.stderr.write(
+            "error: --browser_idle_timeout must be a non-negative number\n",
+          );
+          process.exit(1);
+        }
+        browserIdleTimeoutMs = Math.round(secs * 1000);
+        break;
+      }
+      case "--browser_viewport":
+        if (i + 1 >= args.length) {
+          process.stderr.write("error: --browser_viewport requires a value\n");
+          process.exit(1);
+        }
+        browserFlags.push(arg);
+        browserViewport = args[++i];
+        if (!/^[1-9]\d*x[1-9]\d*$/u.test(browserViewport)) {
+          process.stderr.write(
+            "error: --browser_viewport must use positive WxH dimensions\n",
+          );
+          process.exit(1);
+        }
+        break;
+      case "--browser_app_port": {
+        if (i + 1 >= args.length) {
+          process.stderr.write("error: --browser_app_port requires a value\n");
+          process.exit(1);
+        }
+        browserFlags.push(arg);
+        const port = Number(args[++i]);
+        if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+          process.stderr.write(
+            "error: --browser_app_port must be an integer from 1 to 65535\n",
+          );
+          process.exit(1);
+        }
+        browserAppPort = port;
+        break;
+      }
+      case "--browser_log_file":
+        if (i + 1 >= args.length) {
+          process.stderr.write("error: --browser_log_file requires a value\n");
+          process.exit(1);
+        }
+        browserFlags.push(arg);
+        browserLogFile = args[++i];
+        if (!browserLogFile) {
+          process.stderr.write("error: --browser_log_file must not be blank\n");
+          process.exit(1);
+        }
+        break;
+      case "--browser_allowed_url_pattern":
+        if (i + 1 >= args.length) {
+          process.stderr.write(
+            "error: --browser_allowed_url_pattern requires a value\n",
+          );
+          process.exit(1);
+        }
+        browserFlags.push(arg);
+        browserAllowedUrlPatterns.push(args[++i]);
+        if (!browserAllowedUrlPatterns.at(-1)) {
+          process.stderr.write(
+            "error: --browser_allowed_url_pattern must not be blank\n",
+          );
+          process.exit(1);
+        }
+        break;
       case "--timeout": {
         if (i + 1 >= args.length) {
           process.stderr.write("error: --timeout requires a value\n");
@@ -538,6 +712,13 @@ function parseArgs() {
     }
   }
 
+  if (provider !== "browser" && browserFlags.length > 0) {
+    process.stderr.write(
+      `error: ${browserFlags[0]} is only valid with --provider browser\n`,
+    );
+    process.exit(1);
+  }
+
   return {
     provider,
     model,
@@ -549,6 +730,16 @@ function parseArgs() {
     codexIdleTimeoutMs,
     codexCancelGraceMs,
     codexStatusIntervalMs,
+    browserLeaseCommand,
+    browserCommand,
+    browserIdleTimeoutMs,
+    browserViewport,
+    browserAppPort,
+    browserLogFile,
+    browserAllowedUrlPatterns:
+      browserAllowedUrlPatterns.length > 0
+        ? browserAllowedUrlPatterns
+        : undefined,
     defaultTimeoutMs,
   };
 }
@@ -577,6 +768,422 @@ function resolveCodexWorkspaceNetworkAccess(cliValue) {
   const envValue = process.env[CODEX_WORKSPACE_NETWORK_ACCESS_ENV];
   if (envValue === undefined) return DEFAULT_CODEX_WORKSPACE_NETWORK_ACCESS;
   return parseBooleanSetting(envValue, CODEX_WORKSPACE_NETWORK_ACCESS_ENV);
+}
+
+/**
+ * Parse a command setting into argv without invoking a shell. JSON arrays are
+ * unambiguous; plain strings support ordinary quoting and backslash escaping
+ * while deliberately omitting expansion, substitution, and redirection.
+ * @param {string} value
+ * @param {string} source
+ * @returns {string[]}
+ */
+function parseCommandArgvSetting(value, source) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`${source} must be a nonblank command or JSON argv`);
+  }
+  const trimmed = value.trim();
+  if (trimmed.startsWith("[")) {
+    let parsed;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`${source} contains invalid JSON argv: ${message}`);
+    }
+    if (
+      !Array.isArray(parsed) || parsed.length === 0 ||
+      parsed.some((part) => typeof part !== "string" || !part)
+    ) {
+      throw new Error(`${source} JSON argv must be a nonempty string array`);
+    }
+    return parsed;
+  }
+
+  const argv = [];
+  let current = "";
+  let quote;
+  let escaped = false;
+  let tokenStarted = false;
+  for (const char of trimmed) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      tokenStarted = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) {
+        quote = undefined;
+      } else if (char === "\\" && quote === '"') {
+        escaped = true;
+      } else {
+        current += char;
+      }
+      tokenStarted = true;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      tokenStarted = true;
+    } else if (char === "\\") {
+      escaped = true;
+      tokenStarted = true;
+    } else if (/\s/u.test(char)) {
+      if (tokenStarted) {
+        argv.push(current);
+        current = "";
+        tokenStarted = false;
+      }
+    } else {
+      current += char;
+      tokenStarted = true;
+    }
+  }
+  if (quote || escaped) {
+    throw new Error(`${source} has an unterminated quote or escape`);
+  }
+  if (tokenStarted) argv.push(current);
+  if (argv.length === 0 || argv[0] === "") {
+    throw new Error(`${source} must contain an executable`);
+  }
+  return argv;
+}
+
+/**
+ * Resolve the browser downstream executable using the documented deterministic
+ * order: explicit override, this package's local installation, then pinned npx.
+ * @param {string | undefined} explicitSetting
+ * @returns {{ command: string, args: string[], source: string, npxFallback: boolean }}
+ */
+function resolveBrowserDownstreamCommand(explicitSetting) {
+  if (explicitSetting !== undefined) {
+    const argv = parseCommandArgvSetting(explicitSetting, "browser command");
+    return {
+      command: argv[0],
+      args: argv.slice(1),
+      source: "explicit",
+      npxFallback: false,
+    };
+  }
+
+  try {
+    const packageEntry = LOCAL_REQUIRE.resolve("chrome-devtools-mcp");
+    const script = join(dirname(packageEntry), "bin", "chrome-devtools-mcp.js");
+    if (existsSync(script)) {
+      return {
+        command: process.execPath,
+        args: [script],
+        source: "local package",
+        npxFallback: false,
+      };
+    }
+  } catch {}
+
+  const localBin = join(
+    __dirname,
+    "node_modules",
+    ".bin",
+    process.platform === "win32"
+      ? "chrome-devtools-mcp.cmd"
+      : "chrome-devtools-mcp",
+  );
+  if (existsSync(localBin)) {
+    return {
+      command: localBin,
+      args: [],
+      source: "local binary",
+      npxFallback: false,
+    };
+  }
+
+  return {
+    command: "npx",
+    args: ["-y", CHROME_DEVTOOLS_MCP_NPX_SPEC],
+    source: "npx fallback",
+    npxFallback: true,
+  };
+}
+
+/**
+ * Parse a positive TCP port setting.
+ * @param {string | number | undefined} value
+ * @param {string} source
+ * @returns {number | undefined}
+ */
+function parseOptionalPortSetting(value, source) {
+  if (value === undefined) return undefined;
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error(`${source} must be an integer from 1 to 65535`);
+  }
+  return port;
+}
+
+/**
+ * Resolve browser settings with CLI values taking precedence over environment
+ * equivalents. The lease command remains mandatory so the provider cannot
+ * silently fall back to a local browser.
+ * @param {{ browserLeaseCommand?: string, browserCommand?: string, browserIdleTimeoutMs?: number, browserViewport?: string, browserAppPort?: number, browserLogFile?: string, browserAllowedUrlPatterns?: string[] }} opts
+ * @returns {{ leaseCommand: string[], downstream: { command: string, args: string[], source: string, npxFallback: boolean }, idleTimeoutMs: number, viewport: string, appPort?: number, logFile?: string, allowedUrlPatterns: string[] }}
+ */
+function resolveBrowserSettings(opts) {
+  const leaseSetting = opts.browserLeaseCommand ??
+    process.env[BROWSER_LEASE_COMMAND_ENV];
+  if (leaseSetting === undefined) {
+    throw new Error(
+      `--browser_lease_command or ${BROWSER_LEASE_COMMAND_ENV} is required`,
+    );
+  }
+  const commandSetting = opts.browserCommand ?? process.env[BROWSER_COMMAND_ENV];
+  const envIdle = process.env[BROWSER_IDLE_TIMEOUT_ENV];
+  let idleTimeoutMs = opts.browserIdleTimeoutMs;
+  if (idleTimeoutMs === undefined && envIdle !== undefined) {
+    const seconds = Number(envIdle);
+    if (!Number.isFinite(seconds) || seconds < 0) {
+      throw new Error(
+        `${BROWSER_IDLE_TIMEOUT_ENV} must be a non-negative number`,
+      );
+    }
+    idleTimeoutMs = Math.round(seconds * 1_000);
+  }
+  const viewport = opts.browserViewport ??
+    process.env[BROWSER_VIEWPORT_ENV] ?? DEFAULT_BROWSER_VIEWPORT;
+  if (!/^[1-9]\d*x[1-9]\d*$/u.test(viewport)) {
+    throw new Error(`${BROWSER_VIEWPORT_ENV} must use positive WxH dimensions`);
+  }
+  const appPort = opts.browserAppPort ?? parseOptionalPortSetting(
+    process.env[BROWSER_APP_PORT_ENV],
+    BROWSER_APP_PORT_ENV,
+  );
+  const logFile = opts.browserLogFile ?? process.env[BROWSER_LOG_FILE_ENV];
+  if (logFile !== undefined && !logFile) {
+    throw new Error(`${BROWSER_LOG_FILE_ENV} must not be blank`);
+  }
+  let allowedUrlPatterns = opts.browserAllowedUrlPatterns;
+  if (!allowedUrlPatterns) {
+    const envPattern = process.env[BROWSER_ALLOWED_URL_PATTERN_ENV];
+    if (envPattern?.trim().startsWith("[")) {
+      try {
+        allowedUrlPatterns = JSON.parse(envPattern);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `${BROWSER_ALLOWED_URL_PATTERN_ENV} contains invalid JSON: ${message}`,
+        );
+      }
+      if (
+        !Array.isArray(allowedUrlPatterns) ||
+        allowedUrlPatterns.some((pattern) =>
+          typeof pattern !== "string" || !pattern
+        )
+      ) {
+        throw new Error(
+          `${BROWSER_ALLOWED_URL_PATTERN_ENV} must be a string or JSON string array`,
+        );
+      }
+    } else {
+      allowedUrlPatterns = envPattern ? [envPattern] : [];
+    }
+  }
+  return {
+    leaseCommand: parseCommandArgvSetting(
+      leaseSetting,
+      "browser lease command",
+    ),
+    downstream: resolveBrowserDownstreamCommand(commandSetting),
+    idleTimeoutMs: idleTimeoutMs ?? DEFAULT_BROWSER_IDLE_TIMEOUT_MS,
+    viewport,
+    appPort,
+    logFile,
+    allowedUrlPatterns,
+  };
+}
+
+/**
+ * Allocate a currently-free loopback port. The lease helper owns the eventual
+ * bind, so callers must still handle its explicit exit-75 race result.
+ * @returns {Promise<number>}
+ */
+function allocateLoopbackPort() {
+  return new Promise((resolve, reject) => {
+    const server = createNetServer();
+    server.unref();
+    server.once("error", reject);
+    server.listen({ host: "127.0.0.1", port: 0, exclusive: true }, () => {
+      const address = server.address();
+      const port = typeof address === "object" && address
+        ? address.port
+        : undefined;
+      server.close((err) => {
+        if (err) reject(err);
+        else if (port) resolve(port);
+        else reject(new Error("loopback port allocation returned no port"));
+      });
+    });
+  });
+}
+
+/**
+ * Parse bounded lease-helper stdout as inert key/value data. Values are split
+ * at the first equals sign and are never sourced or evaluated.
+ * @param {string} output
+ * @returns {Record<string, string>}
+ */
+function parseBrowserLeaseRecord(output) {
+  const record = Object.create(null);
+  for (const rawLine of output.split(/\r?\n/u)) {
+    if (!rawLine) continue;
+    const equals = rawLine.indexOf("=");
+    if (equals <= 0) continue;
+    const key = rawLine.slice(0, equals);
+    if (Object.hasOwn(record, key)) {
+      throw new Error(`duplicate browser lease record key: ${key}`);
+    }
+    record[key] = rawLine.slice(equals + 1);
+  }
+  return record;
+}
+
+/**
+ * Read the per-Chrome-process browser UUID exposed by the local CDP endpoint.
+ * Reachability alone is not identity: after an SSH tunnel dies, an unrelated
+ * local Chromium can successfully bind the same port and accept the next call.
+ * @param {string} browserUrl
+ * @param {number} timeoutMs
+ * @returns {Promise<string>}
+ */
+function readBrowserWebSocketIdentity(browserUrl, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const endpoint = new URL("/json/version", browserUrl);
+    let settled = false;
+    const finish = (err, identity) => {
+      if (settled) return;
+      settled = true;
+      if (err) reject(err);
+      else resolve(identity);
+    };
+    const request = httpGet(endpoint, (response) => {
+      let body = Buffer.alloc(0);
+      response.on("data", (chunk) => {
+        if (body.length + chunk.length > MAX_BUFFER_BYTES) {
+          request.destroy(new Error("browser identity response exceeded frame cap"));
+          return;
+        }
+        body = body.length ? Buffer.concat([body, chunk]) : Buffer.from(chunk);
+      });
+      response.on("end", () => {
+        if (response.statusCode !== 200) {
+          finish(new Error(`browser identity endpoint returned HTTP ${response.statusCode}`));
+          return;
+        }
+        try {
+          const payload = JSON.parse(body.toString("utf8"));
+          const websocketUrl = new URL(payload.webSocketDebuggerUrl);
+          const match = websocketUrl.pathname.match(/^\/devtools\/browser\/([^/]+)$/u);
+          if (!match?.[1]) throw new Error("missing browser UUID");
+          finish(undefined, match[1]);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          finish(new Error(`invalid browser identity response: ${message}`));
+        }
+      });
+    });
+    request.setTimeout(timeoutMs, () => {
+      request.destroy(new Error(`browser identity check timed out after ${timeoutMs}ms`));
+    });
+    request.on("error", (err) => finish(err));
+  });
+}
+
+/**
+ * Append remote-browser caveats to selected downstream tool descriptions while
+ * preserving schemas and every other metadata field.
+ * @param {any} msg
+ * @returns {boolean}
+ */
+function rewriteBrowserToolsListMessage(msg) {
+  const tools = msg?.result?.tools;
+  if (!Array.isArray(tools)) return false;
+  let changed = false;
+  for (const tool of tools) {
+    if (!tool || typeof tool !== "object") continue;
+    const warning = BROWSER_WARNING_DESCRIPTIONS[tool.name];
+    if (!warning) continue;
+    const description = typeof tool.description === "string"
+      ? tool.description
+      : "";
+    if (description.includes(warning)) continue;
+    tool.description = description ? `${description}\n\n${warning}` : warning;
+    changed = true;
+  }
+  return changed;
+}
+
+/**
+ * Match the measured chrome-devtools-mcp connection-failure result shape.
+ * @param {any} result
+ * @returns {boolean}
+ */
+function browserConnectFailure(result) {
+  if (result?.isError !== true) return false;
+  const text = [
+    result?.structuredContent?.content,
+    ...(Array.isArray(result?.content)
+      ? result.content.map((part) => part?.text)
+      : []),
+  ].filter((value) => typeof value === "string").join("\n").toLowerCase();
+  return text.includes("could not connect to chrome") &&
+    text.includes("failed to fetch browser websocket url");
+}
+
+/**
+ * Build a typed MCP tool error result owned by the browser wrapper.
+ * @param {string} code
+ * @param {string} message
+ * @param {Record<string, unknown>} [extra]
+ * @returns {any}
+ */
+function browserToolErrorResult(code, message, extra = {}) {
+  return {
+    content: [{ type: "text", text: `mcp-agents: ${message}` }],
+    structuredContent: { code, message, ...extra },
+    isError: true,
+  };
+}
+
+/**
+ * Type-tag a JSON-RPC id so numeric 1 and string "1" never collide.
+ * @param {unknown} id
+ * @returns {string}
+ */
+function idKey(id) {
+  return `${typeof id}:${id}`;
+}
+
+const FRAME_HEADER_SCAN = 8192;
+
+/**
+ * Classify a bounded frame prefix and return its response id when present.
+ * @param {Buffer} prefix
+ * @returns {unknown}
+ */
+function peekResponseId(prefix) {
+  const s = prefix
+    .subarray(0, Math.min(prefix.length, FRAME_HEADER_SCAN))
+    .toString("utf8");
+  const resultAt = s.search(/"(?:result|error)"\s*:/);
+  if (resultAt === -1) return undefined; // no result/error -> not a response
+  const methodAt = s.search(/"method"\s*:/);
+  if (methodAt !== -1 && methodAt < resultAt) return undefined; // request/notif
+  // Capture the full id TOKEN (number or quoted string) and JSON-decode it so
+  // the value matches what noteInbound stored via JSON.parse — otherwise an
+  // escaped string id (e.g. "a\\b") would not equal the tracked key.
+  const idMatch = s
+    .slice(0, resultAt)
+    .match(/"id"\s*:\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|"(?:[^"\\]|\\.)*")/);
+  if (!idMatch) return undefined;
+  try { return JSON.parse(idMatch[1]); } catch { return undefined; }
 }
 
 /**
@@ -2631,6 +3238,2092 @@ function rewriteCodexToolsListMessage(msg) {
 }
 
 /**
+ * Spawn chrome-devtools-mcp as a separate browser pass-through. Provisioning
+ * is lazy, but the MCP child starts immediately so initialize/tools-list stay
+ * responsive and the client's roots capability reaches the downstream.
+ * @param {{ leaseCommand: string[], downstream: { command: string, args: string[], source: string, npxFallback: boolean }, idleTimeoutMs: number, viewport: string, appPort?: number, logFile?: string, allowedUrlPatterns: string[], hardTimeoutMs?: number }} opts
+ * @returns {Promise<void>}
+ */
+async function runBrowserPassthrough({
+  leaseCommand,
+  downstream,
+  idleTimeoutMs,
+  viewport,
+  appPort,
+  logFile,
+  allowedUrlPatterns,
+  hardTimeoutMs,
+}) {
+  const resolvedHardTimeoutMs = hardTimeoutMs ?? DEFAULT_BROWSER_ACQUIRE_TIMEOUT_MS;
+  const helperTimeoutMs = testTunableMs(
+    "MCP_AGENTS_TEST_BROWSER_HELPER_TIMEOUT_MS",
+    Math.max(
+      1_000,
+      resolvedHardTimeoutMs - DEFAULT_BROWSER_IDENTITY_TIMEOUT_MS -
+        BROWSER_ACQUIRE_RESERVE_MS,
+    ),
+  );
+  const identityTimeoutMs = testTunableMs(
+    "MCP_AGENTS_TEST_BROWSER_IDENTITY_TIMEOUT_MS",
+    DEFAULT_BROWSER_IDENTITY_TIMEOUT_MS,
+  );
+  const helperTermGraceMs = testTunableMs(
+    "MCP_AGENTS_TEST_BROWSER_HELPER_TERM_GRACE_MS",
+    DEFAULT_BROWSER_HELPER_TERM_GRACE_MS,
+  );
+  const idleReleaseTimeoutMs = testTunableMs(
+    "MCP_AGENTS_TEST_BROWSER_IDLE_RELEASE_TIMEOUT_MS",
+    DEFAULT_BROWSER_IDLE_RELEASE_TIMEOUT_MS,
+  );
+  const shutdownReleaseTimeoutMs = testTunableMs(
+    "MCP_AGENTS_TEST_BROWSER_SHUTDOWN_RELEASE_TIMEOUT_MS",
+    DEFAULT_BROWSER_SHUTDOWN_RELEASE_TIMEOUT_MS,
+  );
+  const progressIntervalMs = testTunableMs(
+    "MCP_AGENTS_TEST_BROWSER_PROGRESS_INTERVAL_MS",
+    DEFAULT_BROWSER_PROGRESS_INTERVAL_MS,
+  );
+  const flushStallMs = testTunableMs(
+    "MCP_AGENTS_TEST_BROWSER_FLUSH_STALL_MS",
+    DEFAULT_BROWSER_FLUSH_STALL_MS,
+  );
+  const rewriteFrameMaxBytes = testTunablePositiveInteger(
+    "MCP_AGENTS_TEST_BROWSER_REWRITE_MAX_BYTES",
+    MAX_BUFFER_BYTES,
+  );
+  const NEWLINE = 0x0a;
+  const sessionId = randomUUID();
+  const internalInitializePrefix =
+    `mcp-agents/browser/initialize/${randomUUID()}/`;
+  const downstreamRequestAliasPrefix =
+    `mcp-agents/browser/downstream-request/${randomUUID()}/`;
+  const wrapperOwnedToolNames = new Set();
+  const inFlight = new Map();
+  const pendingToolsListIds = new Set();
+  // idKey -> { id, generation, owner } captured when the call was forwarded.
+  // Egress must classify against this snapshot, never the shared mutable
+  // `generation` var, and restart cleanup must resolve only calls owned by the
+  // downstream record being replaced.
+  const inspectedToolCallIds = new Map();
+  // Complete tracked responses seen by observation but not rewrite parsing.
+  const unparsedInspectedResponseIds = new Set();
+  const suppressedResponseIds = new Set();
+  const locallyHandledResponseIds = new Set();
+  const downstreamRequestOwners = new Map();
+  const retiredDownstreamRequestOwners = new Map();
+  const downstreamResponseAliases = new Map();
+  const generatedFrames = [];
+  const pendingInboundFrames = [];
+  const activeHelperChildren = new Map();
+  let downstreamToolNames;
+  let state = "cold";
+  let localPort = await allocateLoopbackPort();
+  let generation;
+  let provisioningPromise;
+  let identityVerificationPromise;
+  let leaseOperationPromise;
+  let idleTimer;
+  let finalizing = false;
+  let exited = false;
+  let stdoutPaused = false;
+  let lastForwardedByteWasNewline = true;
+  let stdoutObsBuf = Buffer.alloc(0);
+  let observationSkippingFrame = false;
+  let observationDroppedResponseId;
+  let rewriteBuf = Buffer.alloc(0);
+  let rewriteSkipUntilNewline = false;
+  let rewriteSkipReleaseKey;
+  let rewriteDropUntilNewline = false;
+  let rewriteDropReleaseKey;
+  let oversizedFrameLogged = false;
+  let initializeParams;
+  let initializedFrame;
+  let internalInitializeSequence = 0;
+  let downstreamRequestAliasSequence = 0;
+  let downstreamSequence = 0;
+  let internalInitialize;
+  let classificationPending = false;
+  let pendingBrowserClassification;
+  const deferredStdoutChunks = [];
+  let currentChildRecord;
+  let flushStallTimer;
+  let flushGeneratedFrames = () => {};
+  let flushRewriteBuf = () => {};
+  let recoverTimedOutBrowserCall = () => {};
+  let finalize = () => {};
+
+  // All detached children use the same group-wide kill discipline. The browser
+  // downstream may launch descendants, and the injected lease helper may own an
+  // SSH process; killing only the immediate PID would violate the no-leaks
+  // contract even though the wrapper itself had exited.
+  const killDetachedGroup = (processHandle, signal = "SIGKILL") => {
+    try {
+      if (processHandle?.pid) process.kill(-processHandle.pid, signal);
+      else processHandle?.kill(signal);
+    } catch {
+      try { processHandle?.kill(signal); } catch {}
+    }
+  };
+
+  // Acquisition owns SSH control masters whose EXIT trap performs remote and
+  // local cleanup. SIGTERM gives that trap a bounded chance to run; SIGKILL is
+  // only the escalation for a helper that ignored the grace window.
+  const terminateHelperGracefully = (helperRecord) => {
+    if (!helperRecord || helperRecord.terminating || helperRecord.settled) return;
+    helperRecord.terminating = true;
+    killDetachedGroup(helperRecord.child, "SIGTERM");
+    helperRecord.killTimer = setTimeout(() => {
+      helperRecord.killTimer = undefined;
+      if (!helperRecord.settled) killDetachedGroup(helperRecord.child);
+    }, helperTermGraceMs);
+    helperRecord.killTimer.unref?.();
+  };
+
+  // The lease command is infrastructure supplied by the operator, never a shell
+  // snippet. Capturing stdout separately is load-bearing: successful key/value
+  // records must remain inert data, while the helper's distinct preflight
+  // diagnostic on stderr may need to be surfaced verbatim to the client.
+  const runLeaseCommand = (subcommand, args, timeoutMs) => new Promise((resolve) => {
+    const command = leaseCommand[0];
+    const commandArgs = [...leaseCommand.slice(1), subcommand, ...args];
+    let child;
+    try {
+      child = spawn(command, commandArgs, {
+        detached: true,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, NO_COLOR: "1" },
+      });
+    } catch (err) {
+      resolve({
+        code: undefined,
+        signal: undefined,
+        stdout: "",
+        stderr: "",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    child.stdin?.on("error", () => {});
+    child.stdin?.end();
+    let settleHelper;
+    const helperRecord = {
+      child,
+      subcommand,
+      terminating: false,
+      settled: false,
+      killTimer: undefined,
+      settledPromise: new Promise((settle) => { settleHelper = settle; }),
+    };
+    helperRecord.terminate = () => terminateHelperGracefully(helperRecord);
+    if (child.pid) activeHelperChildren.set(child.pid, helperRecord);
+    let stdout = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
+    let overflow;
+    let spawnError;
+    let timedOut = false;
+    let settled = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      helperRecord.terminate();
+    }, timeoutMs);
+    timer.unref?.();
+    const append = (prior, chunk, streamName) => {
+      if (overflow) return prior;
+      if (prior.length + chunk.length > MAX_BUFFER_BYTES) {
+        overflow = `${streamName} exceeded ${MAX_BUFFER_BYTES} bytes`;
+        killDetachedGroup(child);
+        return prior;
+      }
+      return prior.length ? Buffer.concat([prior, chunk]) : Buffer.from(chunk);
+    };
+    child.stdout.on("data", (chunk) => {
+      stdout = append(stdout, chunk, "stdout");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr = append(stderr, chunk, "stderr");
+    });
+    child.on("error", (err) => {
+      spawnError = err instanceof Error ? err.message : String(err);
+    });
+    child.on("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      helperRecord.settled = true;
+      clearTimeout(timer);
+      clearTimeout(helperRecord.killTimer);
+      if (child.pid) activeHelperChildren.delete(child.pid);
+      settleHelper();
+      resolve({
+        code,
+        signal,
+        stdout: stdout.toString("utf8"),
+        stderr: stderr.toString("utf8"),
+        error: overflow ?? spawnError ?? (timedOut ? "timed out" : undefined),
+      });
+    });
+  });
+
+  // A successful acquire record is accepted only when it describes the exact
+  // port baked into this chrome-devtools-mcp child. Accepting a substituted or
+  // malformed port would make the proxy report readiness while dialing a dead
+  // endpoint, which is both confusing and fail-open in spirit.
+  const validateAcquireResult = (result, expectedPort) => {
+    if (result.error) {
+      return {
+        kind: "provisioning_failed",
+        message: `browser lease acquisition failed: ${result.error}`,
+      };
+    }
+    if (result.code === 75) return { kind: "port_unavailable" };
+    if (result.code === 69) {
+      const stderrTail = result.stderr.trim().slice(
+        -MAX_BROWSER_HELPER_DIAGNOSTIC_CODEPOINTS,
+      );
+      if (stderrTail) {
+        logErr(`[mcp-agents] browser lease unavailable: ${stderrTail}`);
+      }
+      const preflightLines = `${result.stdout}\n${result.stderr}`
+        .split(/\r?\n/u)
+        .map((line) => line.trim());
+      const devPreflightLine = preflightLines.find((line) =>
+        line.includes("GUI not verified") &&
+        line.includes("dev server not reachable")
+      );
+      if (devPreflightLine) {
+        return { kind: "dev_unreachable", message: devPreflightLine };
+      }
+      const minioPreflightLine = preflightLines.find((line) =>
+        line.includes("GUI not verified") && /minio/iu.test(line) &&
+        /(?:not reachable|unreachable)/iu.test(line)
+      );
+      if (minioPreflightLine) {
+        return { kind: "minio_unreachable", message: minioPreflightLine };
+      }
+      return {
+        kind: "unavailable",
+        message:
+          "GUI not verified — no browser box available" +
+          (stderrTail ? `\nLease helper: ${stderrTail}` : ""),
+      };
+    }
+    if (result.code !== 0) {
+      const detail = result.stderr.trim() ||
+        `lease helper exited with code ${result.code}`;
+      return {
+        kind: "provisioning_failed",
+        message: `browser lease acquisition failed: ${detail}`,
+      };
+    }
+    let record;
+    try {
+      record = parseBrowserLeaseRecord(result.stdout);
+    } catch (err) {
+      return {
+        kind: "provisioning_failed",
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+    const expectedUrl = `http://127.0.0.1:${expectedPort}`;
+    if (
+      record.record_version !== "1" || record.state !== "ready" ||
+      !record.generation || record.local_cdp_port !== String(expectedPort) ||
+      record.browser_url !== expectedUrl
+    ) {
+      return {
+        kind: "provisioning_failed",
+        message:
+          "browser lease helper returned a malformed or mismatched ready record",
+      };
+    }
+    return { kind: "ready", record };
+  };
+
+  const clearIdleTimer = () => {
+    if (!idleTimer) return;
+    clearTimeout(idleTimer);
+    idleTimer = undefined;
+  };
+
+  // Release is deliberately best-effort, but idle cleanup gets enough time to
+  // stop remote Chromium, close both control masters, and release the box. A
+  // shorter shutdown bound keeps process exit finite. Both helpers remain
+  // tracked and timeout-killed so "best effort" cannot become an orphan.
+  const releaseGeneration = async (releasedGeneration, reason) => {
+    if (!releasedGeneration?.generation) return;
+    const timeoutMs = reason === "idle"
+      ? idleReleaseTimeoutMs
+      : shutdownReleaseTimeoutMs;
+    const result = await runLeaseCommand(
+      "release",
+      [
+        "--session",
+        sessionId,
+        "--generation",
+        releasedGeneration.generation,
+        "--reason",
+        reason,
+      ],
+      timeoutMs,
+    );
+    if (result.code !== 0) {
+      logErr(
+        `[mcp-agents] browser lease release (${reason}) was nonfatal: ` +
+          `${result.error || result.stderr.trim() || `exit ${result.code}`}`,
+      );
+    }
+  };
+
+  const discardGeneration = (
+    discardedGeneration,
+    { confirmedAbsent = false } = {},
+  ) => {
+    clearIdleTimer();
+    generation = undefined;
+    state = "lost";
+    if (confirmedAbsent) return;
+    const release = releaseGeneration(discardedGeneration, "idle")
+      .finally(() => {
+        if (leaseOperationPromise === release) leaseOperationPromise = undefined;
+      });
+    leaseOperationPromise = release;
+  };
+
+  // The generation timer is reset by parsed downstream frames only. Stderr and
+  // partial chunks do not prove browser activity, and stdout backpressure pauses
+  // it because the wrapper cannot reliably consume downstream work then.
+  const armIdleTimer = () => {
+    clearIdleTimer();
+    if (
+      finalizing || stdoutPaused || state !== "ready" || !generation ||
+      !(idleTimeoutMs > 0)
+    ) return;
+    idleTimer = setTimeout(() => {
+      idleTimer = undefined;
+      if (finalizing || state !== "ready" || !generation) return;
+      const releasedGeneration = generation;
+      generation = undefined;
+      state = "cold";
+      // Compare by reference, exactly as discardGeneration does: a bare
+      // truthiness check would clear a NEWER operation's promise if one was
+      // assigned before this release settled, losing the tracking that makes
+      // overlapping helper operations awaitable.
+      const idleRelease = releaseGeneration(releasedGeneration, "idle")
+        .finally(() => {
+          if (leaseOperationPromise === idleRelease) {
+            leaseOperationPromise = undefined;
+          }
+        });
+      leaseOperationPromise = idleRelease;
+    }, idleTimeoutMs);
+    idleTimer.unref?.();
+  };
+
+  const noteDownstreamFrame = (msg, record) => {
+    if (!msg || typeof msg !== "object") return;
+    if (state === "ready") armIdleTimer();
+    if (msg.id != null && typeof msg.method === "string" && record) {
+      downstreamRequestOwners.set(idKey(msg.id), record);
+    }
+    if (
+      "id" in msg && ("result" in msg || "error" in msg) &&
+      internalInitialize?.key !== idKey(msg.id)
+    ) {
+      const key = idKey(msg.id);
+      if (inspectedToolCallIds.has(key)) {
+        unparsedInspectedResponseIds.add(key);
+      }
+      const entry = inFlight.get(key);
+      if (entry) {
+        clearTimeout(entry.hardTimer);
+        clearInterval(entry.progressTimer);
+        inFlight.delete(key);
+      }
+    }
+  };
+
+  const observeOutgoingLine = (line, record = currentChildRecord) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let msg;
+    try { msg = JSON.parse(trimmed); } catch { return; }
+    noteDownstreamFrame(msg, record);
+  };
+
+  // Raw observation is independent of forwarding/rewrite bytes. Oversized
+  // frames retain only a bounded header, and a response id is settled only once
+  // its terminating newline arrives, preserving the same hang-detection
+  // property as the Codex observer.
+  const observeOutgoing = (record, chunk) => {
+    let data = chunk;
+    if (observationSkippingFrame) {
+      const newline = data.indexOf(NEWLINE);
+      if (newline === -1) return;
+      observationSkippingFrame = false;
+      if (state === "ready") armIdleTimer();
+      if (observationDroppedResponseId !== undefined) {
+        const key = idKey(observationDroppedResponseId);
+        if (inspectedToolCallIds.has(key)) {
+          unparsedInspectedResponseIds.add(key);
+        }
+        const entry = inFlight.get(key);
+        if (entry) {
+          clearTimeout(entry.hardTimer);
+          clearInterval(entry.progressTimer);
+          inFlight.delete(key);
+        }
+        observationDroppedResponseId = undefined;
+      }
+      data = data.subarray(newline + 1);
+    }
+    stdoutObsBuf = stdoutObsBuf.length
+      ? Buffer.concat([stdoutObsBuf, data])
+      : Buffer.from(data);
+    let newline;
+    while ((newline = stdoutObsBuf.indexOf(NEWLINE)) !== -1) {
+      if (newline > MAX_BUFFER_BYTES) {
+        if (state === "ready") armIdleTimer();
+        const responseId = peekResponseId(stdoutObsBuf.subarray(0, newline));
+        if (responseId !== undefined) {
+          const key = idKey(responseId);
+          if (inspectedToolCallIds.has(key)) {
+            unparsedInspectedResponseIds.add(key);
+          }
+          const entry = inFlight.get(key);
+          if (entry) {
+            clearTimeout(entry.hardTimer);
+            clearInterval(entry.progressTimer);
+            inFlight.delete(key);
+          }
+        }
+      } else {
+        observeOutgoingLine(
+          stdoutObsBuf.subarray(0, newline).toString("utf8"),
+          record,
+        );
+      }
+      stdoutObsBuf = stdoutObsBuf.subarray(newline + 1);
+    }
+    if (stdoutObsBuf.length > MAX_BUFFER_BYTES) {
+      observationDroppedResponseId = peekResponseId(stdoutObsBuf);
+      stdoutObsBuf = Buffer.alloc(0);
+      observationSkippingFrame = true;
+    }
+  };
+
+  const canInjectGeneratedFrame = () =>
+    !stdoutPaused && !classificationPending && lastForwardedByteWasNewline &&
+    rewriteBuf.length === 0 && !rewriteSkipUntilNewline &&
+    !rewriteDropUntilNewline;
+
+  const clearFlushStallGuard = () => {
+    if (!flushStallTimer) return;
+    clearTimeout(flushStallTimer);
+    flushStallTimer = undefined;
+  };
+
+  const armFlushStallGuard = () => {
+    if (flushStallTimer || finalizing || !(flushStallMs > 0)) return;
+    flushStallTimer = setTimeout(() => {
+      flushStallTimer = undefined;
+      if (finalizing || generatedFrames.length === 0) return;
+      if (!stdoutPaused && !canInjectGeneratedFrame()) {
+        finalize({
+          reason:
+            `generated frames undeliverable for ${flushStallMs}ms ` +
+            "(chrome-devtools-mcp left a frame unterminated)",
+          emit: true,
+          exitCode: 1,
+        });
+        return;
+      }
+      armFlushStallGuard();
+    }, flushStallMs);
+    flushStallTimer.unref?.();
+  };
+
+  const rememberLocallyHandledResponse = (key) => {
+    locallyHandledResponseIds.add(key);
+    if (locallyHandledResponseIds.size > 32) {
+      locallyHandledResponseIds.delete(locallyHandledResponseIds.values().next().value);
+    }
+  };
+
+  const dropGeneratedFrames = (requestKey, kind) => {
+    for (let index = generatedFrames.length - 1; index >= 0; index -= 1) {
+      if (
+        generatedFrames[index].requestKey === requestKey &&
+        generatedFrames[index].kind === kind
+      ) generatedFrames.splice(index, 1);
+    }
+    if (generatedFrames.length === 0) clearFlushStallGuard();
+  };
+
+  const queueGeneratedFrame = (frame, { requestKey, kind } = {}) => {
+    const queued = {
+      buffer: Buffer.from(`${JSON.stringify(frame)}\n`, "utf8"),
+      requestKey,
+      kind,
+    };
+    if (kind === "progress") {
+      const existing = generatedFrames.findIndex((candidate) =>
+        candidate.kind === kind && candidate.requestKey === requestKey
+      );
+      if (existing !== -1) {
+        generatedFrames[existing] = queued;
+        queueMicrotask(() => flushGeneratedFrames());
+        return;
+      }
+    }
+    generatedFrames.push(queued);
+    if (!canInjectGeneratedFrame()) armFlushStallGuard();
+    queueMicrotask(() => flushGeneratedFrames());
+  };
+
+  const generatedFrameIsLive = (frame) => {
+    if (frame.kind === "progress") {
+      const entry = inFlight.get(frame.requestKey);
+      return entry?.state === "held";
+    }
+    if (frame.kind === "local_response") {
+      const entry = inFlight.get(frame.requestKey);
+      return entry?.state === "local_response";
+    }
+    return true;
+  };
+
+  const markGeneratedFrameDelivered = (frame) => {
+    if (frame.kind !== "local_response") return;
+    const entry = inFlight.get(frame.requestKey);
+    if (entry?.state !== "local_response") return;
+    clearTimeout(entry.hardTimer);
+    clearInterval(entry.progressTimer);
+    rememberLocallyHandledResponse(frame.requestKey);
+    inFlight.delete(frame.requestKey);
+  };
+
+  const forwardChunk = (buffer) => {
+    if (!buffer?.length) return true;
+    lastForwardedByteWasNewline = buffer[buffer.length - 1] === NEWLINE;
+    const ok = process.stdout.write(buffer);
+    if (!ok && !stdoutPaused) {
+      stdoutPaused = true;
+      clearIdleTimer();
+      currentChildRecord?.child.stdout.pause();
+    }
+    return ok;
+  };
+
+  flushGeneratedFrames = () => {
+    if (finalizing || !canInjectGeneratedFrame()) return;
+    while (generatedFrames.length > 0 && canInjectGeneratedFrame()) {
+      const frame = generatedFrames.shift();
+      if (!generatedFrameIsLive(frame)) continue;
+      forwardChunk(frame.buffer);
+      markGeneratedFrameDelivered(frame);
+    }
+    if (generatedFrames.length === 0) clearFlushStallGuard();
+  };
+
+  const stopProgress = (entry) => {
+    if (!entry) return;
+    clearInterval(entry.progressTimer);
+    entry.progressTimer = undefined;
+    dropGeneratedFrames(idKey(entry.id), "progress");
+  };
+
+  const emitProvisioningProgress = (entry, message) => {
+    if (entry?.state !== "held" || entry.progressToken === undefined) return;
+    entry.progressSequence += 1;
+    queueGeneratedFrame(
+      {
+        jsonrpc: "2.0",
+        method: "notifications/progress",
+        params: {
+          progressToken: entry.progressToken,
+          progress: entry.progressSequence,
+          message,
+        },
+      },
+      { requestKey: idKey(entry.id), kind: "progress" },
+    );
+  };
+
+  const startProgress = (entry) => {
+    emitProvisioningProgress(entry, "Browser: acquiring remote browser lease");
+    if (entry.progressToken === undefined || !(progressIntervalMs > 0)) return;
+    entry.progressTimer = setInterval(() => {
+      const elapsed = Math.max(0, Math.floor((Date.now() - entry.startedAt) / 1_000));
+      emitProvisioningProgress(
+        entry,
+        `Browser: still acquiring remote browser lease (${elapsed}s elapsed)`,
+      );
+    }, progressIntervalMs);
+    entry.progressTimer.unref?.();
+  };
+
+  const queueLocalResult = (entry, result) => {
+    if (!entry || !inFlight.has(idKey(entry.id))) return;
+    stopProgress(entry);
+    entry.state = "local_response";
+    queueGeneratedFrame(
+      { jsonrpc: "2.0", id: entry.id, result },
+      { requestKey: idKey(entry.id), kind: "local_response" },
+    );
+    flushGeneratedFrames();
+  };
+
+  const queueHardTimeout = (entry) => {
+    if (!entry || !inFlight.has(idKey(entry.id))) return;
+    if (entry.heldFrame) entry.heldFrame.tombstone = true;
+    stopProgress(entry);
+    const key = idKey(entry.id);
+    const inspected = inspectedToolCallIds.get(key);
+    if (inspected) {
+      recoverTimedOutBrowserCall(inspected.owner);
+      entry.state = "local_response";
+      queueGeneratedFrame(
+        enrichLeaseLostMessage({
+          jsonrpc: "2.0",
+          id: inspected.id,
+          result: {},
+        }),
+        { requestKey: key, kind: "local_response" },
+      );
+      inspectedToolCallIds.delete(key);
+      unparsedInspectedResponseIds.delete(key);
+      flushGeneratedFrames();
+      return;
+    }
+    if (!entry.forwarded || canInjectGeneratedFrame()) {
+      if (entry.forwarded) suppressedResponseIds.add(key);
+      entry.state = "local_response";
+      queueGeneratedFrame(
+        {
+          jsonrpc: "2.0",
+          id: entry.id,
+          error: {
+            code: -32001,
+            message:
+              "mcp-agents: browser pass-through request hard timeout; " +
+              "the request was not replayed",
+          },
+        },
+        { requestKey: key, kind: "local_response" },
+      );
+      flushGeneratedFrames();
+      return;
+    }
+    entry.timeoutPending = true;
+    armFlushStallGuard();
+  };
+
+  const addInFlight = (msg) => {
+    if (msg.id == null) return true;
+    const key = idKey(msg.id);
+    locallyHandledResponseIds.delete(key);
+    if (inFlight.has(key) || suppressedResponseIds.has(key)) {
+      finalize({
+        reason: `request id ${JSON.stringify(msg.id)} was reused before settlement`,
+        emit: true,
+        exitCode: 1,
+      });
+      return false;
+    }
+    const suppliedToken = msg.params?._meta?.progressToken;
+    const progressToken = typeof suppliedToken === "string" ||
+      (typeof suppliedToken === "number" && Number.isFinite(suppliedToken))
+      ? suppliedToken
+      : undefined;
+    const entry = {
+      id: msg.id,
+      method: msg.method,
+      toolName: msg.method === "tools/call" ? msg.params?.name : undefined,
+      progressToken,
+      progressSequence: 0,
+      progressTimer: undefined,
+      hardTimer: undefined,
+      state: "open",
+      forwarded: false,
+      heldFrame: undefined,
+      timeoutPending: false,
+      startedAt: Date.now(),
+    };
+    if (resolvedHardTimeoutMs > 0) {
+      entry.hardTimer = setTimeout(
+        () => queueHardTimeout(entry),
+        resolvedHardTimeoutMs,
+      );
+      entry.hardTimer.unref?.();
+    }
+    inFlight.set(key, entry);
+    return true;
+  };
+
+  const armRewriteLatch = () => {
+    if (
+      pendingToolsListIds.size === 0 && inspectedToolCallIds.size === 0 &&
+      suppressedResponseIds.size === 0 && !internalInitialize &&
+      retiredDownstreamRequestOwners.size === 0 &&
+      downstreamResponseAliases.size === 0 &&
+      rewriteBuf.length === 0 && !rewriteSkipUntilNewline &&
+      !rewriteDropUntilNewline && !lastForwardedByteWasNewline
+    ) {
+      rewriteSkipUntilNewline = true;
+    }
+  };
+
+  const hasRewriteOwner = () =>
+    pendingToolsListIds.size > 0 || inspectedToolCallIds.size > 0 ||
+    suppressedResponseIds.size > 0 || Boolean(internalInitialize) ||
+    retiredDownstreamRequestOwners.size > 0 ||
+    downstreamResponseAliases.size > 0;
+
+  const hasRewriteLatch = () =>
+    hasRewriteOwner() || rewriteBuf.length > 0 || rewriteSkipUntilNewline ||
+    rewriteDropUntilNewline;
+
+  const returnToRawIfLatchClear = () => {
+    if (
+      !finalizing && !classificationPending && !hasRewriteOwner() &&
+      !rewriteSkipUntilNewline &&
+      !rewriteDropUntilNewline && rewriteBuf.length > 0
+    ) {
+      forwardChunk(rewriteBuf);
+      rewriteBuf = Buffer.alloc(0);
+    }
+  };
+
+  const releaseNonBrowserResponseLatch = (key) => {
+    pendingToolsListIds.delete(key);
+    suppressedResponseIds.delete(key);
+  };
+
+  const enrichLeaseLostMessage = (msg) => {
+    const message =
+      "Browser lease was replaced; browser state was lost and the interrupted " +
+      "operation's outcome is unknown. Inspect current state and never blindly " +
+      "replay the interrupted action.";
+    const content = Array.isArray(msg.result?.content)
+      ? [...msg.result.content]
+      : [];
+    content.push({ type: "text", text: `mcp-agents: ${message}` });
+    msg.result = {
+      ...msg.result,
+      content,
+      structuredContent: {
+        ...(msg.result?.structuredContent &&
+        typeof msg.result.structuredContent === "object"
+          ? msg.result.structuredContent
+          : {}),
+        code: "browser_lease_replaced",
+        message,
+        stateLost: true,
+        outcomeUnknown: true,
+        action: "inspect_state_never_blindly_replay",
+      },
+      isError: true,
+    };
+    return msg;
+  };
+
+  const enrichLeaseLostResult = (msg) => {
+    return Buffer.from(
+      `${JSON.stringify(enrichLeaseLostMessage(msg))}\n`,
+      "utf8",
+    );
+  };
+
+  const resolveInspectedCallAsLeaseLost = (key, msg) => {
+    const inspected = inspectedToolCallIds.get(key);
+    if (!inspected) return undefined;
+    inspectedToolCallIds.delete(key);
+    unparsedInspectedResponseIds.delete(key);
+    const entry = inFlight.get(key);
+    if (entry) {
+      stopProgress(entry);
+      clearTimeout(entry.hardTimer);
+      inFlight.delete(key);
+    }
+    rememberLocallyHandledResponse(key);
+    return enrichLeaseLostMessage(msg ?? {
+      jsonrpc: "2.0",
+      id: inspected.id,
+      result: {},
+    });
+  };
+
+  const queueInspectedCallAsLeaseLost = (key, msg) => {
+    const suppressResult = suppressedResponseIds.delete(key);
+    const out = resolveInspectedCallAsLeaseLost(key, msg);
+    if (out && !suppressResult) queueGeneratedFrame(out);
+    return Boolean(out);
+  };
+
+  const failClosedAmbiguousBrowserResult = (responseId, msg) => {
+    if (responseId !== undefined) {
+      const key = idKey(responseId);
+      return queueInspectedCallAsLeaseLost(key, msg);
+    }
+    let resolved = false;
+    for (const key of [...inspectedToolCallIds.keys()]) {
+      resolved = queueInspectedCallAsLeaseLost(key) || resolved;
+    }
+    return resolved;
+  };
+
+  const statusGeneration = (checkedGeneration) => runLeaseCommand(
+    "status",
+    [
+      "--session",
+      sessionId,
+      "--generation",
+      checkedGeneration.generation,
+    ],
+    helperTimeoutMs,
+  );
+
+  // Classification pauses downstream stdout so the held result cannot be
+  // overtaken while an identity/status check runs. Draining in one place keeps
+  // reconnect and connection-error ordering identical.
+  const finishBrowserClassification = (out) => {
+    if (!finalizing && out) forwardChunk(out);
+    pendingBrowserClassification = undefined;
+    classificationPending = false;
+    if (finalizing) return;
+    flushRewriteBuf();
+    while (!classificationPending && deferredStdoutChunks.length > 0) {
+      const chunk = deferredStdoutChunks.shift();
+      rewriteBuf = rewriteBuf.length
+        ? Buffer.concat([rewriteBuf, chunk])
+        : Buffer.from(chunk);
+      flushRewriteBuf();
+    }
+    if (!stdoutPaused && !classificationPending) {
+      currentChildRecord?.child.stdout.resume();
+    }
+    returnToRawIfLatchClear();
+    flushGeneratedFrames();
+  };
+
+  // Connect-failure classification must hold the original downstream result in
+  // stream order while status runs. Replaying the call is forbidden: a form
+  // submission may have committed before CDP dropped, so only the NEXT call may
+  // use a repaired generation.
+  const classifyConnectFailure = async (
+    frameBytes,
+    msg,
+    checkedGeneration,
+    suppressResult,
+  ) => {
+    classificationPending = true;
+    currentChildRecord?.child.stdout.pause();
+    let out = enrichLeaseLostResult(msg);
+    pendingBrowserClassification = { msg, suppressResult };
+    const status = await statusGeneration(checkedGeneration);
+    if (
+      !finalizing && generation?.generation === checkedGeneration.generation
+    ) {
+      if (status.code === 69) {
+        discardGeneration(checkedGeneration, { confirmedAbsent: true });
+      } else {
+        if (status.code !== 0 || status.error) {
+          logErr(
+            "[mcp-agents] browser lease status is unknown; preserving native " +
+              `connection error (${status.error || status.stderr.trim() || `exit ${status.code}`})`,
+          );
+        }
+        out = frameBytes;
+      }
+    }
+    finishBrowserClassification(suppressResult ? undefined : out);
+  };
+
+  // Hold every non-connect-failure browser result until the browser UUID is
+  // checked. A result from a different Chrome process must become a fail-closed
+  // state-loss result, including the first call on a new generation.
+  const classifyBrowserResult = async (
+    frameBytes,
+    msg,
+    checkedGeneration,
+    suppressResult,
+  ) => {
+    classificationPending = true;
+    currentChildRecord?.child.stdout.pause();
+    let out = enrichLeaseLostResult(msg);
+    pendingBrowserClassification = { msg, suppressResult };
+    let observedIdentity;
+    let diagnostic;
+    try {
+      observedIdentity = await readBrowserWebSocketIdentity(
+        checkedGeneration.browser_url,
+        identityTimeoutMs,
+      );
+    } catch (err) {
+      diagnostic = err instanceof Error ? err.message : String(err);
+    }
+    if (
+      !finalizing && generation?.generation === checkedGeneration.generation &&
+      observedIdentity === checkedGeneration.browserIdentity
+    ) {
+      out = frameBytes;
+    } else if (
+      !finalizing && generation?.generation === checkedGeneration.generation
+    ) {
+      discardGeneration(checkedGeneration);
+      logErr(
+        "[mcp-agents] browser reconnect failed identity verification" +
+          (diagnostic ? `: ${diagnostic}` : ""),
+      );
+    }
+    finishBrowserClassification(suppressResult ? undefined : out);
+  };
+
+  const handleCompleteRewriteFrame = (frameBytes) => {
+    let msg;
+    try {
+      msg = JSON.parse(
+        frameBytes.subarray(0, frameBytes.length - 1).toString("utf8"),
+      );
+    } catch {
+      const responseId = peekResponseId(frameBytes);
+      if (failClosedAmbiguousBrowserResult(responseId)) return;
+      forwardChunk(frameBytes);
+      return;
+    }
+    if (!msg || typeof msg !== "object") {
+      forwardChunk(frameBytes);
+      return;
+    }
+    // A replacement downstream can reuse a server-request id while the old
+    // client's response is still in flight. The replacement request receives a
+    // generation-specific client-facing alias only in that ambiguous case. Its
+    // response can then be restored to the native id regardless of which client
+    // response arrives first; the old generation's raw id remains retired.
+    if (msg.id != null && typeof msg.method === "string") {
+      const nativeKey = idKey(msg.id);
+      if (retiredDownstreamRequestOwners.has(nativeKey) && currentChildRecord) {
+        const alias =
+          `${downstreamRequestAliasPrefix}${currentChildRecord.sequence}/` +
+          `${++downstreamRequestAliasSequence}`;
+        downstreamResponseAliases.set(idKey(alias), {
+          owner: currentChildRecord,
+          nativeId: msg.id,
+          nativeKey,
+        });
+        forwardChunk(Buffer.from(
+          `${JSON.stringify({ ...msg, id: alias })}\n`,
+          "utf8",
+        ));
+      } else {
+        forwardChunk(frameBytes);
+      }
+      return;
+    }
+    if (!("id" in msg) || (!("result" in msg) && !("error" in msg))) {
+      forwardChunk(frameBytes);
+      return;
+    }
+    const key = idKey(msg.id);
+    if (internalInitialize?.key === key) {
+      const pending = internalInitialize;
+      internalInitialize = undefined;
+      clearTimeout(pending.timer);
+      if (msg.error) pending.reject(
+        new Error(`downstream re-initialize failed: ${msg.error.message ?? "unknown error"}`),
+      );
+      else pending.resolve(msg.result);
+      return;
+    }
+    if (pendingToolsListIds.has(key)) {
+      pendingToolsListIds.delete(key);
+      if (Array.isArray(msg.result?.tools)) {
+        downstreamToolNames = new Set(
+          msg.result.tools
+            .filter((tool) => typeof tool?.name === "string")
+            .map((tool) => tool.name),
+        );
+      }
+      if (rewriteBrowserToolsListMessage(msg)) {
+        forwardChunk(Buffer.from(`${JSON.stringify(msg)}\n`, "utf8"));
+      } else {
+        forwardChunk(frameBytes);
+      }
+      return;
+    }
+    if (inspectedToolCallIds.has(key)) {
+      const { generation: checkedGeneration } = inspectedToolCallIds.get(key);
+      inspectedToolCallIds.delete(key);
+      unparsedInspectedResponseIds.delete(key);
+      const suppressResult = suppressedResponseIds.delete(key);
+      if (!checkedGeneration || generation !== checkedGeneration) {
+        // The generation this call was issued under is no longer the live
+        // one — e.g. a sibling in-flight call already detected replacement
+        // and discarded it, or the lease idled/finalized out from under this
+        // call while it was outstanding. Never forward such a result raw or
+        // re-probe an abandoned generation; fail closed exactly like a
+        // confirmed identity mismatch would.
+        const out = enrichLeaseLostResult(msg);
+        if (!suppressResult) forwardChunk(out);
+      } else if (browserConnectFailure(msg.result)) {
+        void classifyConnectFailure(
+          frameBytes,
+          msg,
+          checkedGeneration,
+          suppressResult,
+        );
+      } else {
+        void classifyBrowserResult(
+          frameBytes,
+          msg,
+          checkedGeneration,
+          suppressResult,
+        );
+      }
+      return;
+    }
+    if (suppressedResponseIds.has(key)) {
+      suppressedResponseIds.delete(key);
+      return;
+    }
+    forwardChunk(frameBytes);
+  };
+
+  flushRewriteBuf = () => {
+    if (classificationPending) return;
+    if (rewriteDropUntilNewline) {
+      const newline = rewriteBuf.indexOf(NEWLINE);
+      if (newline === -1) {
+        rewriteBuf = Buffer.alloc(0);
+        return;
+      }
+      rewriteBuf = rewriteBuf.subarray(newline + 1);
+      if (rewriteDropReleaseKey) {
+        releaseNonBrowserResponseLatch(rewriteDropReleaseKey);
+      }
+      rewriteDropReleaseKey = undefined;
+      rewriteDropUntilNewline = false;
+    }
+    if (rewriteSkipUntilNewline) {
+      const newline = rewriteBuf.indexOf(NEWLINE);
+      if (newline === -1) {
+        forwardChunk(rewriteBuf);
+        rewriteBuf = Buffer.alloc(0);
+        return;
+      }
+      forwardChunk(rewriteBuf.subarray(0, newline + 1));
+      rewriteBuf = rewriteBuf.subarray(newline + 1);
+      if (rewriteSkipReleaseKey) {
+        releaseNonBrowserResponseLatch(rewriteSkipReleaseKey);
+      }
+      rewriteSkipReleaseKey = undefined;
+      rewriteSkipUntilNewline = false;
+    }
+    let newline;
+    while (
+      !classificationPending &&
+      (newline = rewriteBuf.indexOf(NEWLINE)) !== -1
+    ) {
+      const frameBytes = rewriteBuf.subarray(0, newline + 1);
+      rewriteBuf = rewriteBuf.subarray(newline + 1);
+      if (newline > rewriteFrameMaxBytes) {
+        if (!oversizedFrameLogged) {
+          oversizedFrameLogged = true;
+          logErr(
+            "[mcp-agents] browser passthrough: frame exceeded rewrite cap; " +
+              "tracked browser results fail closed; other unsuppressed frames " +
+              "forward raw",
+          );
+        }
+        const responseId = peekResponseId(frameBytes);
+        const key = responseId === undefined ? undefined : idKey(responseId);
+        if (key && internalInitialize?.key === key) {
+          const pending = internalInitialize;
+          internalInitialize = undefined;
+          clearTimeout(pending.timer);
+          pending.reject(new Error("downstream re-initialize response exceeded frame cap"));
+          continue;
+        }
+        if (
+          (key && inspectedToolCallIds.has(key)) ||
+          (!key && inspectedToolCallIds.size > 0)
+        ) {
+          failClosedAmbiguousBrowserResult(responseId);
+          continue;
+        }
+        if (key && suppressedResponseIds.has(key)) {
+          suppressedResponseIds.delete(key);
+          continue;
+        }
+        if (key) releaseNonBrowserResponseLatch(key);
+        forwardChunk(frameBytes);
+        continue;
+      }
+      handleCompleteRewriteFrame(frameBytes);
+    }
+    if (!classificationPending && rewriteBuf.length > rewriteFrameMaxBytes) {
+      const responseId = peekResponseId(rewriteBuf);
+      const key = responseId === undefined ? undefined : idKey(responseId);
+      if (
+        (key && inspectedToolCallIds.has(key)) ||
+        (!key && inspectedToolCallIds.size > 0)
+      ) {
+        failClosedAmbiguousBrowserResult(responseId);
+        rewriteBuf = Buffer.alloc(0);
+        rewriteDropUntilNewline = true;
+        rewriteDropReleaseKey = undefined;
+      } else if (
+        key && (suppressedResponseIds.has(key) || internalInitialize?.key === key)
+      ) {
+        rewriteBuf = Buffer.alloc(0);
+        rewriteDropUntilNewline = true;
+        rewriteDropReleaseKey = key;
+      } else {
+        forwardChunk(rewriteBuf);
+        rewriteBuf = Buffer.alloc(0);
+        rewriteSkipUntilNewline = true;
+        rewriteSkipReleaseKey = key;
+      }
+    }
+    if (!classificationPending) returnToRawIfLatchClear();
+  };
+
+  const onDownstreamStdout = (record, chunk) => {
+    if (finalizing || record !== currentChildRecord) return;
+    try { observeOutgoing(record, chunk); } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logErr(`[mcp-agents] browser stdout observation error (ignored): ${message}`);
+    }
+    if (classificationPending) {
+      deferredStdoutChunks.push(Buffer.from(chunk));
+      return;
+    }
+    if (hasRewriteLatch()) {
+      rewriteBuf = rewriteBuf.length
+        ? Buffer.concat([rewriteBuf, chunk])
+        : Buffer.from(chunk);
+      flushRewriteBuf();
+    } else {
+      forwardChunk(chunk);
+    }
+    for (const entry of inFlight.values()) {
+      if (entry.timeoutPending && canInjectGeneratedFrame()) {
+        entry.timeoutPending = false;
+        queueHardTimeout(entry);
+      }
+    }
+    flushGeneratedFrames();
+  };
+
+  const buildDownstreamArgs = (port) => [
+    ...downstream.args,
+    "--browserUrl",
+    `http://127.0.0.1:${port}`,
+    "--no-usage-statistics",
+    ...(logFile ? ["--logFile", logFile] : []),
+    ...allowedUrlPatterns.flatMap((pattern) => [
+      "--allowedUrlPattern",
+      pattern,
+    ]),
+  ];
+
+  const spawnDownstream = (port) => {
+    const args = buildDownstreamArgs(port);
+    const child = spawn(downstream.command, args, {
+      detached: true,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, NO_COLOR: "1" },
+    });
+    const record = {
+      child,
+      sequence: ++downstreamSequence,
+      plannedStop: false,
+      exitInfo: undefined,
+      closeSettled: false,
+      resolveClose: undefined,
+      closePromise: undefined,
+    };
+    record.closePromise = new Promise((resolve) => {
+      record.resolveClose = resolve;
+    });
+    currentChildRecord = record;
+    child.stdin.on("error", () => {});
+    child.stdout.on("data", (chunk) => onDownstreamStdout(record, chunk));
+    child.stderr.on("data", (chunk) => {
+      for (const line of chunk.toString("utf8").split(/\r?\n/u)) {
+        if (line) logErr(`[chrome-devtools] ${line}`);
+      }
+    });
+    child.on("error", (err) => {
+      if (record.plannedStop || finalizing) return;
+      finalize({
+        reason: `chrome-devtools-mcp spawn error: ${err.message}`,
+        emit: true,
+        exitCode: 1,
+      });
+    });
+    child.on("exit", (code, signal) => {
+      record.exitInfo = { code, signal };
+      killDetachedGroup(child);
+      setTimeout(() => {
+        if (!record.closeSettled && !record.plannedStop && !finalizing) {
+          finalize({
+            reason: signal
+              ? `chrome-devtools-mcp killed by ${signal}`
+              : `chrome-devtools-mcp exited (code ${code})`,
+            emit: true,
+            exitCode: signal
+              ? 128 + (SIGNAL_CODES[signal] ?? 0)
+              : (code ?? 1),
+          });
+        }
+      }, 2_000).unref?.();
+    });
+    child.on("close", (code, signal) => {
+      record.closeSettled = true;
+      record.resolveClose?.({
+        code: record.exitInfo?.code ?? code,
+        signal: record.exitInfo?.signal ?? signal,
+      });
+      if (record.plannedStop || finalizing) return;
+      finalize({
+        reason: signal
+          ? `chrome-devtools-mcp killed by ${signal}`
+          : `chrome-devtools-mcp exited (code ${code})`,
+        emit: true,
+        exitCode: signal
+          ? 128 + (SIGNAL_CODES[signal] ?? 0)
+          : (code ?? 1),
+      });
+    });
+    logErr(
+      `[mcp-agents] browser passthrough: started chrome-devtools-mcp ` +
+        `(source=${downstream.source}, browser_url=http://127.0.0.1:${port})`,
+    );
+    return record;
+  };
+
+  const stopDownstream = async (record) => {
+    if (!record) return;
+    record.plannedStop = true;
+    try { record.child.stdout.pause(); } catch {}
+    killDetachedGroup(record.child);
+    await Promise.race([
+      record.closePromise,
+      new Promise((resolve) => setTimeout(resolve, 1_000)),
+    ]);
+  };
+
+  const sendRawToDownstream = (frameBytes, metadata = {}) => {
+    if (finalizing || !currentChildRecord) return;
+    if (metadata.toolsListId !== undefined) {
+      armRewriteLatch();
+      pendingToolsListIds.add(idKey(metadata.toolsListId));
+    }
+    if (metadata.inspectedCallId !== undefined) {
+      armRewriteLatch();
+      // Bind this call's id to the generation it is issued under. This is
+      // only ever reached once a browser call has cleared provisioning /
+      // ready-state identity verification, so `generation` is the live,
+      // trusted generation for the call being forwarded right now.
+      const key = idKey(metadata.inspectedCallId);
+      unparsedInspectedResponseIds.delete(key);
+      inspectedToolCallIds.set(key, {
+        id: metadata.inspectedCallId,
+        generation,
+        owner: currentChildRecord,
+      });
+    }
+    const entry = metadata.requestId === undefined
+      ? undefined
+      : inFlight.get(idKey(metadata.requestId));
+    if (entry) {
+      entry.forwarded = true;
+      entry.state = "open";
+      entry.heldFrame = undefined;
+      stopProgress(entry);
+    }
+    currentChildRecord.child.stdin.write(frameBytes);
+  };
+
+  const reinitializeDownstream = () => new Promise((resolve, reject) => {
+    if (!initializeParams) {
+      reject(new Error("cannot restart downstream before client initialize"));
+      return;
+    }
+    const id = `${internalInitializePrefix}${++internalInitializeSequence}`;
+    const key = idKey(id);
+    armRewriteLatch();
+    const timer = setTimeout(() => {
+      if (internalInitialize?.key !== key) return;
+      internalInitialize = undefined;
+      // The private request may still answer after its local timeout. Keep a
+      // response-suppression owner armed so that late internal result can never
+      // leak onto the client's wire as a mysterious second initialize response.
+      suppressedResponseIds.add(key);
+      reject(new Error("downstream re-initialize timed out"));
+    }, resolvedHardTimeoutMs);
+    timer.unref?.();
+    internalInitialize = { id, key, resolve, reject, timer };
+    currentChildRecord.child.stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "initialize",
+        params: initializeParams,
+      })}\n`,
+    );
+  });
+
+  // JSON-RPC response ids carry no process generation. Before replacing a
+  // downstream, remove every response already queued for that child and retire
+  // its outstanding server-request ids. A replacement that reuses one gets a
+  // private client-facing alias, so generation is encoded before either client
+  // response can arrive and ordering is no longer used as a discriminator.
+  const discardDownstreamResponsesForRestart = (record) => {
+    const discardedResponseKeys = new Set();
+    for (const queued of pendingInboundFrames) {
+      if (
+        !queued.clientResponse ||
+        (queued.responseOwner && queued.responseOwner !== record)
+      ) continue;
+      queued.tombstone = true;
+      if (queued.responseKey) discardedResponseKeys.add(queued.responseKey);
+    }
+    for (const [key, owner] of downstreamRequestOwners) {
+      if (owner !== record) continue;
+      downstreamRequestOwners.delete(key);
+      if (!discardedResponseKeys.has(key)) {
+        retiredDownstreamRequestOwners.set(key, record);
+      }
+    }
+    for (const [aliasKey, alias] of downstreamResponseAliases) {
+      if (alias.owner !== record) continue;
+      downstreamResponseAliases.delete(aliasKey);
+      if (!discardedResponseKeys.has(alias.nativeKey)) {
+        retiredDownstreamRequestOwners.set(aliasKey, record);
+      }
+    }
+    for (const [key, inspected] of inspectedToolCallIds) {
+      if (inspected.owner !== record) continue;
+      const responseBuffered = unparsedInspectedResponseIds.has(key);
+      queueInspectedCallAsLeaseLost(key);
+      if (responseBuffered) suppressedResponseIds.add(key);
+    }
+  };
+
+  const restartDownstreamForPortRace = async () => {
+    const replacedRecord = currentChildRecord;
+    await stopDownstream(replacedRecord);
+    let unsafeBoundary = false;
+    try {
+      unsafeBoundary =
+        rewriteBuf.length > 0 || rewriteSkipUntilNewline ||
+        rewriteDropUntilNewline || !lastForwardedByteWasNewline;
+      if (unsafeBoundary) {
+        throw new Error("cannot restart downstream at an unsafe frame boundary");
+      }
+    } finally {
+      discardDownstreamResponsesForRestart(replacedRecord);
+      // A held partial frame from the dead child has not reached stdout when
+      // the client-facing stream is still at a newline. Drop that orphan so
+      // frame-safe lease-loss responses queued by the purge can drain before
+      // the unsafe-boundary error is reported.
+      if (unsafeBoundary && lastForwardedByteWasNewline) {
+        rewriteBuf = Buffer.alloc(0);
+        rewriteSkipUntilNewline = false;
+        rewriteSkipReleaseKey = undefined;
+        rewriteDropUntilNewline = false;
+        rewriteDropReleaseKey = undefined;
+        flushGeneratedFrames();
+      }
+    }
+    stdoutObsBuf = Buffer.alloc(0);
+    // Same family as the resets above, and previously the one member missing from
+    // them. Chunks deferred during a classification belong to the record being
+    // replaced, whose calls this restart has just resolved as typed lease loss.
+    // Left in place, a PARTIAL fragment — never poisoned, because a poison needs a
+    // COMPLETE observed line — would be prepended to the next legitimate frame.
+    deferredStdoutChunks.length = 0;
+    observationSkippingFrame = false;
+    observationDroppedResponseId = undefined;
+    localPort = await allocateLoopbackPort();
+    spawnDownstream(localPort);
+    await reinitializeDownstream();
+    if (initializedFrame) currentChildRecord.child.stdin.write(initializedFrame);
+  };
+
+  // A timed-out browser operation can answer arbitrarily late. Restart only
+  // chrome-devtools-mcp at a safe frame boundary so the old process can no
+  // longer emit that response; the remote browser lease and bridge process
+  // remain alive, and calls arriving during recovery stay behind the normal
+  // provisioning barrier.
+  recoverTimedOutBrowserCall = (replacedRecord) => {
+    if (finalizing || provisioningPromise || !replacedRecord) return;
+    clearIdleTimer();
+    state = "provisioning";
+    provisioningPromise = (async () => {
+      await stopDownstream(replacedRecord);
+      if (finalizing) return;
+      discardDownstreamResponsesForRestart(replacedRecord);
+      const unsafeBoundary =
+        rewriteBuf.length > 0 || rewriteSkipUntilNewline ||
+        rewriteDropUntilNewline || !lastForwardedByteWasNewline;
+      if (unsafeBoundary && lastForwardedByteWasNewline) {
+        rewriteBuf = Buffer.alloc(0);
+        rewriteSkipUntilNewline = false;
+        rewriteSkipReleaseKey = undefined;
+        rewriteDropUntilNewline = false;
+        rewriteDropReleaseKey = undefined;
+        flushGeneratedFrames();
+      } else if (unsafeBoundary) {
+        throw new Error(
+          "cannot recover a timed-out browser call at an unsafe frame boundary",
+        );
+      }
+      stdoutObsBuf = Buffer.alloc(0);
+      observationSkippingFrame = false;
+      observationDroppedResponseId = undefined;
+      spawnDownstream(localPort);
+      await reinitializeDownstream();
+      if (finalizing) return;
+      if (initializedFrame) currentChildRecord.child.stdin.write(initializedFrame);
+      if (!generation) {
+        throw new Error("browser lease was released during timeout recovery");
+      }
+      const observedIdentity = await readBrowserWebSocketIdentity(
+        generation.browser_url,
+        identityTimeoutMs,
+      );
+      if (observedIdentity !== generation.browserIdentity) {
+        const discardedGeneration = generation;
+        discardGeneration(discardedGeneration);
+        throw new Error("browser identity changed during timeout recovery");
+      }
+      state = "ready";
+      armIdleTimer();
+      flushPendingAfterSuccess();
+    })().catch((err) => {
+      if (finalizing) return;
+      state = "cold";
+      flushPendingAfterFailure({
+        kind: "lease_replaced",
+        message:
+          "Browser timeout recovery failed closed " +
+          `(${err instanceof Error ? err.message : String(err)}).`,
+      });
+    }).finally(() => {
+      provisioningPromise = undefined;
+    });
+  };
+
+  const provisioningFailureResult = (failure) => {
+    if (failure.kind === "dev_unreachable") {
+      return {
+        content: [{ type: "text", text: failure.message }],
+        structuredContent: {
+          code: "browser_dev_server_unreachable",
+          message: failure.message,
+        },
+        isError: true,
+      };
+    }
+    if (failure.kind === "minio_unreachable") {
+      return {
+        content: [{ type: "text", text: failure.message }],
+        structuredContent: {
+          code: "browser_minio_unreachable",
+          message: failure.message,
+        },
+        isError: true,
+      };
+    }
+    if (failure.kind === "unavailable") {
+      return browserToolErrorResult("browser_unavailable", failure.message, {
+        failClosed: true,
+      });
+    }
+    if (failure.kind === "lease_replaced") {
+      return browserToolErrorResult("browser_lease_replaced", failure.message, {
+        failClosed: true,
+        stateLost: true,
+        outcomeUnknown: false,
+        action: "reacquire_before_next_call",
+      });
+    }
+    const message = failure.message ??
+      "browser provisioning failed closed; GUI was not verified";
+    return browserToolErrorResult("browser_provisioning_failed", message, {
+      failClosed: true,
+    });
+  };
+
+  const sendPendingEntry = (queued) => {
+    if (queued.tombstone) return;
+    if (queued.clientResponse) {
+      if (queued.responseOwner !== currentChildRecord) return;
+      if (queued.responseKey) downstreamRequestOwners.delete(queued.responseKey);
+    }
+    sendRawToDownstream(queued.buffer, {
+      requestId: queued.requestId,
+      toolsListId: queued.toolsListId,
+      inspectedCallId: queued.browserCall ? queued.requestId : undefined,
+    });
+  };
+
+  const flushPendingAfterSuccess = () => {
+    while (pendingInboundFrames.length > 0) {
+      sendPendingEntry(pendingInboundFrames.shift());
+    }
+  };
+
+  const flushPendingAfterFailure = (failure) => {
+    const result = provisioningFailureResult(failure);
+    while (pendingInboundFrames.length > 0) {
+      const queued = pendingInboundFrames.shift();
+      if (queued.tombstone) continue;
+      if (queued.browserCall) {
+        queueLocalResult(inFlight.get(idKey(queued.requestId)), result);
+      } else {
+        sendPendingEntry(queued);
+      }
+    }
+  };
+
+  // Every ready-state browser call crosses this shared identity barrier. A new
+  // HTTP request to /json/version is cheap, and comparing the per-process UUID
+  // proves the local port still terminates at the Chrome acquired for this
+  // generation. Merely reconnecting to the port would allow a local Chromium
+  // that won the freed bind after tunnel death to impersonate the remote box.
+  const ensureReadyIdentity = () => {
+    if (identityVerificationPromise) return identityVerificationPromise;
+    const checkedGeneration = generation;
+    clearIdleTimer();
+    identityVerificationPromise = (async () => {
+      let observedIdentity;
+      let diagnostic;
+      try {
+        observedIdentity = await readBrowserWebSocketIdentity(
+          checkedGeneration.browser_url,
+          identityTimeoutMs,
+        );
+      } catch (err) {
+        diagnostic = err instanceof Error ? err.message : String(err);
+      }
+      if (
+        !finalizing && generation === checkedGeneration &&
+        observedIdentity === checkedGeneration.browserIdentity
+      ) {
+        armIdleTimer();
+        flushPendingAfterSuccess();
+        return;
+      }
+      if (finalizing) return;
+      const stillOurs = generation === checkedGeneration;
+      if (stillOurs) discardGeneration(checkedGeneration);
+      else if (!generation) clearIdleTimer();
+      const detail = stillOurs
+        ? (diagnostic
+            ? `identity could not be verified (${diagnostic})`
+            : "the browser UUID changed")
+        : "the lease was released while the call waited";
+      logErr(`[mcp-agents] browser lease identity lost: ${detail}`);
+      flushPendingAfterFailure({
+        kind: "lease_replaced",
+        message:
+          `Browser lease identity changed before the call was forwarded; ${detail}. ` +
+          "The call was not executed.",
+      });
+    })().catch((err) => {
+      if (finalizing) return;
+      const stillOurs = generation === checkedGeneration;
+      if (stillOurs) discardGeneration(checkedGeneration);
+      else if (!generation) clearIdleTimer();
+      flushPendingAfterFailure({
+        kind: "lease_replaced",
+        message:
+          "Browser lease identity verification failed before the call was " +
+          `forwarded (${err instanceof Error ? err.message : String(err)}).`,
+      });
+    }).finally(() => {
+      identityVerificationPromise = undefined;
+    });
+    return identityVerificationPromise;
+  };
+
+  // One shared promise owns every acquire/restart attempt. All ingress joins the
+  // FIFO before this starts, so a second call cannot overtake the first or launch
+  // a duplicate 103-second provision.
+  const ensureProvisioned = () => {
+    if (provisioningPromise) return provisioningPromise;
+    state = "provisioning";
+    provisioningPromise = (async () => {
+      if (leaseOperationPromise) await leaseOperationPromise;
+      let failure;
+      for (let attempt = 1; attempt <= MAX_BROWSER_PORT_ATTEMPTS; attempt += 1) {
+        const acquireArgs = [
+          "--session",
+          sessionId,
+          "--local-cdp-port",
+          String(localPort),
+          "--viewport",
+          viewport,
+          ...(appPort ? ["--app-port", String(appPort)] : []),
+        ];
+        const result = await runLeaseCommand(
+          "acquire",
+          acquireArgs,
+          helperTimeoutMs,
+        );
+        failure = validateAcquireResult(result, localPort);
+        if (failure.kind === "ready") {
+          let browserIdentity;
+          try {
+            browserIdentity = await readBrowserWebSocketIdentity(
+              failure.record.browser_url,
+              identityTimeoutMs,
+            );
+          } catch (err) {
+            failure = {
+              kind: "provisioning_failed",
+              message:
+                "browser lease became ready but its identity could not be " +
+                `verified (${err instanceof Error ? err.message : String(err)})`,
+            };
+            break;
+          }
+          generation = { ...failure.record, browserIdentity };
+          state = "ready";
+          armIdleTimer();
+          flushPendingAfterSuccess();
+          return;
+        }
+        if (
+          failure.kind !== "port_unavailable" ||
+          attempt === MAX_BROWSER_PORT_ATTEMPTS
+        ) break;
+        await restartDownstreamForPortRace();
+      }
+      if (failure?.kind === "port_unavailable") {
+        failure = {
+          kind: "provisioning_failed",
+          message:
+            `local CDP port was unavailable after ${MAX_BROWSER_PORT_ATTEMPTS} attempts`,
+        };
+      }
+      state = "cold";
+      flushPendingAfterFailure(failure ?? {
+        kind: "provisioning_failed",
+        message: "browser provisioning failed closed",
+      });
+    })().catch((err) => {
+      state = "cold";
+      flushPendingAfterFailure({
+        kind: "provisioning_failed",
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }).finally(() => {
+      provisioningPromise = undefined;
+    });
+    return provisioningPromise;
+  };
+
+  const isDownstreamBrowserTool = (toolName) => {
+    if (typeof toolName !== "string" || wrapperOwnedToolNames.has(toolName)) {
+      return false;
+    }
+    return downstreamToolNames === undefined || downstreamToolNames.has(toolName);
+  };
+
+  const ingressBarrierActive = () =>
+    state === "provisioning" || Boolean(identityVerificationPromise);
+
+  const holdInboundFrame = (
+    frameBytes,
+    msg,
+    browserCall,
+    clientResponse = false,
+    responseOwner = undefined,
+  ) => {
+    const queued = {
+      buffer: Buffer.from(frameBytes),
+      requestId: msg?.id,
+      toolsListId: msg?.method === "tools/list" ? msg.id : undefined,
+      browserCall,
+      clientResponse,
+      responseKey: clientResponse && msg?.id != null ? idKey(msg.id) : undefined,
+      responseOwner,
+      tombstone: false,
+    };
+    pendingInboundFrames.push(queued);
+    const entry = msg?.id == null ? undefined : inFlight.get(idKey(msg.id));
+    if (entry) {
+      entry.state = "held";
+      entry.heldFrame = queued;
+      if (browserCall) startProgress(entry);
+    }
+  };
+
+  const cancelInbound = (requestId) => {
+    if (requestId == null) return false;
+    const key = idKey(requestId);
+    if (locallyHandledResponseIds.has(key)) return true;
+    const entry = inFlight.get(key);
+    if (!entry) return false;
+    if (entry.state === "held") {
+      if (entry.heldFrame) entry.heldFrame.tombstone = true;
+      stopProgress(entry);
+      clearTimeout(entry.hardTimer);
+      inFlight.delete(key);
+      return true;
+    }
+    if (entry.state === "local_response") {
+      dropGeneratedFrames(key, "local_response");
+      clearTimeout(entry.hardTimer);
+      inFlight.delete(key);
+      rememberLocallyHandledResponse(key);
+      return true;
+    }
+    return false;
+  };
+
+  const routeInboundFrame = (frameBytes) => {
+    const line = frameBytes[frameBytes.length - 1] === NEWLINE
+      ? frameBytes.subarray(0, frameBytes.length - 1)
+      : frameBytes;
+    let msg;
+    try { msg = JSON.parse(line.toString("utf8")); } catch {
+      if (ingressBarrierActive()) holdInboundFrame(frameBytes, undefined, false);
+      else sendRawToDownstream(frameBytes);
+      return;
+    }
+    if (!msg || typeof msg !== "object") {
+      if (ingressBarrierActive()) holdInboundFrame(frameBytes, msg, false);
+      else sendRawToDownstream(frameBytes);
+      return;
+    }
+    const clientResponse = msg.id != null && typeof msg.method !== "string" &&
+      ("result" in msg || "error" in msg);
+    if (clientResponse) {
+      const key = idKey(msg.id);
+      const alias = downstreamResponseAliases.get(key);
+      if (alias) {
+        downstreamResponseAliases.delete(key);
+        if (alias.owner !== currentChildRecord) return;
+        const restored = Buffer.from(
+          `${JSON.stringify({ ...msg, id: alias.nativeId })}\n`,
+          "utf8",
+        );
+        if (ingressBarrierActive()) {
+          holdInboundFrame(restored, { ...msg, id: alias.nativeId }, false, true, alias.owner);
+        } else {
+          downstreamRequestOwners.delete(alias.nativeKey);
+          sendRawToDownstream(restored);
+        }
+        return;
+      }
+      if (retiredDownstreamRequestOwners.has(key)) {
+        retiredDownstreamRequestOwners.delete(key);
+        returnToRawIfLatchClear();
+        return;
+      }
+      const responseOwner = downstreamRequestOwners.get(key);
+      if (ingressBarrierActive()) {
+        holdInboundFrame(frameBytes, msg, false, true, responseOwner);
+      } else if (responseOwner === currentChildRecord) {
+        downstreamRequestOwners.delete(key);
+        sendRawToDownstream(frameBytes);
+      }
+      return;
+    }
+    if (msg.method === "notifications/cancelled") {
+      const requestId = msg.params?.requestId;
+      if (cancelInbound(requestId)) return;
+      if (requestId != null) {
+        pendingToolsListIds.delete(idKey(requestId));
+        returnToRawIfLatchClear();
+      }
+      if (ingressBarrierActive()) holdInboundFrame(frameBytes, msg, false);
+      else sendRawToDownstream(frameBytes);
+      return;
+    }
+    if (msg.id != null && typeof msg.method === "string") {
+      if (
+        typeof msg.id === "string" &&
+        (msg.id.startsWith(internalInitializePrefix) ||
+          msg.id.startsWith(downstreamRequestAliasPrefix))
+      ) {
+        if (addInFlight(msg)) {
+          queueLocalResult(
+            inFlight.get(idKey(msg.id)),
+            browserToolErrorResult(
+              "reserved_request_id",
+              "request id uses the browser provider's private namespace",
+            ),
+          );
+        }
+        return;
+      }
+      if (!addInFlight(msg)) return;
+      if (msg.method === "initialize") {
+        initializeParams = JSON.parse(JSON.stringify(msg.params ?? {}));
+      }
+    }
+    if (msg.method === "notifications/initialized") {
+      initializedFrame = Buffer.from(frameBytes);
+    }
+    const browserCall = msg.method === "tools/call" &&
+      isDownstreamBrowserTool(msg.params?.name);
+    if (ingressBarrierActive()) {
+      holdInboundFrame(frameBytes, msg, browserCall);
+      return;
+    }
+    if (browserCall && state === "ready") {
+      holdInboundFrame(frameBytes, msg, true);
+      void ensureReadyIdentity();
+      return;
+    }
+    if (browserCall && state !== "ready") {
+      holdInboundFrame(frameBytes, msg, true);
+      void ensureProvisioned();
+      return;
+    }
+    sendRawToDownstream(frameBytes, {
+      requestId:
+        msg.id != null && typeof msg.method === "string" ? msg.id : undefined,
+      toolsListId: msg.method === "tools/list" ? msg.id : undefined,
+      inspectedCallId: browserCall ? msg.id : undefined,
+    });
+  };
+
+  const hardExit = (code) => {
+    if (exited) return;
+    exited = true;
+    process.exit(code);
+  };
+
+  const flushThenExit = (code) => {
+    if (exited) return;
+    if (process.stdout.writableLength === 0) {
+      hardExit(code);
+      return;
+    }
+    const safety = setTimeout(() => hardExit(code), 2_000);
+    process.stdout.once("drain", () => {
+      clearTimeout(safety);
+      hardExit(code);
+    });
+  };
+
+  finalize = ({ reason, emit, exitCode }) => {
+    if (finalizing) return;
+    finalizing = true;
+    state = "finalizing";
+    clearIdleTimer();
+    clearFlushStallGuard();
+    logErr(`[mcp-agents] browser passthrough finalize: ${reason}`);
+    try { currentChildRecord?.child.stdout.pause(); } catch {}
+    if (currentChildRecord) currentChildRecord.plannedStop = true;
+    killDetachedGroup(currentChildRecord?.child);
+    // A release helper may be in the middle of closing SSH control masters.
+    // Preserve and await that bounded child. Acquisition/status helpers are no
+    // longer useful after client loss, but they receive SIGTERM and a bounded
+    // trap grace before escalation so their own tunnel cleanup still runs.
+    const helperStops = [];
+    for (const helperRecord of activeHelperChildren.values()) {
+      if (helperRecord.subcommand !== "release") {
+        helperRecord.terminate();
+        helperStops.push(helperRecord.settledPromise);
+      }
+    }
+
+    if (rewriteSkipUntilNewline || rewriteDropUntilNewline) {
+      rewriteBuf = Buffer.alloc(0);
+      rewriteSkipUntilNewline = false;
+      rewriteDropUntilNewline = false;
+      if (emit && !lastForwardedByteWasNewline) {
+        try { process.stdout.write("\n"); } catch {}
+        lastForwardedByteWasNewline = true;
+      }
+    } else if (rewriteBuf.length > 0) {
+      const raw = rewriteBuf.toString("utf8");
+      let out;
+      try {
+        const msg = JSON.parse(raw);
+        const key = msg?.id == null ? undefined : idKey(msg.id);
+        if (key && internalInitialize?.key === key) {
+          internalInitialize.reject(new Error("downstream exited during re-initialize"));
+          internalInitialize = undefined;
+        } else if (key && inspectedToolCallIds.has(key)) {
+          const suppressResult = suppressedResponseIds.delete(key);
+          const leaseLost = resolveInspectedCallAsLeaseLost(key, msg);
+          out = suppressResult
+            ? undefined
+            : JSON.stringify(leaseLost);
+        } else if (key && suppressedResponseIds.has(key)) {
+          suppressedResponseIds.delete(key);
+        } else if (key && pendingToolsListIds.has(key)) {
+          pendingToolsListIds.delete(key);
+          if (Array.isArray(msg.result?.tools)) {
+            downstreamToolNames = new Set(msg.result.tools.map((tool) => tool?.name));
+          }
+          rewriteBrowserToolsListMessage(msg);
+          out = JSON.stringify(msg);
+        } else {
+          out = raw;
+        }
+        if (out !== undefined && emit) {
+          try { process.stdout.write(`${out}\n`); } catch {}
+          observeOutgoingLine(raw);
+          lastForwardedByteWasNewline = true;
+        }
+      } catch {
+        if (emit && !lastForwardedByteWasNewline) {
+          try { process.stdout.write("\n"); } catch {}
+          lastForwardedByteWasNewline = true;
+        }
+      }
+      rewriteBuf = Buffer.alloc(0);
+    } else if (stdoutObsBuf.length > 0 && emit) {
+      observeOutgoingLine(stdoutObsBuf.toString("utf8"));
+      stdoutObsBuf = Buffer.alloc(0);
+      if (!lastForwardedByteWasNewline) {
+        try { process.stdout.write("\n"); } catch {}
+        lastForwardedByteWasNewline = true;
+      }
+    }
+
+    // A classifier may still be awaiting identity/status while complete
+    // sibling frames remain buffered behind it. Settle the active classifier
+    // first, then every remaining browser owner, without assuming rewriteBuf or
+    // deferred chunks contain exactly one parseable JSON value.
+    const activeClassification = pendingBrowserClassification;
+    pendingBrowserClassification = undefined;
+    if (activeClassification) {
+      rememberLocallyHandledResponse(idKey(activeClassification.msg.id));
+      if (emit && !activeClassification.suppressResult) {
+        try {
+          process.stdout.write(
+            `${JSON.stringify(activeClassification.msg)}\n`,
+          );
+          lastForwardedByteWasNewline = true;
+        } catch {}
+      }
+    }
+    for (const key of [...inspectedToolCallIds.keys()]) {
+      const suppressResult = suppressedResponseIds.delete(key);
+      const leaseLost = resolveInspectedCallAsLeaseLost(key);
+      if (emit && leaseLost && !suppressResult) {
+        try {
+          process.stdout.write(`${JSON.stringify(leaseLost)}\n`);
+          lastForwardedByteWasNewline = true;
+        } catch {}
+      }
+    }
+
+    if (emit) {
+      for (const frame of generatedFrames.splice(0)) {
+        if (!generatedFrameIsLive(frame)) continue;
+        try { process.stdout.write(frame.buffer); } catch {}
+        markGeneratedFrameDelivered(frame);
+      }
+      for (const entry of inFlight.values()) {
+        if (entry.state === "local_response") continue;
+        try {
+          process.stdout.write(`${JSON.stringify({
+            jsonrpc: "2.0",
+            id: entry.id,
+            error: {
+              code: -32001,
+              message:
+                `mcp-agents: browser pass-through aborted before responding (${reason})`,
+            },
+          })}\n`);
+        } catch {}
+      }
+    }
+    for (const entry of inFlight.values()) {
+      clearTimeout(entry.hardTimer);
+      clearInterval(entry.progressTimer);
+    }
+    inFlight.clear();
+    pendingInboundFrames.length = 0;
+    pendingToolsListIds.clear();
+    inspectedToolCallIds.clear();
+    unparsedInspectedResponseIds.clear();
+    suppressedResponseIds.clear();
+    downstreamRequestOwners.clear();
+    retiredDownstreamRequestOwners.clear();
+    downstreamResponseAliases.clear();
+    generatedFrames.length = 0;
+    deferredStdoutChunks.length = 0;
+    const releasedGeneration = generation;
+    generation = undefined;
+    const releaseInProgress = leaseOperationPromise;
+    const release = (async () => {
+      await Promise.allSettled(helperStops);
+      if (releaseInProgress) {
+        try { await releaseInProgress; } catch {}
+      }
+      if (releasedGeneration) {
+        await releaseGeneration(releasedGeneration, "shutdown");
+      }
+    })();
+    release.finally(() => flushThenExit(exitCode));
+  };
+
+  logErr(`[mcp-agents] browser passthrough: session_id=${sessionId}`);
+  if (downstream.npxFallback) {
+    logErr(
+      "[mcp-agents] browser passthrough: no local chrome-devtools-mcp found; " +
+        `first startup may wait for npm to resolve ${CHROME_DEVTOOLS_MCP_NPX_SPEC}`,
+    );
+  }
+  spawnDownstream(localPort);
+  fatalShutdown = (reason, code) => finalize({
+    reason: `fatal: ${reason}`,
+    emit: true,
+    exitCode: code ?? 1,
+  });
+
+  process.stdout.on("drain", () => {
+    if (!stdoutPaused) return;
+    stdoutPaused = false;
+    if (finalizing) return;
+    if (!classificationPending) currentChildRecord?.child.stdout.resume();
+    armIdleTimer();
+    flushGeneratedFrames();
+  });
+  process.stdout.on("error", (err) => {
+    if (err?.code === "EPIPE") {
+      finalize({ reason: "stdout EPIPE", emit: false, exitCode: 0 });
+    }
+  });
+
+  let stdinBuf = Buffer.alloc(0);
+  process.stdin.on("data", (chunk) => {
+    stdinBuf = stdinBuf.length ? Buffer.concat([stdinBuf, chunk]) : Buffer.from(chunk);
+    let newline;
+    while ((newline = stdinBuf.indexOf(NEWLINE)) !== -1) {
+      const frame = stdinBuf.subarray(0, newline + 1);
+      stdinBuf = stdinBuf.subarray(newline + 1);
+      routeInboundFrame(frame);
+    }
+  });
+  process.stdin.on("error", () => {});
+  process.stdin.on("end", () => {
+    if (stdinBuf.length > 0) routeInboundFrame(stdinBuf);
+    finalize({ reason: "client stdin ended", emit: false, exitCode: 0 });
+  });
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    process.once(signal, () => finalize({
+      reason: `signal ${signal}`,
+      emit: false,
+      exitCode: 128 + SIGNAL_CODES[signal],
+    }));
+  }
+}
+
+/**
  * Spawn codex mcp-server as a pass-through. codex stdout is forwarded back to
  * the client byte-for-byte, but the client's stdin is intercepted line-by-line
  * so the curated call contract can be validated and transformed before reaching
@@ -2907,7 +5600,6 @@ function runCodexPassthrough({
     `mcp-agents/job/${randomUUID()}/`;
   let privateRequestSequence = 0;
   let authFailureLogged = false;
-  const idKey = (id) => `${typeof id}:${id}`;
   const authFailureToolResult = (threadId) => ({
     content: [{ type: "text", text: CODEX_AUTH_FAILURE_MESSAGE }],
     structuredContent: {
@@ -4849,24 +7541,6 @@ function runCodexPassthrough({
   // a notification/request emits its top-level "method" before "params". Under
   // that contract a nested "result"/"id" inside a non-response's params cannot be
   // misread as a response. Only ever consulted for frames too large to buffer.
-  const FRAME_HEADER_SCAN = 8192;
-  const peekResponseId = (prefix) => {
-    const s = prefix
-      .subarray(0, Math.min(prefix.length, FRAME_HEADER_SCAN))
-      .toString("utf8");
-    const resultAt = s.search(/"(?:result|error)"\s*:/);
-    if (resultAt === -1) return undefined; // no result/error -> not a response
-    const methodAt = s.search(/"method"\s*:/);
-    if (methodAt !== -1 && methodAt < resultAt) return undefined; // request/notif
-    // Capture the full id TOKEN (number or quoted string) and JSON-decode it so
-    // the value matches what noteInbound stored via JSON.parse — otherwise an
-    // escaped string id (e.g. "a\\b") would not equal the tracked key.
-    const idMatch = s
-      .slice(0, resultAt)
-      .match(/"id"\s*:\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|"(?:[^"\\]|\\.)*")/);
-    if (!idMatch) return undefined;
-    try { return JSON.parse(idMatch[1]); } catch { return undefined; }
-  };
   const peekCorrelatedRequestId = (prefix) => {
     const s = prefix
       .subarray(0, Math.min(prefix.length, FRAME_HEADER_SCAN))
@@ -5818,6 +8492,13 @@ async function main() {
     codexIdleTimeoutMs,
     codexCancelGraceMs,
     codexStatusIntervalMs,
+    browserLeaseCommand,
+    browserCommand,
+    browserIdleTimeoutMs,
+    browserViewport,
+    browserAppPort,
+    browserLogFile,
+    browserAllowedUrlPatterns,
     defaultTimeoutMs,
   } = parseArgs();
   const backend = CLI_BACKENDS[providerName];
@@ -5829,7 +8510,7 @@ async function main() {
     return;
   }
 
-  if (backend.passthrough) {
+  if (providerName === "codex") {
     runCodexPassthrough({
       model,
       modelReasoningEffort,
@@ -5842,6 +8523,31 @@ async function main() {
       idleTimeoutMs: codexIdleTimeoutMs,
       cancelGraceOverrideMs: codexCancelGraceMs,
       statusIntervalOverrideMs: codexStatusIntervalMs,
+      hardTimeoutMs: defaultTimeoutMs,
+    });
+    return;
+  }
+
+  if (providerName === "browser") {
+    let browserSettings;
+    try {
+      browserSettings = resolveBrowserSettings({
+        browserLeaseCommand,
+        browserCommand,
+        browserIdleTimeoutMs,
+        browserViewport,
+        browserAppPort,
+        browserLogFile,
+        browserAllowedUrlPatterns,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logErr(`error: ${message}`);
+      process.exitCode = 1;
+      return;
+    }
+    await runBrowserPassthrough({
+      ...browserSettings,
       hardTimeoutMs: defaultTimeoutMs,
     });
     return;
