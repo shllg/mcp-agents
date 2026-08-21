@@ -108,6 +108,11 @@ const DEFAULT_BROWSER_VIEWPORT = "1440x900";
 const DEFAULT_BROWSER_ACQUIRE_TIMEOUT_MS = 600_000;
 const DEFAULT_BROWSER_IDENTITY_TIMEOUT_MS = 3_000;
 const BROWSER_ACQUIRE_RESERVE_MS = 15_000;
+// Lease acquisition never gets less than this, so a request budget that the
+// fixed reserves already consume leaves --timeout with no effect at all.
+const BROWSER_MIN_HELPER_TIMEOUT_MS = 1_000;
+const BROWSER_MIN_HARD_TIMEOUT_MS = DEFAULT_BROWSER_IDENTITY_TIMEOUT_MS +
+  BROWSER_ACQUIRE_RESERVE_MS + BROWSER_MIN_HELPER_TIMEOUT_MS;
 const DEFAULT_BROWSER_HELPER_TERM_GRACE_MS = 30_000;
 const DEFAULT_BROWSER_IDLE_RELEASE_TIMEOUT_MS = 60_000;
 const DEFAULT_BROWSER_SHUTDOWN_RELEASE_TIMEOUT_MS = 15_000;
@@ -445,8 +450,8 @@ Options:
   --timeout <seconds>            Default timeout per call
                                  [default: codex ${DEFAULT_CODEX_TIMEOUT_MS / 1000}, claude ${DEFAULT_CLAUDE_TIMEOUT_MS / 1000}, browser ${DEFAULT_BROWSER_ACQUIRE_TIMEOUT_MS / 1000}, gemini ${DEFAULT_TIMEOUT_MS / 1000}]
                                  browser reserves ${(DEFAULT_BROWSER_IDENTITY_TIMEOUT_MS + BROWSER_ACQUIRE_RESERVE_MS) / 1000}s of this budget for
-                                 identity plus the first tool call, so a value
-                                 below ${(DEFAULT_BROWSER_IDENTITY_TIMEOUT_MS + BROWSER_ACQUIRE_RESERVE_MS + 1000) / 1000 + 1}s leaves lease acquisition at its 1s floor
+                                 identity plus the first tool call; a smaller
+                                 value is rejected at startup
   --help, -h                     Show this help message
   --version, -v                  Show version number`);
 }
@@ -718,6 +723,30 @@ function parseArgs() {
   if (provider !== "browser" && browserFlags.length > 0) {
     process.stderr.write(
       `error: ${browserFlags[0]} is only valid with --provider browser\n`,
+    );
+    process.exit(1);
+  }
+
+  // At or below this the reserves consume the whole budget, lease acquisition
+  // is pinned to its floor, and raising --timeout changes nothing -- while the
+  // failure surfaces at runtime as a helper timeout that blames the lease
+  // command rather than this flag. Refuse it at startup instead.
+  // Only meaningful when the derived budget is the one actually used: the test
+  // tunable replaces it outright, so there would be nothing to validate.
+  if (
+    provider === "browser" && defaultTimeoutMs !== undefined &&
+    defaultTimeoutMs <= BROWSER_MIN_HARD_TIMEOUT_MS &&
+    process.env.MCP_AGENTS_TEST_BROWSER_HELPER_TIMEOUT_MS === undefined
+  ) {
+    const reserveSecs =
+      (DEFAULT_BROWSER_IDENTITY_TIMEOUT_MS + BROWSER_ACQUIRE_RESERVE_MS) / 1000;
+    const minSecs = Math.floor(BROWSER_MIN_HARD_TIMEOUT_MS / 1000) + 1;
+    process.stderr.write(
+      `error: --timeout ${defaultTimeoutMs / 1000} is too small for --provider browser\n` +
+      `       the browser provider reserves ${reserveSecs}s of the request budget for\n` +
+      `       identity verification and the first tool call, so lease acquisition\n` +
+      `       would be left at its ${BROWSER_MIN_HELPER_TIMEOUT_MS / 1000}s floor\n` +
+      `       use --timeout ${minSecs} or higher\n`,
     );
     process.exit(1);
   }
@@ -3261,7 +3290,7 @@ async function runBrowserPassthrough({
   const helperTimeoutMs = testTunableMs(
     "MCP_AGENTS_TEST_BROWSER_HELPER_TIMEOUT_MS",
     Math.max(
-      1_000,
+      BROWSER_MIN_HELPER_TIMEOUT_MS,
       resolvedHardTimeoutMs - DEFAULT_BROWSER_IDENTITY_TIMEOUT_MS -
         BROWSER_ACQUIRE_RESERVE_MS,
     ),

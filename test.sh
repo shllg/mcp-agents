@@ -318,6 +318,14 @@ test_cli_error "--timeout without value"                    "--timeout"         
 test_cli_error "--timeout with zero"                        "--timeout 0"                "must be a positive number"
 test_cli_error "--timeout with negative"                    "--timeout -5"               "must be a positive number"
 test_cli_error "--timeout with non-number"                  "--timeout abc"              "must be a positive number"
+test_cli_error "--timeout below the browser reserve" \
+  "--provider browser --timeout 10" "too small for --provider browser"
+test_cli_error "--timeout at the browser reserve boundary" \
+  "--provider browser --timeout 19" "too small for --provider browser"
+# One above the boundary must CLEAR this check: it falls through to the next
+# validation, which proves the budget gate accepted it rather than exiting here.
+test_cli_error "--timeout just above the browser reserve is accepted" \
+  "--provider browser --timeout 20" "browser_lease_command"
 test_cli_error "--codex_idle_timeout without value"         "--codex_idle_timeout"       "requires a value"
 test_cli_error "--codex_idle_timeout non-number"            "--codex_idle_timeout abc"   "non-negative number"
 test_cli_error "--codex_idle_timeout negative"              "--codex_idle_timeout -1"    "non-negative number"
@@ -6192,7 +6200,7 @@ test_browser_case "browser escalates when an acquiring helper ignores TERM" \
       (.result.content[0].text | contains("timed out")))] | length == 1) and
    ([.spawns[0].stdin[] | select(.method == "tools/call") | .id] | length == 0)'
 test_browser_case "browser helper budget stays below its request budget" \
-  "derived-helper-timeout" "normal" "acquire-derived-timeout" "10" "18" \
+  "derived-helper-timeout" "normal" "acquire-derived-timeout" "10" "20" \
   '(.driverError == null) and (.acquireTerminated == true) and
    ([.frames[] | select(.id == 3 and
       .result.structuredContent.code == "browser_provisioning_failed" and

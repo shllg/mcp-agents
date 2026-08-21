@@ -39,10 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   newer than 18, and that floor rises as the unpinned dependency tracks latest,
   so one current floor replaces a split one. Consumers on Node 18-25 must
   upgrade Node to install this release.
-- Document that `--timeout` bounds a browser request end to end, and that the
-  browser provider reserves 18s of that budget for identity verification plus
-  the first tool call. A value below 20s therefore leaves lease acquisition at
-  its 1s floor. The 600s browser default is unaffected.
+- Reject a browser `--timeout` of 19s or less at startup. The provider reserves
+  18s of the request budget for identity verification and the first tool call,
+  so a smaller budget pinned lease acquisition to a 1s floor: acquisition could
+  never succeed, raising `--timeout` anywhere inside that range changed nothing,
+  and the runtime error blamed the lease command instead of the flag. The 600s
+  browser default is unaffected.
 
 ### Security
 
