@@ -4,7 +4,7 @@ MCP server that wraps AI CLI tools — [Claude Code](https://docs.anthropic.com/
 
 ## Prerequisites
 
-- **Node.js >= 18**
+- **Node.js >= 26**
 - At least one of the following CLIs installed and on your `$PATH`:
 
 | CLI | Install |
@@ -188,8 +188,8 @@ startup, install `chrome-devtools-mcp` alongside mcp-agents, or install it
 elsewhere and point `--browser_command` at its executable. Pin it there if you
 need a fixed version for a particular deployment. The browser downstream
 requires the Node versions supported by the `chrome-devtools-mcp` release it
-resolves to, which is currently newer than this package's Node 18 floor; the
-other mcp-agents providers retain that floor.
+resolves to; this package's own `>=26` floor stays at or above that as the
+unpinned dependency tracks latest.
 
 `chrome-devtools-mcp` is intentionally a development dependency, not a runtime
 dependency. A developer checkout therefore exercises the package-local path,

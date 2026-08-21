@@ -358,8 +358,8 @@ function normalizeToolOutput(provider, output) {
   try {
     const parsed = JSON.parse(trimmed);
     // Resolve the result event from either shape. Scanning from the end finds
-    // the terminal result without depending on Array.prototype.findLast
-    // (keeps the Node >=18 floor — see engines).
+    // the terminal result explicitly rather than via Array.prototype.findLast;
+    // the loop is equivalent and carries no floor assumption.
     let result = parsed;
     if (Array.isArray(parsed)) {
       result = null;
@@ -444,6 +444,9 @@ Options:
                                  [env: ${BROWSER_ALLOWED_URL_PATTERN_ENV}]
   --timeout <seconds>            Default timeout per call
                                  [default: codex ${DEFAULT_CODEX_TIMEOUT_MS / 1000}, claude ${DEFAULT_CLAUDE_TIMEOUT_MS / 1000}, browser ${DEFAULT_BROWSER_ACQUIRE_TIMEOUT_MS / 1000}, gemini ${DEFAULT_TIMEOUT_MS / 1000}]
+                                 browser reserves ${(DEFAULT_BROWSER_IDENTITY_TIMEOUT_MS + BROWSER_ACQUIRE_RESERVE_MS) / 1000}s of this budget for
+                                 identity plus the first tool call, so a value
+                                 below ${(DEFAULT_BROWSER_IDENTITY_TIMEOUT_MS + BROWSER_ACQUIRE_RESERVE_MS + 1000) / 1000 + 1}s leaves lease acquisition at its 1s floor
   --help, -h                     Show this help message
   --version, -v                  Show version number`);
 }

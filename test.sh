@@ -5735,10 +5735,10 @@ run_codex_watchdog_case "codex child death synthesizes error (no childless hang)
 # Browser resolver and passthrough process-boundary tests. The npx resolver and
 # all remaining browser cases use PID-registering downstream/helper stubs, so
 # they run anywhere. The FIRST case is different: it starts the REAL
-# package-local chrome-devtools-mcp, whose own engines floor is well above this
-# package's `>=18`, and rises further as the unpinned dependency tracks latest.
-# Gate it on the node actually running the suite so the fast suite stays usable
-# on the floor mcp-agents still supports for its other providers.
+# package-local chrome-devtools-mcp, whose own engines floor rises as the
+# unpinned dependency tracks latest. mcp-agents now requires `>=26` so this
+# normally passes; the gate stays as a guard for anyone running the suite on an
+# older node than the package supports.
 browser_local_node_ok=1
 if ! node -e '
   const [maj, min] = process.versions.node.split(".").map(Number);

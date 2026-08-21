@@ -1,0 +1,5 @@
+# Node 26 is this package's engines floor (see package.json). The browser
+# provider's downstream chrome-devtools-mcp is deliberately unpinned and its own
+# floor rises with each release, so pinning the checkout here is what keeps a
+# developer at or above it.
+nodejs                    26.7.0

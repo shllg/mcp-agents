@@ -44,7 +44,7 @@
     "ip-address": "^10.2.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=26"
   },
   "license": "MIT"
 }

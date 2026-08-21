@@ -4,7 +4,7 @@ MCP server that wraps AI CLI tools (Claude Code, Gemini CLI, Codex CLI) as MCP t
 
 ## Architecture
 
-Single-file server (`server.js`) — ESM, no build step, no transpilation. The `CLI_BACKENDS` object defines all providers; adding a new backend means adding one entry there. Version is read from `package.json` at runtime via `readFileSync` (not import assertions — those differ between Node 18 and 22+).
+Single-file server (`server.js`) — ESM, no build step, no transpilation. The `CLI_BACKENDS` object defines all providers; adding a new backend means adding one entry there. Version is read from `package.json` at runtime via `readFileSync` (not import assertions — the syntax shifted across Node versions and the runtime read sidesteps that entirely).
 
 ## Commands
 
@@ -29,6 +29,10 @@ node server.js --version
 npm install && npm link
 ```
 
+`.tool-versions` pins the checkout's Node for mise. `npm link` puts `mcp-agents`
+in the *active* Node's global prefix, so switching Node versions orphans the
+link — re-run `npm link` if `mcp-agents` disappears from `$PATH`.
+
 ## Critical: stdout is MCP-only
 
 NEVER write to stdout in server mode — it's the MCP JSON-RPC transport. Use `logErr()` (writes to stderr) for all logging. `console.log` is only safe in `printHelp()` / `parseArgs()` which call `process.exit()` before the server starts.
@@ -38,7 +42,7 @@ NEVER write to stdout in server mode — it's the MCP JSON-RPC transport. Use `l
 - `package.json` must stay in the `files` array — the server reads it at runtime for `VERSION`
 - Child process stdin must be closed immediately (`child.stdin?.end()`) or the CLI hangs waiting for EOF
 - The `keepAlive` interval prevents premature exit when stdin EOF arrives before async handlers complete
-- `engines` requires `>=18` — avoid Node-version-specific syntax like import assertions
+- `engines` requires `>=26` — raised in 0.28.0 so the browser provider's downstream floor is always satisfied. Older providers ran on 18; do not reintroduce a lower floor without checking `chrome-devtools-mcp`
 - `CODEX_LOCAL_TOOL_CONTRACTS` is a third tool family beside the passthrough and job tools: answered wholly from wrapper state, addressing no job. `codex-peek` is its only member. It is strictly read-only with respect to the turns it OBSERVES — it mutates no Codex-turn entry and arms no timer on one (its own request goes through `addInFlight` like any call) — and must stay that way — it exists so a caller blocked on an opaque blocking call has *some* readable liveness. Three invariants it must keep: it never returns prompts, model output or commentary; it never discloses a job's private native request id (jobs are addressed by `jobId`, clients by `requestId`); and it never converts "unknown" into "absent" — a cancelled turn is listed as `canceling` for its grace window because it is still writing, after which only the process-wide count remembers it, and a `cwd` filter reports rather than hides a turn whose workspace could not be recovered. Self-exclusion rests on the `CODEX_TOOL_CONTRACTS` allowlist in `peekRows`, so widening that predicate to "any `codex-*` tool" would silently break it
 - The Codex tools expose closed wrapper-owned schemas. `codex` requires `prompt`, an **absolute** `cwd`, and `sandbox`, with optional `model` (`gpt-5.6-sol|gpt-5.6-terra`), `model_reasoning_effort` (`medium|high|xhigh|max`), `allow_subagents` (boolean, default false), and `goal`; omitted selectors use the server defaults (`gpt-5.6-sol|xhigh`). `codex-reply` requires `prompt` and nonblank `threadId`, with optional `goal`. `additionalProperties` is false. Other models, raw `config`, `approval-policy`, direct developer/base/compact instructions, reply model/sandbox/cwd/effort, missing fields, and malformed values are rejected locally with redacted JSON-RPC `-32602` responses and never reach Codex. Approval policy is server-owned (`never` by default, startup-overridable)
 - The isolated Codex config always includes `[sandbox_workspace_write] network_access`, defaulting to `true` so workspace-write sessions can reach local services. Operators can change it server-wide with `--codex-workspace-network=true|false` or `MCP_AGENTS_CODEX_WORKSPACE_NETWORK_ACCESS` (CLI wins); it MUST stay out of per-call schemas. Enabled means general outbound access because Codex has no localhost-only toggle, while filesystem writes remain workspace-bounded. The table is ignored by read-only and danger-full-access sessions

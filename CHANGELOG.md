@@ -32,6 +32,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   replays the client's original initialize capabilities into the replacement
   child, so local screenshot paths retain their negotiated roots.
 
+### Changed
+
+- **BREAKING**: raise the supported Node floor to `>=26` (was `>=18`). The
+  browser provider's downstream `chrome-devtools-mcp` already requires a Node
+  newer than 18, and that floor rises as the unpinned dependency tracks latest,
+  so one current floor replaces a split one. Consumers on Node 18-25 must
+  upgrade Node to install this release.
+- Document that `--timeout` bounds a browser request end to end, and that the
+  browser provider reserves 18s of that budget for identity verification plus
+  the first tool call. A value below 20s therefore leaves lease acquisition at
+  its 1s floor. The 600s browser default is unaffected.
+
 ### Security
 
 - Never forward a browser tool result that cannot be proven to have come from
