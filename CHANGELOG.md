@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.29.0] - 2026-08-26
+
+### Added
+
+- Add a wrapper-owned MCP adapter over `codex app-server`'s documented stdio JSONL
+  protocol. Existing blocking, reply, background-job, status, commentary,
+  result, cancellation, and peek tools keep their closed MCP contracts while
+  App Server remains an internal implementation detail.
+- Expose curated App Server capabilities through closed schemas: race-safe
+  steering, durable native goal set/get/clear with usage counters, native code
+  reviews, bounded thread list/read/fork/archive/unarchive operations, and an
+  interaction queue for approvals and structured user input.
+- Persist project-scoped sessions, archived sessions, native writer locks, goal
+  state, operation leases, and content-free bridge liveness sidecars outside the
+  served workspace. Add `--codex-state-root` and
+  `--codex-session-retention-days` with matching environment variables; the
+  default retention window is 30 days.
+- Translate eligible foreground App Server interactions into MCP elicitation
+  when the client advertises it. Background jobs expose the same pending
+  interactions through `codex-interactions` and
+  `codex-interaction-resolve`, without disclosing native request IDs.
+- Preserve the complete 0.28 native MCP bridge as the explicit, deprecated
+  `codex-legacy` provider while supported Codex CLI releases still ship
+  `codex mcp-server`. It retains the former schemas, framing, jobs, liveness,
+  auth handling, watchdogs, and legacy goal transformation as one removable
+  compatibility boundary.
+
+### Changed
+
+- **BREAKING:** change `--provider codex` from the native MCP bridge to
+  `codex app-server` and require Codex CLI 0.149.1 or newer for that provider.
+  Use `--provider codex-legacy` for temporary native MCP compatibility; there
+  is no automatic fallback between the providers because their durability,
+  goal, recovery, and error semantics differ. The outer MCP server now owns
+  discovery and validation, so `initialize`, `tools/list`, `ping`, and local
+  status tools remain available even while the App Server child is absent or
+  restarting.
+- **BREAKING:** reject `--approval_policy on-failure` for `--provider codex`,
+  which App Server does not support. Use `on-request` or `never` instead. The
+  `codex-legacy` provider retains the former native MCP setting.
+- Reject App Server-only durable-state and retention flags for every provider
+  other than `codex` instead of silently ignoring them.
+- Use native `thread/start`, `thread/resume`, `turn/start`, `turn/interrupt`,
+  `turn/steer`, `review/start`, and thread-goal methods. A configured or
+  per-call goal now enters Codex's durable native goal lifecycle instead of
+  being approximated with prompt or developer-instruction injection.
+- Lazily start App Server generations and restart only for later safe calls.
+  An in-flight turn whose child exits is reported as `outcome_unknown` and is
+  never replayed automatically; durable thread IDs remain resumable across a
+  clean bridge reconnect.
+
+### Security
+
+- Keep each App Server generation's config, auth snapshot, cache, logs, and
+  general SQLite state isolated while allowlisting only project sessions,
+  writer locks, and the version-gated native goal store into durable state.
+  State roots inside the served workspace, unsafe symlinks, unknown goal-store
+  layouts, and ambiguous cross-process thread ownership fail closed.
+- Create credential-bearing and durable paths under a process-wide `0077`
+  umask, validate private directories/files before reuse, and publish only
+  content-free liveness metadata. Prompts, model output, commentary, and native
+  request IDs never enter sidecars.
+- Keep approval policy server-owned. Blocking calls that cannot safely conduct
+  an interaction are rejected or interrupted instead of silently approving it;
+  first resolution wins and unresolved interactions expire within the call's
+  remaining hard deadline.
+
 ## [0.28.0] - 2026-08-21
 
 ### Added

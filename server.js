@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /* eslint-disable no-console */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { get as httpGet } from "node:http";
 import { createRequire } from "node:module";
@@ -17,21 +17,29 @@ import {
   openSync,
   readFileSync,
   readdirSync,
-  statSync,
+  realpathSync,
   renameSync,
   rmSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
+  ElicitResultSchema,
+  ErrorCode,
+  ListPromptsRequestSchema,
+  ListResourcesRequestSchema,
+  ListResourceTemplatesRequestSchema,
   ListToolsRequestSchema,
+  McpError,
+  PingRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -52,23 +60,17 @@ const DEFAULT_CODEX_APPROVAL_POLICY = "never";
 const DEFAULT_CODEX_WORKSPACE_NETWORK_ACCESS = true;
 const CODEX_WORKSPACE_NETWORK_ACCESS_ENV =
   "MCP_AGENTS_CODEX_WORKSPACE_NETWORK_ACCESS";
-// Correlated watchdogs for the codex pass-through. Only a codex/event carrying
-// the matching MCP request id extends a call's idle window; stderr, pings, and
-// unrelated calls cannot keep a wedged request alive. 0 disables the idle cap.
+const CODEX_STATE_ROOT_ENV = "MCP_AGENTS_CODEX_STATE_ROOT";
+const CODEX_SESSION_RETENTION_DAYS_ENV =
+  "MCP_AGENTS_CODEX_SESSION_RETENTION_DAYS";
+const DEFAULT_CODEX_SESSION_RETENTION_DAYS = 30;
+const CODEX_GOAL_STORE_VERSION = "0.149.1";
+const CODEX_INTERACTION_TIMEOUT_MS = 10 * 60 * 1_000;
 const DEFAULT_CODEX_IDLE_TIMEOUT_MS = 600_000;
-const DEFAULT_CODEX_TERMINAL_GRACE_MS = 1_000;
-const SUCCESS_TERMINAL_EVENTS = new Set(["task_complete", "turn_complete"]);
-const ABORT_TERMINAL_EVENTS = new Set(["turn_aborted"]);
-// How long codex gets to acknowledge a cancellation before the bridge stops
-// waiting. A codex mid-turn is running sandboxed commands and streaming model
-// output; it does NOT service a cancellation promptly, so this must be generous.
-// Expiry no longer tears the bridge down (see onCancelGraceExpired) — it only
-// decides when the wrapper stops holding the request id open.
+// How long App Server gets to acknowledge a cancellation before the bridge
+// settles its local handler. The native turn and its ownership remain visible
+// until App Server proves it stopped or its generation exits.
 const DEFAULT_CODEX_CANCEL_GRACE_MS = 30_000;
-// Backstop for a queued generated frame that cannot flush because codex left a
-// native frame unterminated (buffer mode latched, no boundary). Generous: it
-// must never fire for legitimate slow-frame delivery, only a genuine wedge.
-const DEFAULT_CODEX_FLUSH_STALL_MS = 60_000;
 const DEFAULT_CODEX_PROGRESS_INTERVAL_MS = 1_000;
 // Cadence of a background job's status CURSOR — deliberately far coarser than the
 // progress-notification interval above. Notifications are a free UI stream, but every
@@ -88,6 +90,7 @@ const MAX_CODEX_PAGE_CODEPOINTS = 32_768;
 const MAX_CODEX_COMMENTARY_BYTES = 1024 * 1024;
 const MAX_ACTIVE_CODEX_JOBS = 8;
 const MAX_RETAINED_CODEX_JOBS = 32;
+const MAX_EARLY_CODEX_COMPLETIONS = 32;
 // `codex-reply` takes no cwd — a reply inherits the workspace of the thread it
 // continues — so the only way codex-peek can name a reply's workspace is to
 // remember where each thread was opened. Bounded FIFO; losing an old mapping
@@ -155,7 +158,6 @@ const MAX_RETAINED_CLAUDE_JOBS = 32;
 const CLAUDE_JOB_RETENTION_MS = 60 * 60 * 1_000;
 const DEFAULT_CLAUDE_CANCEL_TERM_MS = 1_000;
 const DEFAULT_CLAUDE_CANCEL_KILL_MS = 1_000;
-const MAX_SUPPRESSED_CODEX_RESPONSES = 32;
 const CODEX_AUTH_FAILURE_CODE = "codex_auth_invalidated";
 const CODEX_AUTH_FAILURE_ACTION = "reauthenticate_and_restart";
 const CODEX_AUTH_FAILURE_MESSAGE =
@@ -234,6 +236,61 @@ const CODEX_LOCAL_TOOL_CONTRACTS = {
     required: [],
   },
 };
+const CODEX_APP_TOOL_CONTRACTS = {
+  "codex-steer": {
+    allowed: ["threadId", "prompt"],
+    required: ["threadId", "prompt"],
+  },
+  "codex-goal-set": {
+    allowed: ["threadId", "objective", "status", "tokenBudget"],
+    required: ["threadId"],
+  },
+  "codex-goal-get": {
+    allowed: ["threadId"],
+    required: ["threadId"],
+  },
+  "codex-goal-clear": {
+    allowed: ["threadId"],
+    required: ["threadId"],
+  },
+  "codex-review": {
+    allowed: ["threadId", "target", "delivery"],
+    required: ["threadId", "target"],
+  },
+  "codex-review-start": {
+    allowed: ["threadId", "target", "delivery"],
+    required: ["threadId", "target"],
+  },
+  "codex-thread-list": {
+    allowed: ["cursor", "limit", "cwd", "archived"],
+    required: [],
+  },
+  "codex-thread-read": {
+    allowed: ["threadId", "includeTurns", "cursor", "limit"],
+    required: ["threadId"],
+  },
+  "codex-thread-fork": {
+    allowed: ["threadId", "lastTurnId"],
+    required: ["threadId"],
+  },
+  "codex-thread-archive": {
+    allowed: ["threadId"],
+    required: ["threadId"],
+  },
+  "codex-thread-unarchive": {
+    allowed: ["threadId"],
+    required: ["threadId"],
+  },
+  "codex-interactions": {
+    allowed: ["threadId", "jobId"],
+    required: [],
+  },
+  "codex-interaction-resolve": {
+    allowed: ["interactionId", "decision", "answers"],
+    required: ["interactionId"],
+  },
+};
+const CODEX_APP_TOOL_NAMES = Object.keys(CODEX_APP_TOOL_CONTRACTS);
 const CODEX_LOCAL_TOOL_NAMES = Object.keys(CODEX_LOCAL_TOOL_CONTRACTS);
 const TERMINAL_CODEX_JOB_STATES = new Set(["completed", "failed", "canceled"]);
 const CLAUDE_EMPTY_OUTPUT_MAX_ATTEMPTS = 2;
@@ -314,6 +371,9 @@ const CLI_BACKENDS = {
     extraProperties: {},
   },
   codex: {
+    passthrough: true,
+  },
+  "codex-legacy": {
     passthrough: true,
   },
   browser: {
@@ -404,16 +464,16 @@ Options:
   --model_reasoning_effort <e>   Codex reasoning effort [default: ${DEFAULT_CODEX_MODEL_REASONING_EFFORT}]
   --sandbox_mode <mode>          Codex sandbox mode: read-only, workspace-write,
                                  danger-full-access [default: ${DEFAULT_CODEX_SANDBOX_MODE}]
-  --approval_policy <policy>     Codex approval policy: untrusted, on-failure,
-                                 on-request, never [default: ${DEFAULT_CODEX_APPROVAL_POLICY}]
+  --approval_policy <policy>     Codex approval policy: untrusted, on-request,
+                                 never; codex-legacy also accepts on-failure
+                                 [default: ${DEFAULT_CODEX_APPROVAL_POLICY}]
   --codex-workspace-network=<b> Enable network access in workspace-write Codex
                                  sessions: true or false [default: ${DEFAULT_CODEX_WORKSPACE_NETWORK_ACCESS};
                                  env: ${CODEX_WORKSPACE_NETWORK_ACCESS_ENV}]
-  --goal <text>                  Persistent objective injected into every Codex
-                                 call (as developer-instructions, or a prompt
-                                 reminder on codex-reply); per-call \`goal\` arg
-                                 overrides it [default: none]
-  --codex_idle_timeout <secs>    Codex pass-through idle watchdog; 0 disables
+  --goal <text>                  Native durable goal for codex; codex-legacy
+                                 approximates goals by injecting instructions
+                                 into each affected turn [default: none]
+  --codex_idle_timeout <secs>    Codex turn idle watchdog; 0 disables
                                  [default: ${DEFAULT_CODEX_IDLE_TIMEOUT_MS / 1000}]
   --codex_cancel_grace <secs>    How long codex may take to acknowledge a
                                  cancellation before the bridge abandons the
@@ -429,6 +489,14 @@ Options:
                                  still woken by the ${MAX_CODEX_STATUS_WAIT_MS / 1000}s heartbeat ceiling, so
                                  only the status text goes stale. 0 = every change
                                  [default: ${DEFAULT_CODEX_STATUS_INTERVAL_MS / 1000}]
+  --codex-state-root <path>      Absolute base directory for project-scoped
+                                 durable Codex state (codex only)
+                                 [env: ${CODEX_STATE_ROOT_ENV}]
+  --codex-session-retention-days <days>
+                                 Retain resumable Codex sessions for this many
+                                 days (codex only); 0 disables expiry
+                                 [default: ${DEFAULT_CODEX_SESSION_RETENTION_DAYS};
+                                 env: ${CODEX_SESSION_RETENTION_DAYS_ENV}]
   --browser_lease_command <cmd>  Required browser lease helper command or JSON
                                  argv [env: ${BROWSER_LEASE_COMMAND_ENV}]
   --browser_command <cmd>        chrome-devtools-mcp command or JSON argv;
@@ -462,7 +530,7 @@ Options:
  * --sandbox_mode, --approval_policy, --codex-workspace-network, --goal,
  * --codex_idle_timeout, --codex_cancel_grace, --codex_status_interval, browser
  * provider settings, --timeout, and unknown flags.
- * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, codexWorkspaceNetworkAccess?: boolean, goal?: string, codexIdleTimeoutMs?: number, codexCancelGraceMs?: number, codexStatusIntervalMs?: number, browserLeaseCommand?: string, browserCommand?: string, browserIdleTimeoutMs?: number, browserViewport?: string, browserAppPort?: number, browserLogFile?: string, browserAllowedUrlPatterns?: string[], defaultTimeoutMs?: number }}
+ * @returns {{ provider: string, model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, codexWorkspaceNetworkAccess?: boolean, goal?: string, codexIdleTimeoutMs?: number, codexCancelGraceMs?: number, codexStatusIntervalMs?: number, codexStateRoot?: string, codexSessionRetentionDays?: number, browserLeaseCommand?: string, browserCommand?: string, browserIdleTimeoutMs?: number, browserViewport?: string, browserAppPort?: number, browserLogFile?: string, browserAllowedUrlPatterns?: string[], defaultTimeoutMs?: number }}
  */
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -476,6 +544,8 @@ function parseArgs() {
   let codexIdleTimeoutMs;
   let codexCancelGraceMs;
   let codexStatusIntervalMs;
+  let codexStateRoot;
+  let codexSessionRetentionDays;
   let browserLeaseCommand;
   let browserCommand;
   let browserIdleTimeoutMs;
@@ -607,6 +677,34 @@ function parseArgs() {
         codexStatusIntervalMs = Math.round(secs * 1000);
         break;
       }
+      case "--codex-state-root":
+        if (i + 1 >= args.length) {
+          process.stderr.write("error: --codex-state-root requires a value\n");
+          process.exit(1);
+        }
+        codexStateRoot = args[++i];
+        if (!isAbsolute(codexStateRoot)) {
+          process.stderr.write("error: --codex-state-root must be absolute\n");
+          process.exit(1);
+        }
+        break;
+      case "--codex-session-retention-days": {
+        if (i + 1 >= args.length) {
+          process.stderr.write(
+            "error: --codex-session-retention-days requires a value\n",
+          );
+          process.exit(1);
+        }
+        const days = Number(args[++i]);
+        if (!Number.isInteger(days) || days < 0) {
+          process.stderr.write(
+            "error: --codex-session-retention-days must be a non-negative integer\n",
+          );
+          process.exit(1);
+        }
+        codexSessionRetentionDays = days;
+        break;
+      }
       case "--browser_lease_command":
         if (i + 1 >= args.length) {
           process.stderr.write(
@@ -720,6 +818,35 @@ function parseArgs() {
     }
   }
 
+  if (approvalPolicy === "on-failure" && provider !== "codex-legacy") {
+    process.stderr.write(
+      "error: --approval_policy on-failure is only supported by --provider codex-legacy; use on-request or never\n",
+    );
+    process.exit(1);
+  }
+  const approvalPolicies = provider === "codex-legacy"
+    ? ["untrusted", "on-failure", "on-request", "never"]
+    : ["untrusted", "on-request", "never"];
+  if (approvalPolicy !== undefined && !approvalPolicies.includes(approvalPolicy)) {
+    process.stderr.write(
+      `error: --approval_policy must be ${approvalPolicies.join(", ")}\n`,
+    );
+    process.exit(1);
+  }
+
+  if (provider !== "codex" && codexStateRoot !== undefined) {
+    process.stderr.write(
+      "error: --codex-state-root is only supported by --provider codex\n",
+    );
+    process.exit(1);
+  }
+  if (provider !== "codex" && codexSessionRetentionDays !== undefined) {
+    process.stderr.write(
+      "error: --codex-session-retention-days is only supported by --provider codex\n",
+    );
+    process.exit(1);
+  }
+
   if (provider !== "browser" && browserFlags.length > 0) {
     process.stderr.write(
       `error: ${browserFlags[0]} is only valid with --provider browser\n`,
@@ -762,6 +889,8 @@ function parseArgs() {
     codexIdleTimeoutMs,
     codexCancelGraceMs,
     codexStatusIntervalMs,
+    codexStateRoot,
+    codexSessionRetentionDays,
     browserLeaseCommand,
     browserCommand,
     browserIdleTimeoutMs,
@@ -2443,7 +2572,7 @@ function buildCodexBridgeConfig({
     // get the collab tools with it set to false. `agents.enabled = false` is
     // the gate that actually removes them; keep both so older Codex versions
     // stay disabled through the feature flag. Sessions opt back in per call
-    // with `allow_subagents` (see transformCodexToolCall). The [agents] line
+    // with `allow_subagents` (see threadStartConfig). The [agents] line
     // is version-gated: 0.102–0.144 hard-fail parsing a boolean there (see
     // codexSupportsAgentsEnabledKey), and the feature flag still gates the
     // collab tools on those versions.
@@ -2452,16 +2581,15 @@ function buildCodexBridgeConfig({
 }
 
 /**
- * Prepare the private parent for isolated Codex homes inside the startup cwd.
- * Keeping it outside the OS temp directory allows Codex to create its PATH
- * helper aliases without weakening the isolation between bridge instances.
+ * Prepare the private parent for isolated Codex generation homes. The App
+ * Server adapter passes its project-scoped external state path so copied
+ * credentials never become reachable from the served workspace.
+ * @param {string} [root]
  * @returns {string}
  */
-function prepareIsolatedCodexHomesRoot() {
-  const projectTmp = join(STARTUP_CWD, "tmp");
-  const root = join(projectTmp, "codex-homes");
-
-  mkdirSync(projectTmp, { recursive: true });
+function prepareIsolatedCodexHomesRoot(
+  root = join(STARTUP_CWD, "tmp", "codex-homes"),
+) {
   mkdirSync(root, { recursive: true, mode: 0o700 });
 
   const rootStat = lstatSync(root);
@@ -2471,40 +2599,6 @@ function prepareIsolatedCodexHomesRoot() {
   chmodSync(root, 0o700);
 
   return root;
-}
-
-/**
- * Remove isolated Codex homes left behind by bridges that died without running
- * their cleanup (SIGKILL, a hard crash, a machine restart). Each one holds a
- * copy of auth.json, so they are both disk litter and credential sprawl. Only
- * directories older than the cutoff are touched, so a concurrently starting
- * bridge is never disturbed. Entirely best-effort.
- * @param {string} root
- * @param {number} [maxAgeMs]
- * @returns {number} count removed
- */
-function sweepStaleCodexHomes(
-  root,
-  maxAgeMs = STALE_CODEX_HOME_MAX_AGE_MS,
-) {
-  const cutoff = Date.now() - maxAgeMs;
-  let removed = 0;
-  let names;
-  try {
-    names = readdirSync(root);
-  } catch {
-    return 0;
-  }
-  for (const name of names) {
-    if (!name.startsWith("mcp-agents-codex-")) continue;
-    const dir = join(root, name);
-    try {
-      if (statSync(dir).mtimeMs >= cutoff) continue;
-      rmSync(dir, { recursive: true, force: true });
-      removed += 1;
-    } catch {}
-  }
-  return removed;
 }
 
 /**
@@ -2650,179 +2744,13 @@ function persistIsolatedCodexAuth(isolatedCodexHome, initialAuth) {
   }
 }
 
-/**
- * Build the text for codex's native `developer-instructions` field (a
- * developer-role message) from a goal. This is the MCP-correct vehicle for a
- * standing objective: it is higher-altitude than the user prompt and persists
- * across the thread. It is NOT codex's `/goal` subsystem — that is a TUI-only
- * slash command (parsed in codex-rs/tui, e.g. chatwidget/slash_dispatch.rs) and
- * is not reachable through the MCP `codex`/`codex-reply` tool surface.
- * @param {string} goal
- * @returns {string}
- */
-function buildGoalDeveloperInstructions(goal) {
-  return (
-    "Persistent objective for this Codex thread (a standing goal — keep " +
-    "pursuing it across turns unless explicitly superseded):\n" +
-    goal.trim()
-  );
-}
 
-/**
- * Prepend a concise goal reminder to a prompt. Used for `codex-reply` turns,
- * which expose no `developer-instructions` field, so the prompt is the only
- * vehicle left to restate the standing objective. A blank goal leaves the
- * prompt untouched.
- * @param {string} prompt
- * @param {string} goal
- * @returns {string}
- */
-function applyGoalPreamble(prompt, goal) {
-  const trimmedGoal = (goal ?? "").trim();
-  const body = prompt ?? "";
-  if (!trimmedGoal) return body;
-  return `Reminder — standing objective for this thread: ${trimmedGoal}\n\n${body}`;
-}
-
-/**
- * Transform one already-validated newline-delimited `tools/call` frame before
- * forwarding it to native Codex:
- *   1. Translate the wrapper-only initial-session `model_reasoning_effort` into
- *      native `config.model_reasoning_effort`.
- *   2. Strip the wrapper-only `allow_subagents` flag; `true` becomes the native
- *      per-call config overrides `agents.enabled = true` +
- *      `features.multi_agent = true` for the new session (the isolated home
- *      keeps both gates hard-off as the baseline).
- *   3. Inject the wrapper-only goal — codex's native `/goal` is a TUI-only slash
- *      command, not
- *      reachable via MCP, so a wrapper-only `goal` arg is always stripped and the
- *      objective is injected the MCP-correct way: into `developer-instructions`
- *      (a developer-role message) for the initial `codex` call, or as a concise
- *      prompt reminder for a `codex-reply` turn (which has no
- *      `developer-instructions` field). A per-call `goal` overrides the
- *      server-wide `--goal` default (`opts.serverGoal`); a blank per-call goal
- *      suppresses the default for that call.
- * Non-`tools/call`, unparseable, and nothing-to-change lines are returned
- * byte-for-byte unchanged so the MCP framing is preserved; any actual mutation
- * re-serializes the message (the intended, framing-safe path for a changed
- * message).
- * @param {string} line
- * @param {{ serverGoal?: string, agentsEnabledKeySupported?: boolean }} [opts]
- * @returns {string}
- */
-function transformCodexToolCall(line, opts = {}) {
-  const trimmed = line.trim();
-  if (!trimmed) return line;
-
-  let msg;
-  try {
-    msg = JSON.parse(trimmed);
-  } catch {
-    return line; // not JSON (e.g. partial/keepalive) — pass through untouched
-  }
-
-  const args =
-    msg && typeof msg === "object" && msg.method === "tools/call"
-      ? msg.params?.arguments
-      : null;
-  if (!args || typeof args !== "object") return line;
-
-  const toolName = msg.params?.name;
-  if (!CODEX_TOOL_CONTRACTS[toolName]) return line;
-  let changed = false;
-  let effortLog;
-
-  if (
-    toolName === "codex" &&
-    Object.hasOwn(args, CODEX_PER_SESSION_REASONING_EFFORT_ARG)
-  ) {
-    const requestedSessionEffort = args[CODEX_PER_SESSION_REASONING_EFFORT_ARG];
-    delete args[CODEX_PER_SESSION_REASONING_EFFORT_ARG];
-    args.config = { model_reasoning_effort: requestedSessionEffort };
-    effortLog = `applied per-session reasoning effort ${requestedSessionEffort}`;
-    changed = true;
-  }
-
-  // ── Native subagent opt-in ────────────────────────────────────────────────
-  // The wrapper-only `allow_subagents` flag is always stripped; only an
-  // explicit `true` re-enables the session's multi-agent gates via per-call
-  // native config overrides. The isolated home config keeps its hard-off
-  // baseline (`[features] multi_agent = false` + `[agents] enabled = false`)
-  // and writes no [mcp_servers], so an enabled session can spawn only
-  // Codex-native in-process subagents — never MCP or other LLM-backed tools.
-  // Session-scoped like `sandbox`: replies inherit it.
-  let subagentsLog;
-  if (toolName === "codex" && Object.hasOwn(args, CODEX_ALLOW_SUBAGENTS_ARG)) {
-    const allowSubagents = args[CODEX_ALLOW_SUBAGENTS_ARG] === true;
-    delete args[CODEX_ALLOW_SUBAGENTS_ARG];
-    if (allowSubagents) {
-      // Flip the right gate(s) for the running codex: `agents.enabled` is the
-      // effective switch on >= 0.145.0 but a fatal config type error on
-      // 0.102–0.144 (see codexSupportsAgentsEnabledKey), where the
-      // `features.multi_agent` flag still gates the collab tools itself.
-      args.config = {
-        ...args.config,
-        "features.multi_agent": true,
-        ...(opts.agentsEnabledKeySupported === false
-          ? {}
-          : { "agents.enabled": true }),
-      };
-      subagentsLog =
-        "enabled native Codex subagents for this session " +
-        `(features.multi_agent=true${
-          opts.agentsEnabledKeySupported === false ? "" : ", agents.enabled=true"
-        })`;
-    }
-    changed = true;
-  }
-
-  // ── Goal injection ────────────────────────────────────────────────────────
-  // A validated per-call `goal` (including "") replaces the server default for
-  // this call. The wrapper field is never forwarded to native Codex.
-  let goalLog;
-  let goalSource = "server";
-  let effectiveGoal = opts.serverGoal;
-  if ("goal" in args) {
-    const perCallGoal = args.goal;
-    delete args.goal;
-    goalLog = "stripped per-call goal arg";
-    effectiveGoal = perCallGoal;
-    goalSource = "per-call";
-    changed = true;
-  }
-  if (typeof effectiveGoal === "string" && effectiveGoal.trim()) {
-    if (toolName === "codex") {
-      // Initial `codex` call: the native developer-instructions field is the
-      // correct, thread-persistent vehicle for a standing objective.
-      args["developer-instructions"] = buildGoalDeveloperInstructions(effectiveGoal);
-      goalLog = `injected ${goalSource} goal into developer-instructions`;
-      changed = true;
-    } else if (toolName === "codex-reply" && typeof args.prompt === "string") {
-      // codex-reply has no developer-instructions field, so restate the
-      // objective as a concise prompt reminder.
-      args.prompt = applyGoalPreamble(args.prompt, effectiveGoal);
-      goalLog = `injected ${goalSource} goal into codex-reply prompt`;
-      changed = true;
-    }
-  }
-
-  if (!changed) return line;
-  if (effortLog) {
-    logErr(`[mcp-agents] codex passthrough: ${effortLog}`);
-  }
-  if (subagentsLog) {
-    logErr(`[mcp-agents] codex passthrough: ${subagentsLog}`);
-  }
-  if (goalLog) {
-    logErr(`[mcp-agents] codex passthrough: ${goalLog}`);
-  }
-  return JSON.stringify(msg);
-}
-
-const CODEX_GOAL_PROPERTY_DESCRIPTION =
-  "Optional standing objective. mcp-agents injects it as developer instructions " +
-  "for a new session or a prompt reminder for a reply. An empty string suppresses " +
-  "the server-wide goal for this call.";
+const CODEX_INITIAL_GOAL_PROPERTY_DESCRIPTION =
+  "Optional native durable goal for the new thread. It overrides the server-wide " +
+  "goal; an empty string suppresses that default for this call.";
+const CODEX_REPLY_GOAL_PROPERTY_DESCRIPTION =
+  "Optional native durable goal update for this thread. A nonempty value replaces " +
+  "the objective; an empty string clears the current goal.";
 const CODEX_PER_SESSION_MODEL_PROPERTY_DESCRIPTION =
   `Optional model for this new session: ${DEFAULT_CODEX_MODEL} for demanding work ` +
   "or gpt-5.6-terra for faster, easier jobs. Defaults to the server-configured " +
@@ -2837,6 +2765,52 @@ const CODEX_ALLOW_SUBAGENTS_PROPERTY_DESCRIPTION =
   "(default false). Subagents share the session's sandbox and approval policy " +
   "and get no MCP or external tool access. Set at session start; replies " +
   "inherit it.";
+const CODEX_GOAL_STATUSES = [
+  "active",
+  "paused",
+  "blocked",
+  "usageLimited",
+  "budgetLimited",
+  "complete",
+];
+const CODEX_REVIEW_TARGET_SCHEMA = {
+  oneOf: [
+    {
+      type: "object",
+      properties: { type: { const: "uncommittedChanges" } },
+      required: ["type"],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        type: { const: "baseBranch" },
+        branch: { type: "string", minLength: 1 },
+      },
+      required: ["type", "branch"],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        type: { const: "commit" },
+        sha: { type: "string", minLength: 1 },
+        title: { type: "string" },
+      },
+      required: ["type", "sha"],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        type: { const: "custom" },
+        instructions: { type: "string", minLength: 1 },
+      },
+      required: ["type", "instructions"],
+      additionalProperties: false,
+    },
+  ],
+};
 
 function codexToolPresentation(toolName) {
   if (toolName === "codex") {
@@ -2877,7 +2851,7 @@ function codexToolPresentation(toolName) {
           },
           goal: {
             type: "string",
-            description: CODEX_GOAL_PROPERTY_DESCRIPTION,
+            description: CODEX_INITIAL_GOAL_PROPERTY_DESCRIPTION,
           },
         },
         required: [...CODEX_TOOL_CONTRACTS.codex.required],
@@ -2902,7 +2876,7 @@ function codexToolPresentation(toolName) {
           },
           goal: {
             type: "string",
-            description: CODEX_GOAL_PROPERTY_DESCRIPTION,
+            description: CODEX_REPLY_GOAL_PROPERTY_DESCRIPTION,
           },
         },
         required: [...CODEX_TOOL_CONTRACTS["codex-reply"].required],
@@ -3039,11 +3013,10 @@ function codexToolPresentation(toolName) {
         "once Codex reports one, the workspace, and lastActivitySeconds — small and " +
         "falling means healthy however long elapsedSeconds grows. A client call is " +
         "identified by requestId (stable for the life of the call); a background job by " +
-        "its jobId. `state` is `running`, or `canceling` for a turn whose cancellation " +
-        "has not been confirmed — that turn is still executing and still WRITING. Two " +
-        "answers that mean less than they look like: an EMPTY list is not evidence a " +
-        "turn finished (an abandoned turn keeps running with no in-flight request left " +
-        "to report — see abandonedTurns), and a row may carry cwdUnknown when the " +
+        "its jobId. `state` is `starting`, `running`, `canceling`, or `outcome_unknown`; " +
+        "canceling and outcome-unknown rows may still be WRITING. The process-wide " +
+        "abandoned count is returned as abandonedTurnsProcessWide. A row may carry " +
+        "cwdUnknown when the " +
         "workspace could not be recovered, in which case a cwd filter still reports it " +
         "rather than hiding it.",
       inputSchema: {
@@ -3064,6 +3037,174 @@ function codexToolPresentation(toolName) {
       },
     };
   }
+  if (toolName === "codex-steer") {
+    return {
+      description:
+        "Append input to the currently active turn on a Codex thread. Fails if " +
+        "the turn is no longer active or belongs to another bridge.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          threadId: { type: "string", minLength: 1 },
+          prompt: { type: "string", minLength: 1 },
+        },
+        required: [...CODEX_APP_TOOL_CONTRACTS[toolName].required],
+        additionalProperties: false,
+      },
+    };
+  }
+  if (toolName === "codex-goal-set") {
+    return {
+      description:
+        "Set or update the native durable goal for a Codex thread. Supply at " +
+        "least one of objective, status, or tokenBudget.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          threadId: { type: "string", minLength: 1 },
+          objective: { type: "string", minLength: 1, maxLength: 4000 },
+          status: { type: "string", enum: [...CODEX_GOAL_STATUSES] },
+          tokenBudget: { type: "integer", minimum: 0 },
+        },
+        required: [...CODEX_APP_TOOL_CONTRACTS[toolName].required],
+        additionalProperties: false,
+      },
+    };
+  }
+  if (toolName === "codex-goal-get" || toolName === "codex-goal-clear") {
+    return {
+      description: toolName.endsWith("get")
+        ? "Read the native durable goal and usage counters for a Codex thread."
+        : "Clear the native durable goal for a Codex thread.",
+      inputSchema: {
+        type: "object",
+        properties: { threadId: { type: "string", minLength: 1 } },
+        required: [...CODEX_APP_TOOL_CONTRACTS[toolName].required],
+        additionalProperties: false,
+      },
+    };
+  }
+  if (toolName === "codex-review" || toolName === "codex-review-start") {
+    return {
+      description: toolName.endsWith("-start")
+        ? "Start a native Codex code review as a background job."
+        : "Run a native Codex code review and wait for its final answer.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          threadId: { type: "string", minLength: 1 },
+          target: CODEX_REVIEW_TARGET_SCHEMA,
+          delivery: { type: "string", enum: ["inline", "detached"], default: "inline" },
+        },
+        required: [...CODEX_APP_TOOL_CONTRACTS[toolName].required],
+        additionalProperties: false,
+      },
+    };
+  }
+  if (toolName === "codex-thread-list") {
+    return {
+      description: "List durable Codex App Server threads using bounded pagination.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          cursor: { type: "string" },
+          limit: { type: "integer", minimum: 1, maximum: 100 },
+          cwd: { type: "string" },
+          archived: { type: "boolean" },
+        },
+        required: [],
+        additionalProperties: false,
+      },
+    };
+  }
+  if (toolName === "codex-thread-read") {
+    return {
+      description:
+        "Read sanitized thread metadata and, when requested, bounded user/agent history.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          threadId: { type: "string", minLength: 1 },
+          includeTurns: { type: "boolean", default: false },
+          cursor: { type: "string" },
+          limit: { type: "integer", minimum: 1, maximum: 100 },
+        },
+        required: [...CODEX_APP_TOOL_CONTRACTS[toolName].required],
+        additionalProperties: false,
+      },
+    };
+  }
+  if (toolName === "codex-thread-fork") {
+    return {
+      description: "Fork a durable Codex thread, optionally through a specific turn.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          threadId: { type: "string", minLength: 1 },
+          lastTurnId: { type: "string", minLength: 1 },
+        },
+        required: [...CODEX_APP_TOOL_CONTRACTS[toolName].required],
+        additionalProperties: false,
+      },
+    };
+  }
+  if (toolName === "codex-thread-archive" || toolName === "codex-thread-unarchive") {
+    return {
+      description: toolName.endsWith("unarchive")
+        ? "Restore a durable archived Codex thread."
+        : "Archive a durable Codex thread.",
+      inputSchema: {
+        type: "object",
+        properties: { threadId: { type: "string", minLength: 1 } },
+        required: [...CODEX_APP_TOOL_CONTRACTS[toolName].required],
+        additionalProperties: false,
+      },
+    };
+  }
+  if (toolName === "codex-interactions") {
+    return {
+      description:
+        "List unresolved Codex approvals and user-input requests without exposing native IDs.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          threadId: { type: "string", minLength: 1 },
+          jobId: { type: "string", minLength: 1 },
+        },
+        required: [],
+        additionalProperties: false,
+      },
+    };
+  }
+  if (toolName === "codex-interaction-resolve") {
+    return {
+      description: "Resolve one queued Codex approval or structured input request.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          interactionId: { type: "string", minLength: 1 },
+          decision: {
+            type: "string",
+            enum: ["accept", "acceptForSession", "decline", "cancel"],
+          },
+          answers: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                questionId: { type: "string", minLength: 1 },
+                answers: { type: "array", items: { type: "string" } },
+              },
+              required: ["questionId", "answers"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: [...CODEX_APP_TOOL_CONTRACTS[toolName].required],
+        additionalProperties: false,
+      },
+    };
+  }
   return undefined;
 }
 
@@ -3071,7 +3212,7 @@ function validateCodexToolCallMessage(msg) {
   if (!msg || typeof msg !== "object" || msg.method !== "tools/call") return undefined;
   const toolName = msg.params?.name;
   const contract = CODEX_TOOL_CONTRACTS[toolName] ?? CODEX_JOB_TOOL_CONTRACTS[toolName] ??
-    CODEX_LOCAL_TOOL_CONTRACTS[toolName];
+    CODEX_LOCAL_TOOL_CONTRACTS[toolName] ?? CODEX_APP_TOOL_CONTRACTS[toolName];
   if (!contract) return undefined;
   const args = msg.params?.arguments;
   if (!args || typeof args !== "object" || Array.isArray(args)) {
@@ -3141,8 +3282,11 @@ function validateCodexToolCallMessage(msg) {
       problem: "must be a boolean",
     });
   }
-  if (Object.hasOwn(args, "goal") && typeof args.goal !== "string") {
-    issues.push({ argument: "goal", problem: "must be a string" });
+  if (
+    Object.hasOwn(args, "goal") &&
+    (typeof args.goal !== "string" || args.goal.length > 4_000)
+  ) {
+    issues.push({ argument: "goal", problem: "must be a string of at most 4000 characters" });
   }
   if (Object.hasOwn(args, "threadId")) {
     if (typeof args.threadId !== "string") {
@@ -3160,6 +3304,7 @@ function validateCodexToolCallMessage(msg) {
   }
   if (
     Object.hasOwn(args, "cursor") &&
+    toolName === "codex-status" &&
     (!Number.isInteger(args.cursor) || args.cursor < 0)
   ) {
     issues.push({ argument: "cursor", problem: "must be a nonnegative integer" });
@@ -3190,6 +3335,118 @@ function validateCodexToolCallMessage(msg) {
       issues.push({ argument: "requestId", problem: "must not be blank" });
     }
   }
+  if (Object.hasOwn(args, "interactionId")) {
+    if (typeof args.interactionId !== "string" || !args.interactionId.trim()) {
+      issues.push({ argument: "interactionId", problem: "must be a nonblank string" });
+    }
+  }
+  if (
+    Object.hasOwn(args, "objective") &&
+    (typeof args.objective !== "string" || !args.objective.trim() ||
+      args.objective.length > 4_000)
+  ) {
+    issues.push({
+      argument: "objective",
+      problem: "must be a nonblank string of at most 4000 characters",
+    });
+  }
+  if (
+    Object.hasOwn(args, "status") &&
+    (typeof args.status !== "string" || !CODEX_GOAL_STATUSES.includes(args.status))
+  ) {
+    issues.push({ argument: "status", problem: "must be a native goal status" });
+  }
+  if (
+    Object.hasOwn(args, "tokenBudget") &&
+    (!Number.isInteger(args.tokenBudget) || args.tokenBudget < 0)
+  ) {
+    issues.push({ argument: "tokenBudget", problem: "must be a nonnegative integer" });
+  }
+  if (
+    toolName === "codex-goal-set" &&
+    !["objective", "status", "tokenBudget"].some((name) => Object.hasOwn(args, name))
+  ) {
+    issues.push({
+      argument: "arguments",
+      problem: "must include objective, status, or tokenBudget",
+    });
+  }
+  if (Object.hasOwn(args, "delivery") && !["inline", "detached"].includes(args.delivery)) {
+    issues.push({ argument: "delivery", problem: "must be inline or detached" });
+  }
+  if (Object.hasOwn(args, "target")) {
+    const target = args.target;
+    const validTarget = target && typeof target === "object" && !Array.isArray(target) &&
+      ((target.type === "uncommittedChanges" && Object.keys(target).length === 1) ||
+        (target.type === "baseBranch" && typeof target.branch === "string" &&
+          target.branch.trim() && Object.keys(target).every((key) => ["type", "branch"].includes(key))) ||
+        (target.type === "commit" && typeof target.sha === "string" && target.sha.trim() &&
+          (target.title === undefined || typeof target.title === "string") &&
+          Object.keys(target).every((key) => ["type", "sha", "title"].includes(key))) ||
+        (target.type === "custom" && typeof target.instructions === "string" &&
+          target.instructions.trim() &&
+          Object.keys(target).every((key) => ["type", "instructions"].includes(key))));
+    if (!validTarget) {
+      issues.push({ argument: "target", problem: "must be a closed native review target" });
+    }
+  }
+  if (
+    Object.hasOwn(args, "limit") &&
+    (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 100)
+  ) {
+    issues.push({ argument: "limit", problem: "must be an integer from 1 to 100" });
+  }
+  for (const field of ["includeTurns", "archived"]) {
+    if (Object.hasOwn(args, field) && typeof args[field] !== "boolean") {
+      issues.push({ argument: field, problem: "must be a boolean" });
+    }
+  }
+  for (const field of ["lastTurnId"]) {
+    if (
+      Object.hasOwn(args, field) &&
+      (typeof args[field] !== "string" || !args[field].trim())
+    ) {
+      issues.push({ argument: field, problem: "must be a nonblank string" });
+    }
+  }
+  if (
+    Object.hasOwn(args, "cursor") &&
+    ["codex-thread-list", "codex-thread-read"].includes(toolName) &&
+    (typeof args.cursor !== "string" || !args.cursor.trim())
+  ) {
+    issues.push({ argument: "cursor", problem: "must be a nonblank string" });
+  }
+  if (Object.hasOwn(args, "decision")) {
+    if (!["accept", "acceptForSession", "decline", "cancel"].includes(args.decision)) {
+      issues.push({ argument: "decision", problem: "must be a supported decision" });
+    }
+  }
+  if (Object.hasOwn(args, "answers")) {
+    const answers = args.answers;
+    if (
+      !Array.isArray(answers) || answers.some((entry) =>
+        !entry || typeof entry !== "object" || Array.isArray(entry) ||
+        typeof entry.questionId !== "string" || !entry.questionId.trim() ||
+        !Array.isArray(entry.answers) ||
+        entry.answers.some((answer) => typeof answer !== "string") ||
+        Object.keys(entry).some((key) => !["questionId", "answers"].includes(key))
+      ) || new Set(answers.map((entry) => entry.questionId)).size !== answers.length
+    ) {
+      issues.push({
+        argument: "answers",
+        problem: "must contain unique questionId/string-array entries",
+      });
+    }
+  }
+  if (
+    toolName === "codex-interaction-resolve" &&
+    Number(Object.hasOwn(args, "decision")) + Number(Object.hasOwn(args, "answers")) !== 1
+  ) {
+    issues.push({
+      argument: "arguments",
+      problem: "must include exactly one of decision or answers",
+    });
+  }
 
   return issues.length > 0
     ? {
@@ -3201,73 +3458,6 @@ function validateCodexToolCallMessage(msg) {
     : undefined;
 }
 
-function codexInvalidParamsFrame(id, validation) {
-  return {
-    jsonrpc: "2.0",
-    id,
-    error: {
-      code: -32602,
-      message: `mcp-agents: invalid arguments for ${validation.toolName}`,
-      data: validation,
-    },
-  };
-}
-
-/**
- * Mutate a parsed `tools/list` response in place, replacing native Codex's broad
- * config-shaped inputs with the exact strict mcp-agents contract. Other tool
- * fields and non-Codex tools remain untouched.
- * @param {any} msg
- * @returns {boolean}
- */
-function rewriteCodexToolsListMessage(msg) {
-  const tools = msg?.result?.tools;
-  if (!Array.isArray(tools)) return false;
-  let changed = false;
-  for (const tool of tools) {
-    if (!tool || typeof tool !== "object") continue;
-    const presentation = codexToolPresentation(tool.name);
-    if (!presentation) continue;
-    if (tool.description !== presentation.description) {
-      tool.description = presentation.description;
-      changed = true;
-    }
-    if (JSON.stringify(tool.inputSchema) !== JSON.stringify(presentation.inputSchema)) {
-      tool.inputSchema = presentation.inputSchema;
-      changed = true;
-    }
-  }
-  const existingNames = new Set(
-    tools.filter((tool) => tool && typeof tool.name === "string").map((tool) => tool.name),
-  );
-  const hasCodex = existingNames.has("codex");
-  const hasCodexReply = existingNames.has("codex-reply");
-  const availableAddedTools = [...CODEX_JOB_TOOL_NAMES, ...CODEX_LOCAL_TOOL_NAMES].filter(
-    (toolName) => {
-      if (toolName === "codex-start") return hasCodex;
-      if (toolName === "codex-reply-start") return hasCodexReply;
-      return hasCodex || hasCodexReply;
-    },
-  );
-  for (const toolName of availableAddedTools) {
-    const presentation = codexToolPresentation(toolName);
-    const existing = tools.find((tool) => tool?.name === toolName);
-    if (existing) {
-      if (existing.description !== presentation.description) {
-        existing.description = presentation.description;
-        changed = true;
-      }
-      if (JSON.stringify(existing.inputSchema) !== JSON.stringify(presentation.inputSchema)) {
-        existing.inputSchema = presentation.inputSchema;
-        changed = true;
-      }
-      continue;
-    }
-    tools.push({ name: toolName, ...presentation });
-    changed = true;
-  }
-  return changed;
-}
 
 /**
  * Spawn chrome-devtools-mcp as a separate browser pass-through. Provisioning
@@ -5356,16 +5546,13 @@ async function runBrowserPassthrough({
 }
 
 /**
- * Spawn codex mcp-server as a pass-through. codex stdout is forwarded back to
- * the client byte-for-byte, but the client's stdin is intercepted line-by-line
- * so the curated call contract can be validated and transformed before reaching
- * codex. Invalid calls are answered locally with JSON-RPC invalid-params errors.
- * Per-request idle and hard deadlines convert unbounded Codex stalls into
- * surfaced JSON-RPC errors. Correlated events also provide client-visible MCP
- * progress and enough terminal metadata to recover a missing final response.
- * @param {{ model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, workspaceNetworkAccess?: boolean, idleTimeoutMs?: number, cancelGraceOverrideMs?: number, statusIntervalOverrideMs?: number, hardTimeoutMs?: number, goal?: string }} opts
+ * Serve the curated Codex MCP contract while using Codex App Server privately.
+ * App Server request IDs, raw events, reasoning items, and private storage paths
+ * never cross the outer MCP boundary.
+ * @param {{ model?: string, modelReasoningEffort?: string, sandboxMode?: string, approvalPolicy?: string, workspaceNetworkAccess?: boolean, idleTimeoutMs?: number, cancelGraceOverrideMs?: number, statusIntervalOverrideMs?: number, hardTimeoutMs?: number, goal?: string, stateRoot?: string, sessionRetentionDays?: number }} opts
+ * @returns {Promise<void>}
  */
-function runCodexPassthrough({
+async function runCodexAppServer({
   model,
   modelReasoningEffort,
   sandboxMode,
@@ -5376,43 +5563,22 @@ function runCodexPassthrough({
   statusIntervalOverrideMs,
   hardTimeoutMs,
   goal,
+  stateRoot,
+  sessionRetentionDays,
 }) {
   const resolvedModel = model || DEFAULT_CODEX_MODEL;
-  const resolvedModelReasoningEffort =
-    modelReasoningEffort || DEFAULT_CODEX_MODEL_REASONING_EFFORT;
-  const resolvedSandboxMode = sandboxMode || DEFAULT_CODEX_SANDBOX_MODE;
-  const resolvedApprovalPolicy = approvalPolicy || DEFAULT_CODEX_APPROVAL_POLICY;
-  const resolvedWorkspaceNetworkAccess =
-    workspaceNetworkAccess ?? DEFAULT_CODEX_WORKSPACE_NETWORK_ACCESS;
-  const resolvedIdleTimeoutMs = idleTimeoutMs ?? DEFAULT_CODEX_IDLE_TIMEOUT_MS;
-  const resolvedHardTimeoutMs = hardTimeoutMs ?? DEFAULT_CODEX_TIMEOUT_MS;
-  const terminalGraceMs = testTunableMs(
-    "MCP_AGENTS_CODEX_TERMINAL_GRACE_MS",
-    DEFAULT_CODEX_TERMINAL_GRACE_MS,
-  );
-  // CLI flag wins over the env tunable, which wins over the default.
+  const resolvedEffort = modelReasoningEffort ||
+    DEFAULT_CODEX_MODEL_REASONING_EFFORT;
+  const resolvedSandbox = sandboxMode || DEFAULT_CODEX_SANDBOX_MODE;
+  const resolvedApproval = approvalPolicy || DEFAULT_CODEX_APPROVAL_POLICY;
+  const resolvedNetwork = workspaceNetworkAccess ??
+    DEFAULT_CODEX_WORKSPACE_NETWORK_ACCESS;
+  const resolvedIdleMs = idleTimeoutMs ?? DEFAULT_CODEX_IDLE_TIMEOUT_MS;
+  const resolvedHardMs = hardTimeoutMs ?? DEFAULT_CODEX_TIMEOUT_MS;
   const cancelGraceMs = cancelGraceOverrideMs ?? testTunableMs(
     "MCP_AGENTS_CODEX_CANCEL_GRACE_MS",
     DEFAULT_CODEX_CANCEL_GRACE_MS,
   );
-  // How long codex may keep working after the client's stdin closed before the
-  // detached group is reaped outright.
-  const clientGoneGraceMs = testTunableMs(
-    "MCP_AGENTS_CODEX_CLIENT_GONE_GRACE_MS",
-    Math.max(cancelGraceMs * 2, DEFAULT_CODEX_CANCEL_GRACE_MS),
-  );
-  let clientGoneTimer;
-  const flushStallLimitMs = testTunableMs(
-    "MCP_AGENTS_CODEX_FLUSH_STALL_MS",
-    DEFAULT_CODEX_FLUSH_STALL_MS,
-  );
-  const progressIntervalMs = testTunableMs(
-    "MCP_AGENTS_CODEX_PROGRESS_INTERVAL_MS",
-    DEFAULT_CODEX_PROGRESS_INTERVAL_MS,
-  );
-  // CLI flag wins over the env tunable, which wins over the default. Clamped to the
-  // largest delay setTimeout represents: Node silently fires anything above it after
-  // 1ms, which would invert this knob into a cursor bump per event.
   const statusIntervalMs = Math.min(
     MAX_TIMER_DELAY_MS,
     statusIntervalOverrideMs ?? testTunableMs(
@@ -5420,3092 +5586,2981 @@ function runCodexPassthrough({
       DEFAULT_CODEX_STATUS_INTERVAL_MS,
     ),
   );
-  const waitIntervalMs = testTunableMs(
-    "MCP_AGENTS_CODEX_WAIT_INTERVAL_MS",
-    DEFAULT_CODEX_WAIT_INTERVAL_MS,
+  const progressIntervalMs = testTunableMs(
+    "MCP_AGENTS_CODEX_PROGRESS_INTERVAL_MS",
+    DEFAULT_CODEX_PROGRESS_INTERVAL_MS,
   );
-  const commentaryByteLimit = testTunableMs(
+  const maxActiveJobs = testTunablePositiveInteger(
+    "MCP_AGENTS_TEST_CODEX_MAX_ACTIVE_JOBS",
+    MAX_ACTIVE_CODEX_JOBS,
+  );
+  const maxRetainedJobs = testTunablePositiveInteger(
+    "MCP_AGENTS_TEST_CODEX_MAX_RETAINED_JOBS",
+    MAX_RETAINED_CODEX_JOBS,
+  );
+  const commentaryLimit = testTunableMs(
     "MCP_AGENTS_TEST_COMMENTARY_BYTES",
     MAX_CODEX_COMMENTARY_BYTES,
   );
-  // Server-wide default goal (string or undefined); per-call `goal` overrides it.
-  const resolvedGoal = goal;
+  const appInitTimeoutMs = testTunableMs(
+    "MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS",
+    10_000,
+  );
+  const appMutationTimeoutMs = testTunableMs(
+    "MCP_AGENTS_CODEX_APP_MUTATION_TIMEOUT_MS",
+    60_000,
+  );
+  const earlyCompletionTtlMs = Math.min(
+    MAX_TIMER_DELAY_MS,
+    testTunableMs(
+      "MCP_AGENTS_TEST_CODEX_EARLY_COMPLETION_TTL_MS",
+      Math.min(MAX_TIMER_DELAY_MS, appMutationTimeoutMs + cancelGraceMs),
+    ),
+  );
+  const interactionTimeoutMs = testTunableMs(
+    "MCP_AGENTS_CODEX_INTERACTION_TIMEOUT_MS",
+    CODEX_INTERACTION_TIMEOUT_MS,
+  );
+  const retentionStartupMs = testTunableMs(
+    "MCP_AGENTS_CODEX_RETENTION_STARTUP_MS",
+    1_000,
+  );
+  const staleLeaseDelayMs = testTunableMs(
+    "MCP_AGENTS_TEST_CODEX_STALE_LEASE_DELAY_MS",
+    0,
+  );
   const sourceCodexHome = resolveCodexHome();
   const fastModeEnabled = readCodexFastModeOptIn(sourceCodexHome);
   const codexVersion = readCodexBinaryVersion();
+  const versionText = codexVersion
+    ? `${codexVersion.major}.${codexVersion.minor}.${codexVersion.patch}`
+    : "unknown";
   const agentsEnabledKeySupported = codexSupportsAgentsEnabledKey(codexVersion);
-  let codexAuthInvalidated = false;
-  let isolatedCodexHomesRoot;
+  const goalStoreCompatible = process.platform !== "win32" &&
+    versionText === CODEX_GOAL_STORE_VERSION;
+  const bridgeId = randomUUID();
+  const bridgeStartedAt = new Date().toISOString();
+  const canonicalProjectCwd = realpathSync(STARTUP_CWD);
+  const projectHash = createHash("sha256")
+    .update(canonicalProjectCwd)
+    .digest("hex");
 
-  try {
-    isolatedCodexHomesRoot = prepareIsolatedCodexHomesRoot();
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    logErr(`[mcp-agents] failed to prepare isolated codex home root: ${msg}`);
-    process.exitCode = 1;
-    return;
-  }
-
-  const sweptHomes =
-    sweepStaleCodexHomes(isolatedCodexHomesRoot) +
-    sweepStaleCodexHomes(tmpdir());
-  if (sweptHomes > 0) {
-    logErr(
-      `[mcp-agents] swept ${sweptHomes} stale isolated codex home(s) left by ` +
-        `bridges that exited without cleanup`,
-    );
-  }
-  let isolatedCodexHome;
-
-  try {
-    isolatedCodexHome = createIsolatedCodexHome({
-      homesRoot: isolatedCodexHomesRoot,
-      sourceCodexHome,
-      model: resolvedModel,
-      modelReasoningEffort: resolvedModelReasoningEffort,
-      sandboxMode: resolvedSandboxMode,
-      approvalPolicy: resolvedApprovalPolicy,
-      workspaceNetworkAccess: resolvedWorkspaceNetworkAccess,
-      fastModeEnabled,
-      agentsEnabledKeySupported,
-    });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    logErr(`[mcp-agents] failed to prepare isolated codex home: ${msg}`);
-    process.exitCode = 1;
-    return;
-  }
-
-  const args = ["mcp-server"];
-  let initialIsolatedAuth;
-  try {
-    const isolatedAuthPath = join(isolatedCodexHome, "auth.json");
-    if (existsSync(isolatedAuthPath)) initialIsolatedAuth = readFileSync(isolatedAuthPath);
-  } catch {}
-  let cleanedUp = false;
-  const cleanupIsolatedCodexHome = () => {
-    if (cleanedUp || !isolatedCodexHome) return;
-    cleanedUp = true;
-
-    // Write any rotated OAuth token back to the real CODEX_HOME before the temp
-    // home is removed. A credential Codex classified as unauthorized is never
-    // eligible: copying it back could clobber the manual login this error asks
-    // the operator to perform.
-    if (codexAuthInvalidated) {
-      logErr(
-        "[mcp-agents] skipped Codex auth.json write-back after authentication invalidation",
+  const envRetention = process.env[CODEX_SESSION_RETENTION_DAYS_ENV];
+  let resolvedRetentionDays = sessionRetentionDays;
+  if (resolvedRetentionDays === undefined && envRetention !== undefined) {
+    const parsed = Number(envRetention);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new Error(
+        `${CODEX_SESSION_RETENTION_DAYS_ENV} must be a non-negative integer`,
       );
-    } else {
-      persistIsolatedCodexAuth(isolatedCodexHome, initialIsolatedAuth);
     }
+    resolvedRetentionDays = parsed;
+  }
+  resolvedRetentionDays ??= DEFAULT_CODEX_SESSION_RETENTION_DAYS;
+
+  const configuredStateBase = stateRoot ?? process.env[CODEX_STATE_ROOT_ENV] ??
+    join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"),
+      "mcp-agents", "codex");
+  if (!isAbsolute(configuredStateBase)) {
+    throw new Error(`${CODEX_STATE_ROOT_ENV} must be an absolute path`);
+  }
+  const lexicalStateBase = resolve(configuredStateBase);
+  const lexicalRelative = relative(canonicalProjectCwd, lexicalStateBase);
+  if (
+    lexicalRelative === "" ||
+    (!lexicalRelative.startsWith("..") && !isAbsolute(lexicalRelative))
+  ) {
+    throw new Error("Codex state root must stay outside the served workspace");
+  }
+
+  // The restrictive mask is process-wide on Node. Set it once, before any
+  // durable or credential-bearing path is created, rather than racing a
+  // temporary mask against concurrent async writes.
+  process.umask(0o077);
+  mkdirSync(lexicalStateBase, { recursive: true, mode: 0o700 });
+  const canonicalStateBase = realpathSync(lexicalStateBase);
+  const canonicalRelative = relative(canonicalProjectCwd, canonicalStateBase);
+  if (
+    canonicalRelative === "" ||
+    (!canonicalRelative.startsWith("..") && !isAbsolute(canonicalRelative))
+  ) {
+    throw new Error("Codex state root resolves inside the served workspace");
+  }
+  chmodSync(canonicalStateBase, 0o700);
+
+  const durableRoot = join(
+    canonicalStateBase,
+    "projects",
+    projectHash,
+    "v1",
+  );
+  const durableSessions = join(durableRoot, "sessions");
+  const durableArchivedSessions = join(durableRoot, "archived_sessions");
+  const durableWriterLocks = join(durableRoot, "thread-writer-locks");
+  const durableGoals = join(durableRoot, "goals");
+  const durableLeases = join(durableRoot, "leases");
+  const durableBridges = join(durableRoot, "bridges");
+  const durableRuntime = join(durableRoot, "runtime");
+  const bridgeDir = join(durableBridges, bridgeId);
+  for (const dir of [
+    durableRoot,
+    durableSessions,
+    durableArchivedSessions,
+    durableWriterLocks,
+    durableGoals,
+    durableLeases,
+    durableBridges,
+    durableRuntime,
+    bridgeDir,
+  ]) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const dirStat = lstatSync(dir);
+    if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) {
+      throw new Error(`unsafe Codex state directory: ${dir}`);
+    }
+    chmodSync(dir, 0o700);
+  }
+
+  const durableGoalFiles = ["goals_1.sqlite", "goals_1.sqlite-wal", "goals_1.sqlite-shm"];
+  const durableGoalDb = join(durableGoals, durableGoalFiles[0]);
+  if (goalStoreCompatible && !existsSync(durableGoalDb)) {
+    const fd = openSync(durableGoalDb, "a", 0o600);
+    closeSync(fd);
+  }
+  for (const name of durableGoalFiles) {
+    const path = join(durableGoals, name);
+    if (!existsSync(path)) continue;
+    const goalStat = lstatSync(path);
+    if (!goalStat.isFile() || goalStat.isSymbolicLink()) {
+      throw new Error(`unsafe Codex goal database file: ${path}`);
+    }
+    chmodSync(path, 0o600);
+  }
+
+  const atomicPrivateJson = (path, value) => {
+    const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    let fd;
     try {
-      rmSync(isolatedCodexHome, { recursive: true, force: true });
+      fd = openSync(tmp, "wx", 0o600);
+      writeFileSync(fd, `${JSON.stringify(value)}\n`, "utf8");
+      closeSync(fd);
+      fd = undefined;
+      renameSync(tmp, path);
+      chmodSync(path, 0o600);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logErr(`[mcp-agents] failed to clean isolated codex home: ${msg}`);
+      if (fd !== undefined) {
+        try { closeSync(fd); } catch {}
+      }
+      try { unlinkSync(tmp); } catch {}
+      throw err;
     }
   };
 
-  logErr(
-    `[mcp-agents] passthrough: codex ${args.join(" ")} ` +
-      `(model=${resolvedModel}, reasoning_effort=${resolvedModelReasoningEffort}, ` +
-      `sandbox_mode=${resolvedSandboxMode}, approval_policy=${resolvedApprovalPolicy}, ` +
-      `workspace_network_access=${resolvedWorkspaceNetworkAccess}, ` +
-      `fast_mode_opt_in=${fastModeEnabled}, ` +
-      `codex_version=${
-        codexVersion
-          ? `${codexVersion.major}.${codexVersion.minor}.${codexVersion.patch}`
-          : "unknown"
-      }, ` +
-      `subagent_gate=${
-        agentsEnabledKeySupported ? "agents_enabled" : "feature_flag_only"
-      }, ` +
-      `goal=${resolvedGoal && resolvedGoal.trim() ? "set" : "none"}, ` +
-      `idle_timeout_ms=${resolvedIdleTimeoutMs}, hard_timeout_ms=${resolvedHardTimeoutMs}, ` +
-      `isolated_home=true)`,
-  );
-
-  const child = spawn("codex", args, {
-    env: { ...process.env, CODEX_HOME: isolatedCodexHome },
-    // stdin is piped so we can strip per-call overrides; stdout is piped (not
-    // inherited) so the wrapper can both forward responses byte-for-byte AND
-    // observe them for the idle watchdog. detached:true puts codex in its own
-    // process group so a stall is torn down group-wide (mirrors runCli).
-    detached: true,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-
-  const NEWLINE = 0x0a;
-  // Clean the isolated home on any exit path, not just the ones we route through
-  // hardExit() (e.g. a global uncaughtException handler calling process.exit).
-  process.once("exit", () => cleanupIsolatedCodexHome());
-
-  // Install signal teardown IMMEDIATELY after spawn (before the heavier wiring
-  // below) so a signal in the startup window can never orphan the detached
-  // group. `finalize` is a forward reference — safe because the handler body
-  // only runs when a signal fires, which is after this synchronous setup
-  // completes and `finalize` is defined.
-  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
-    process.once(sig, () => {
-      finalize({
-        reason: `signal ${sig}`,
-        emit: false,
-        exitCode: 128 + SIGNAL_CODES[sig],
-      });
-    });
-  }
-
-  // ── Liveness / lifecycle state ──────────────────────────────────────────
-  let finalizing = false;
-  let exited = false;
-  let stdoutPaused = false; // process.stdout backpressured (downstream, not idle)
-  let lastForwardedByteWasNewline = true; // nothing forwarded yet
-  let stdoutObsBuf = Buffer.alloc(0); // observation copy of codex stdout
-  let skippingFrame = false; // mid-skip of an oversized stdout frame (resync at \n)
-  let droppedFrameResponseId; // partial oversized frame's classified id (cleared at its newline)
-  let observationDropLogged = false; // log the first observation-cap drop only
-
-  // ── Curated-schema rewrite and private-job frame filter ──────────────────
-  // While a `tools/list` request id or private job is outstanding the forwarder
-  // switches from raw passthrough to bounded frame buffering. It rewrites the
-  // advertised Codex inputs and suppresses private job responses/events, then
-  // returns to raw when no latch remains.
-  // Observation above stays the SOLE authority for inFlight/the watchdog; this
-  // path only changes HOW bytes reach the wire.
-  const pendingToolsListIds = new Set(); // idKey(id) of outstanding tools/list requests (the latch)
-  const suppressedResponseIds = new Set(); // late native responses already synthesized upstream
-  // Requests the wrapper stopped waiting for while codex was still working on
-  // them. The turn keeps running inside codex (it does not honour MCP
-  // cancellation promptly), so it can still write to the workspace long after
-  // the client gave up — the "zombie writer". Tracked purely for operator
-  // visibility: entries are logged on abandonment and again when the real
-  // response finally lands, so a stale tree can be explained rather than
-  // guessed at. Bounded by MAX_SUPPRESSED_CODEX_RESPONSES via the same ids.
-  const abandonedTurns = new Map(); // request key -> { threadId, jobId, at }
-  let rewriteBuf = Buffer.alloc(0); // buffer-mode accumulator; holds ≤1 trailing partial after a flush
-  let rewriteSkipUntilNewline = false; // forwarding raw to the next newline (oversized frame or mode-boundary align)
-  let rewriteSkipReleaseId; // idKey to release when the skipped frame's newline lands (oversized response only)
-  let rewriteDropUntilNewline = false; // discarding an oversized suppressed response through its delimiter
-  let rewriteDropReleaseId;
-  let oversizedToolsListLogged = false; // log the first rewrite-cap drop only
-  const generatedFrames = [];
-  const locallyHandledResponseIds = new Set();
-  const privateJobRequestIds = new Set();
-  // Foreground turns normally remain byte-for-byte passthrough. Their ids keep
-  // the existing bounded frame path active only until the terminal response so
-  // a typed Codex authentication failure can be replaced before it reaches the
-  // client. Every unrelated frame is still forwarded with its original bytes.
-  const foregroundTurnRequestIds = new Set();
-  let flushGeneratedFrames = () => {};
-
-  // ── In-flight request tracking ──────────────────────────────────────────
-  // Every request owns its own lifecycle and progress timers.
-  // JSON-RPC numeric `1` and string `"1"` remain distinct keys.
-  const inFlight = new Map();
-  const serverRequestParents = new Map();
+  let appGeneration = 0;
+  let app;
+  let appStarting;
+  let innerRequestSequence = 0;
+  let shuttingDown = false;
+  let keepAlive;
+  let ownerHeartbeat;
+  let bridgeStateEnabled = true;
+  let retentionTimer;
+  let retentionStartupTimer;
+  let retentionRunning;
+  let codexAuthInvalidated = false;
+  const activeTurns = new Map();
+  const activeTurnsByThread = new Map();
+  const provisionalTurns = new Map();
+  const completedBeforeRegistration = new Map();
+  const threadWorkspaces = new Map();
   const jobs = new Map();
-  const jobsByNativeRequest = new Map();
-  const threadWorkspaces = new Map(); // threadId -> { cwd, sandbox } from the opening `codex` call
-  // LRU, not FIFO. Map iteration order is insertion order, so evicting the first key
-  // without refreshing on use throws out the long-lived thread you keep replying to
-  // before idle newer ones — exactly backwards for the case this map exists to serve.
+  const interactions = new Map();
+
+  const appError = (code, message, extra = {}) => {
+    const error = new Error(message);
+    error.codexCode = code;
+    Object.assign(error, extra);
+    return error;
+  };
+  const toolResult = (text, structuredContent = {}, { isError = false } = {}) => ({
+    content: [{ type: "text", text }],
+    structuredContent,
+    ...(isError ? { isError: true } : {}),
+  });
+  const errorResult = (code, message, extra = {}) => toolResult(
+    `mcp-agents: ${message}`,
+    { code, message, ...extra },
+    { isError: true },
+  );
+  const authFailureResult = (threadId) => errorResult(
+    CODEX_AUTH_FAILURE_CODE,
+    CODEX_AUTH_FAILURE_MESSAGE,
+    {
+      action: CODEX_AUTH_FAILURE_ACTION,
+      ...(threadId ? { threadId } : {}),
+    },
+  );
+  const codePointLength = (value) => Array.from(value ?? "").length;
+  const pageByCodePoint = (value, offset, limit = MAX_CODEX_PAGE_CODEPOINTS) => {
+    const points = Array.from(value ?? "");
+    const text = points.slice(offset, offset + limit).join("");
+    return { text, nextOffset: offset + codePointLength(text), endOffset: points.length };
+  };
+  const boundedText = (value, max = MAX_CODEX_PROGRESS_CODEPOINTS) =>
+    Array.from(typeof value === "string" ? value.replace(/\s+/gu, " ").trim() : "")
+      .slice(0, max)
+      .join("");
+  const isUncertainMutationError = (err) =>
+    err?.codexCode === "codex_outcome_unknown" || err?.mutationOutcomeUnknown === true;
+  const pathsOverlap = (left, right) => {
+    const leftToRight = relative(left, right);
+    const rightToLeft = relative(right, left);
+    const contains = (value) => value === "" ||
+      (!value.startsWith("..") && !isAbsolute(value));
+    return contains(leftToRight) || contains(rightToLeft);
+  };
+  const assertWorkspaceOutsideState = (cwd) => {
+    if (!cwd) return;
+    const lexicalCwd = resolve(cwd);
+    let canonicalCwd = lexicalCwd;
+    try { canonicalCwd = realpathSync(lexicalCwd); } catch {}
+    if (
+      pathsOverlap(lexicalCwd, canonicalStateBase) ||
+      pathsOverlap(canonicalCwd, canonicalStateBase)
+    ) {
+      throw appError(
+        "codex_workspace_state_overlap",
+        "Codex workspace must not overlap the bridge's private state root",
+      );
+    }
+  };
+
+  const activeTurnsPath = join(bridgeDir, "active-turns.json");
+  const ownerPath = join(bridgeDir, "owner.json");
+  const writeBridgeState = () => {
+    if (!bridgeStateEnabled) return false;
+    const updatedAt = new Date().toISOString();
+    const currentApp = app?.alive ? app : undefined;
+    const turns = [
+      ...provisionalTurns.values(),
+      ...activeTurns.values(),
+    ].map((turn) => ({
+      threadId: turn.threadId ?? null,
+      turnId: turn.turnId ?? null,
+      cwd: turn.cwd ?? null,
+      sandbox: turn.sandbox ?? null,
+      state: turn.state,
+      startedAt: turn.startedAt,
+      updatedAt: turn.updatedAt,
+      rolloutPath: turn.rolloutPath ?? null,
+    }));
+    try {
+      atomicPrivateJson(ownerPath, {
+        version: 1,
+        bridgeId,
+        pid: process.pid,
+        startedAt: bridgeStartedAt,
+        updatedAt,
+        projectCwd: canonicalProjectCwd,
+        childPid: currentApp?.child.pid ?? null,
+        generation: currentApp?.generation ?? appGeneration,
+      });
+      atomicPrivateJson(activeTurnsPath, {
+        version: 1,
+        bridgeId,
+        bridgePid: process.pid,
+        childPid: currentApp?.child.pid ?? null,
+        generation: currentApp?.generation ?? appGeneration,
+        projectCwd: canonicalProjectCwd,
+        updatedAt,
+        turns,
+      });
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logErr(`[mcp-agents] failed to write Codex liveness state: ${message}`);
+      return false;
+    }
+  };
+  writeBridgeState();
+  ownerHeartbeat = setInterval(writeBridgeState, 30_000);
+  ownerHeartbeat.unref();
+
+  const beginProvisionalTurn = ({
+    generationState,
+    threadId,
+    cwd,
+    sandbox,
+    requestId,
+    jobId,
+    tool = "codex",
+    cwdInferred = false,
+    deadlineAt,
+  }) => {
+    const now = new Date().toISOString();
+    const provisional = {
+      provisionalId: randomUUID(),
+      generation: generationState.generation,
+      threadId: threadId ?? null,
+      turnId: null,
+      cwd: cwd ?? null,
+      sandbox: sandbox ?? null,
+      requestId,
+      jobId,
+      tool,
+      cwdInferred,
+      state: "starting",
+      startedAt: now,
+      updatedAt: now,
+      lastActivityAt: Date.now(),
+      hardDeadlineAt: deadlineAt,
+      rolloutPath: null,
+    };
+    provisionalTurns.set(provisional.provisionalId, provisional);
+    provisional.persisted = writeBridgeState();
+    if (!provisional.persisted) provisionalTurns.delete(provisional.provisionalId);
+    return provisional;
+  };
+  const updateProvisionalTurn = (provisional, changes) => {
+    if (!provisionalTurns.has(provisional?.provisionalId)) return;
+    Object.assign(provisional, changes, {
+      updatedAt: new Date().toISOString(),
+      lastActivityAt: Date.now(),
+    });
+    writeBridgeState();
+  };
+  const forgetProvisionalTurn = (provisional) => {
+    if (!provisional) return;
+    provisionalTurns.delete(provisional.provisionalId);
+    writeBridgeState();
+  };
+
+  const rememberThreadWorkspace = (threadId, cwd, sandbox) => {
+    if (!threadId || !cwd) return;
+    threadWorkspaces.delete(threadId);
+    threadWorkspaces.set(threadId, { cwd, sandbox });
+    while (threadWorkspaces.size > MAX_REMEMBERED_CODEX_THREAD_WORKSPACES) {
+      threadWorkspaces.delete(threadWorkspaces.keys().next().value);
+    }
+  };
   const lookupThreadWorkspace = (threadId) => {
-    if (!threadId) return undefined;
     const found = threadWorkspaces.get(threadId);
     if (!found) return undefined;
     threadWorkspaces.delete(threadId);
     threadWorkspaces.set(threadId, found);
     return found;
   };
-  const rememberThreadWorkspace = (threadId, cwd, sandbox) => {
-    if (!threadId || !cwd) return;
-    if (threadWorkspaces.has(threadId)) {
-      lookupThreadWorkspace(threadId);
-      return;
-    }
-    threadWorkspaces.set(threadId, { cwd, sandbox });
-    while (threadWorkspaces.size > MAX_REMEMBERED_CODEX_THREAD_WORKSPACES) {
-      threadWorkspaces.delete(threadWorkspaces.keys().next().value);
-    }
-  };
-  const privateRequestPrefix = process.env.MCP_AGENTS_TEST_PRIVATE_PREFIX ??
-    `mcp-agents/job/${randomUUID()}/`;
-  let privateRequestSequence = 0;
-  let authFailureLogged = false;
-  const authFailureToolResult = (threadId) => ({
-    content: [{ type: "text", text: CODEX_AUTH_FAILURE_MESSAGE }],
-    structuredContent: {
-      code: CODEX_AUTH_FAILURE_CODE,
-      action: CODEX_AUTH_FAILURE_ACTION,
-      content: CODEX_AUTH_FAILURE_MESSAGE,
-      ...(threadId ? { threadId } : {}),
-    },
-    isError: true,
-  });
-  const hasAuthInvalidationMarker = (value) => {
-    if (typeof value !== "string") return false;
-    const normalized = value.toLowerCase();
-    return normalized.includes("refresh_token_invalidated") ||
-      normalized.includes("refresh token was revoked") ||
-      normalized.includes("refresh token has been revoked") ||
-      normalized.includes("authentication token has been invalidated");
-  };
-  const isTypedCodexAuthFailure = (msg) =>
-    msg?.method === "codex/event" &&
-    msg.params?.msg?.type === "error" &&
-    msg.params.msg.codex_error_info === "unauthorized";
-  const isKnownCodexTurnKey = (key) =>
-    key !== undefined &&
-    (foregroundTurnRequestIds.has(key) || jobsByNativeRequest.has(key) ||
-      suppressedResponseIds.has(key));
-  const isCodexAuthFailureResult = (msg) => {
-    if (msg?.result?.isError !== true) return false;
-    const texts = [
-      msg.result.structuredContent?.content,
-      ...(Array.isArray(msg.result.content)
-        ? msg.result.content
-          .filter((part) => part?.type === "text")
-          .map((part) => part.text)
-        : []),
-    ];
-    return texts.some(hasAuthInvalidationMarker);
-  };
-  const markCodexAuthInvalidated = (entry) => {
-    codexAuthInvalidated = true;
-    if (entry) entry.codexAuthInvalidated = true;
-    if (authFailureLogged) return;
-    authFailureLogged = true;
-    logErr(
-      `[mcp-agents] ${CODEX_AUTH_FAILURE_CODE}: Codex rejected this process's ` +
-        "cached authentication; reauthenticate, then restart or reconnect the bridge",
-    );
-  };
-  const rememberLocallyHandledResponse = (requestKey) => {
-    locallyHandledResponseIds.add(requestKey);
-    if (locallyHandledResponseIds.size > MAX_SUPPRESSED_CODEX_RESPONSES) {
-      locallyHandledResponseIds.delete(locallyHandledResponseIds.values().next().value);
+
+  const processExists = (pid) => {
+    if (!Number.isInteger(pid) || pid <= 0) return undefined;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      if (err?.code === "ESRCH") return false;
+      return undefined;
     }
   };
-  const clearTimer = (entry, name) => {
-    if (!entry?.[name]) return;
-    clearTimeout(entry[name]);
-    entry[name] = undefined;
-  };
-  const clearEntryTimers = (entry) => {
-    for (const name of [
-      "idleTimer",
-      "hardTimer",
-      "terminalTimer",
-      "cancelTimer",
-      "abortEscalationTimer",
-      "progressFlushTimer",
-      "waitTimer",
-      "localWaitTimer",
-    ]) {
-      clearTimer(entry, name);
-    }
-  };
-  const dropQueuedFrames = (requestKey, kind) => {
-    for (let index = generatedFrames.length - 1; index >= 0; index -= 1) {
-      const frame = generatedFrames[index];
-      if (frame.kind === kind && frame.requestKey === requestKey) {
-        generatedFrames.splice(index, 1);
+  const acquireLeaseTakeoverClaim = (leasePath) => {
+    const claimPath = `${leasePath}.takeover`;
+    const claimOwnerPath = join(claimPath, "owner.json");
+    const token = randomUUID();
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        mkdirSync(claimPath, { mode: 0o700 });
+        try {
+          atomicPrivateJson(claimOwnerPath, {
+            version: 1,
+            bridgeId,
+            pid: process.pid,
+            token,
+            createdAt: new Date().toISOString(),
+          });
+        } catch (err) {
+          try { rmSync(claimPath, { recursive: true, force: true }); } catch {}
+          throw err;
+        }
+        return () => {
+          try {
+            const owner = JSON.parse(readFileSync(claimOwnerPath, "utf8"));
+            if (
+              owner.bridgeId === bridgeId && owner.pid === process.pid &&
+              owner.token === token
+            ) rmSync(claimPath, { recursive: true, force: true });
+          } catch {}
+        };
+      } catch (err) {
+        if (err?.code !== "EEXIST") throw err;
+      }
+      try {
+        const owner = JSON.parse(readFileSync(claimOwnerPath, "utf8"));
+        if (processExists(owner.pid) !== false) {
+          throw appError(
+            "codex_thread_busy",
+            "Another live or uncertain bridge is changing this thread lease",
+          );
+        }
+        if (typeof owner.token !== "string" || !/^[0-9a-f-]{16,}$/iu.test(owner.token)) {
+          throw appError(
+            "codex_thread_busy",
+            "The thread lease takeover claim is malformed",
+          );
+        }
+        // Keep the token-specific tombstone permanently. Besides providing an
+        // audit trail, the non-empty directory makes a delayed contender's
+        // rename fail instead of moving a replacement claim out of the way.
+        renameSync(claimPath, `${claimPath}.stale-${owner.token}`);
+      } catch (err) {
+        if (err?.codexCode) throw err;
+        if (!["ENOENT", "EEXIST", "ENOTEMPTY"].includes(err?.code)) throw err;
       }
     }
-    // A cancellation-driven drop can empty the queue without a flush. Reset the
-    // delivery backstop here too, so the next stuck frame gets its OWN full grace
-    // window rather than inheriting this now-stale timer's remaining time.
-    if (generatedFrames.length === 0) clearFlushStallGuard();
+    throw appError("codex_thread_busy", "The thread lease takeover is busy");
   };
-  const dropQueuedProgress = (requestKey) =>
-    dropQueuedFrames(requestKey, "progress");
-  const dropQueuedLocalResponse = (requestKey) =>
-    dropQueuedFrames(requestKey, "local_response");
-  const stopEntryProgress = (entry) => {
+  const acquireThreadLease = (threadId, operation) => {
+    const leaseName = createHash("sha256").update(threadId).digest("hex");
+    const path = join(durableLeases, `${leaseName}.json`);
+    const leaseId = randomUUID();
+    const payload = {
+      version: 1,
+      leaseId,
+      bridgeId,
+      pid: process.pid,
+      threadId,
+      operation,
+      createdAt: new Date().toISOString(),
+    };
+    const releaseTakeoverClaim = acquireLeaseTakeoverClaim(path);
+    try {
+      let fd;
+      try {
+        fd = openSync(path, "wx", 0o600);
+        writeFileSync(fd, `${JSON.stringify(payload)}\n`, "utf8");
+        closeSync(fd);
+        fd = undefined;
+        return () => {
+          try {
+            const current = JSON.parse(readFileSync(path, "utf8"));
+            if (
+              current.bridgeId === bridgeId && current.pid === process.pid &&
+              current.leaseId === leaseId
+            ) {
+              unlinkSync(path);
+            }
+          } catch {}
+        };
+      } catch (err) {
+        if (fd !== undefined) {
+          try { closeSync(fd); } catch {}
+        }
+        if (err?.code !== "EEXIST") throw err;
+        try {
+          const beforeStat = lstatSync(path);
+          if (!beforeStat.isFile() || beforeStat.isSymbolicLink()) {
+            throw appError(
+              "codex_thread_busy",
+              `Codex thread ${threadId} has an unsafe ownership lease`,
+            );
+          }
+          const beforeRaw = readFileSync(path, "utf8");
+          const current = JSON.parse(beforeRaw);
+          const alive = processExists(current.pid);
+          if (alive !== false) {
+            throw appError(
+              "codex_thread_busy",
+              `Codex thread ${threadId} is owned by another live or uncertain bridge`,
+            );
+          }
+          if (staleLeaseDelayMs > 0) {
+            Atomics.wait(
+              new Int32Array(new SharedArrayBuffer(4)),
+              0,
+              0,
+              Math.min(staleLeaseDelayMs, 1_000),
+            );
+          }
+          const afterStat = lstatSync(path);
+          const afterRaw = readFileSync(path, "utf8");
+          if (
+            beforeStat.dev !== afterStat.dev || beforeStat.ino !== afterStat.ino ||
+            beforeRaw !== afterRaw
+          ) {
+            throw appError(
+              "codex_thread_busy",
+              `Codex thread ${threadId} ownership changed during stale takeover`,
+            );
+          }
+          unlinkSync(path);
+          fd = openSync(path, "wx", 0o600);
+          writeFileSync(fd, `${JSON.stringify(payload)}\n`, "utf8");
+          closeSync(fd);
+          fd = undefined;
+          return () => {
+            try {
+              const owned = JSON.parse(readFileSync(path, "utf8"));
+              if (
+                owned.bridgeId === bridgeId && owned.pid === process.pid &&
+                owned.leaseId === leaseId
+              ) unlinkSync(path);
+            } catch {}
+          };
+        } catch (readErr) {
+          if (fd !== undefined) {
+            try { closeSync(fd); } catch {}
+          }
+          if (readErr?.codexCode) throw readErr;
+          throw appError(
+            "codex_thread_busy",
+            `Codex thread ${threadId} has an unreadable ownership lease`,
+          );
+        }
+      }
+    } finally {
+      releaseTakeoverClaim();
+    }
+  };
+
+  const killChildGroup = (child, signal = "SIGKILL") => {
+    if (!child?.pid) return;
+    try { process.kill(-child.pid, signal); } catch {
+      try { child.kill(signal); } catch {}
+    }
+  };
+  const takeEarlyCompletion = (turnId) => {
+    const entry = completedBeforeRegistration.get(turnId);
     if (!entry) return;
-    clearTimer(entry, "progressFlushTimer");
-    clearTimer(entry, "waitTimer");
-    entry.pendingProgressMessage = undefined;
-    entry.commentaryItemIds?.clear();
-    entry.commentaryBuffers?.clear();
-    dropQueuedProgress(idKey(entry.id));
-  };
-  const clearAllEntryTimers = () => {
-    for (const entry of inFlight.values()) clearEntryTimers(entry);
-  };
-  const stopAllEntryProgress = () => {
-    for (const entry of inFlight.values()) stopEntryProgress(entry);
-  };
-  const settleInFlight = (id) => {
-    if (id == null) return undefined;
-    const key = idKey(id);
-    const entry = inFlight.get(key);
-    if (!entry) return undefined;
-    clearEntryTimers(entry);
-    stopEntryProgress(entry);
-    if (process.env.MCP_AGENTS_TEST_TIMER_AUDIT === "1") {
-      const liveTimerCount = Object.entries(entry).filter(
-        ([name, timer]) => name.endsWith("Timer") && timer != null,
-      ).length;
-      logErr(`[mcp-agents:test] settled timer count=${liveTimerCount}`);
-    }
-    inFlight.delete(key);
-    pendingToolsListIds.delete(key);
-    foregroundTurnRequestIds.delete(key);
-    for (const [serverRequestKey, parentKey] of serverRequestParents) {
-      if (parentKey === key) serverRequestParents.delete(serverRequestKey);
-    }
+    clearTimeout(entry.timer);
+    completedBeforeRegistration.delete(turnId);
     return entry;
   };
-  const armEntryIdle = (entry) => {
-    clearTimer(entry, "idleTimer");
-    if (
-      !(resolvedIdleTimeoutMs > 0) || finalizing || stdoutPaused ||
-      entry.state !== "open"
-    ) return;
-    entry.idleTimer = setTimeout(() => {
-      if (finalizing || inFlight.get(idKey(entry.id)) !== entry) return;
-      // A per-request idle timeout aborts ONLY this request — it must NOT tear
-      // down the whole bridge, which would close the stdio transport and make
-      // the client permanently unregister every codex tool.
-      abortRequestNoTeardown(
-        entry,
-        `request idle timeout (${Math.round(resolvedIdleTimeoutMs / 1000)}s)`,
-      );
-    }, resolvedIdleTimeoutMs);
-  };
-  const armEntryHard = (entry) => {
-    if (!(resolvedHardTimeoutMs > 0)) return;
-    entry.hardTimer = setTimeout(() => {
-      if (finalizing || inFlight.get(idKey(entry.id)) !== entry) return;
-      const label =
-        `request hard timeout (${Math.round(resolvedHardTimeoutMs / 1000)}s)`;
-      if (entry.state === "open") {
-        // Bound the single request, keep the transport (defer/escalate if needed).
-        abortRequestNoTeardown(entry, label);
-        return;
-      }
-      // The immutable hard deadline must ALWAYS bound the request. Unlike
-      // idleTimer, beginTerminalGrace deliberately does NOT clear hardTimer, so
-      // this can fire while the entry sits in terminal_grace (its terminalTimer
-      // not yet run, or its synthesizeTerminalResult deferred on a mid-frame
-      // stall). Try the safe, no-teardown settlement FIRST — synthesizeTerminalResult
-      // settles an internalJob unconditionally and a normal entry when framing is
-      // clean; only a genuinely wedged mid-frame entry stays in_flight afterward.
-      // Fall back to a bounded teardown ONLY for that residue, rather than tearing
-      // the whole bridge down for a request that could have been answered safely.
-      if (entry.state === "terminal_grace") {
-        synthesizeTerminalResult(entry, entry.terminalOutcome);
-        if (finalizing || inFlight.get(idKey(entry.id)) !== entry) return;
-      }
-      finalize({
-        reason: `${label} while state=${entry.state}`,
-        emit: true,
-        exitCode: 1,
-      });
-    }, resolvedHardTimeoutMs);
-  };
-  const addInFlight = (msg) => {
-    if (msg.id == null) return true;
-    const key = idKey(msg.id);
-    // Once an id is legitimately reused, a later cancellation belongs to the
-    // new request rather than the earlier locally answered one.
-    locallyHandledResponseIds.delete(key);
-    if (inFlight.has(key) || suppressedResponseIds.has(key)) {
-      const entry = inFlight.get(key) ?? {
-        id: msg.id,
-        method: msg.method,
-        toolName: msg.method === "tools/call" ? msg.params?.name : undefined,
-        threadId: undefined,
-      };
-      clearEntryTimers(entry);
-      entry.state = "open";
-      inFlight.set(key, entry);
-      finalize({
-        reason:
-          `request id ${JSON.stringify(msg.id)} was reused before the prior ` +
-          `Codex response settled`,
-        emit: true,
-        exitCode: 1,
-      });
-      return false;
+  const clearEarlyCompletions = () => {
+    for (const entry of completedBeforeRegistration.values()) {
+      clearTimeout(entry.timer);
     }
-    const suppliedProgressToken = msg.params?._meta?.progressToken;
-    const progressToken =
-      typeof suppliedProgressToken === "string" ||
-      (typeof suppliedProgressToken === "number" && Number.isFinite(suppliedProgressToken))
-        ? suppliedProgressToken
-        : undefined;
-    // Workspace identity for codex-peek. `codex`/`codex-start` carry cwd + sandbox
-    // as required arguments; `codex-reply`/`codex-reply-start` carry neither, so a
-    // reply's workspace is recovered from the thread it continues and flagged as
-    // inferred rather than asserted.
-    // Harvest ONLY from a call that is itself a turn. codex-peek takes cwd/threadId/
-    // requestId as FILTERS, and recording those as the request's own identity would
-    // make a peek entry claim to be a turn on that thread in that workspace.
-    const isTurnCall = msg.method === "tools/call" &&
-      Boolean(CODEX_TOOL_CONTRACTS[msg.params?.name] ?? CODEX_JOB_TOOL_CONTRACTS[msg.params?.name]);
-    const callArgs = isTurnCall ? msg.params?.arguments : undefined;
-    const suppliedCwd = typeof callArgs?.cwd === "string" ? callArgs.cwd : undefined;
-    const suppliedSandbox = typeof callArgs?.sandbox === "string" ? callArgs.sandbox : undefined;
-    const repliedThreadId = typeof callArgs?.threadId === "string" ? callArgs.threadId : undefined;
-    const inheritedWorkspace = suppliedCwd ? undefined : lookupThreadWorkspace(repliedThreadId);
-    const entry = {
-      id: msg.id,
-      method: msg.method,
-      toolName: msg.method === "tools/call" ? msg.params?.name : undefined,
-      progressToken,
-      threadId: repliedThreadId,
-      cwd: suppliedCwd ?? inheritedWorkspace?.cwd,
-      sandbox: suppliedSandbox ?? inheritedWorkspace?.sandbox,
-      cwdInferred: !suppliedCwd && Boolean(inheritedWorkspace),
-      state: "open",
-      lastAgentMessage: undefined,
-      terminalEventType: undefined,
-      terminalEventObservedAt: undefined,
-      terminalOutcome: undefined,
-      progressSequence: 0,
-      startedAt: Date.now(),
-      lastActivityAt: Date.now(),
-      lastProgressQueuedAt: undefined,
-      lastProgressDeliveredAt: undefined,
-      lastWaitAttemptAt: undefined,
-      lastProgressMessage: undefined,
-      pendingProgressMessage: undefined,
-      hasUsefulProgress: false,
-      commentaryItemIds: new Set(),
-      commentaryBuffers: new Map(),
-      fallbackReady: false,
-      timeoutPending: undefined,
-      nativeCancelSent: false,
-      suppressedNativeResponseSeen: false,
-      confirmedCancelGraceEscalated: false,
-      confirmedCancelPending: false,
-    };
-    inFlight.set(key, entry);
-    armEntryIdle(entry);
-    armEntryHard(entry);
-    armProgressWait(entry);
-    return true;
+    completedBeforeRegistration.clear();
   };
-  const hasEmittableInFlight = () => {
-    for (const entry of inFlight.values()) {
-      if (!entry.internalJob && entry.state !== "canceled") return true;
+  const rememberEarlyCompletion = (generationState, turnId, params) => {
+    const existing = takeEarlyCompletion(turnId);
+    if (!existing && completedBeforeRegistration.size >= MAX_EARLY_CODEX_COMPLETIONS) {
+      logErr(
+        "[mcp-agents] Codex App Server emitted too many unmatched turn completions; " +
+          "terminating the generation",
+      );
+      killChildGroup(generationState.child);
+      onGenerationGone(
+        generationState,
+        "was terminated after emitting too many unmatched turn completions",
+      );
+      return;
+    }
+    const entry = {
+      generation: generationState.generation,
+      params,
+      timer: undefined,
+    };
+    entry.timer = setTimeout(() => {
+      if (completedBeforeRegistration.get(turnId) === entry) {
+        completedBeforeRegistration.delete(turnId);
+      }
+    }, earlyCompletionTtlMs);
+    entry.timer.unref?.();
+    completedBeforeRegistration.set(turnId, entry);
+  };
+  const writeAppMessage = (generationState, message) => {
+    if (!generationState?.alive || app !== generationState) {
+      throw appError("codex_app_server_unavailable", "Codex App Server is unavailable");
+    }
+    generationState.child.stdin.write(`${JSON.stringify(message)}\n`);
+  };
+  const respondToApp = (generationState, id, result, error) => {
+    if (!generationState?.alive || app !== generationState) return;
+    try {
+      writeAppMessage(generationState, error ? { id, error } : { id, result });
+    } catch {}
+  };
+  const requestApp = (
+    generationState,
+    method,
+    params = {},
+    timeoutMs = 30_000,
+    { mutating = false, onOutcomeUnknown, signal, deadlineAt } = {},
+  ) => {
+    if (!generationState?.alive || app !== generationState) {
+      return Promise.reject(appError(
+        "codex_app_server_unavailable",
+        "Codex App Server is unavailable",
+      ));
+    }
+    const remainingMs = deadlineAt === undefined ? Infinity : deadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      return Promise.reject(appError(
+        "codex_hard_timeout",
+        "Codex call exceeded its hard deadline before the next native request",
+      ));
+    }
+    const effectiveTimeoutMs = Math.max(1, Math.min(timeoutMs, remainingMs));
+    const deadlineLimited = Number.isFinite(remainingMs) && remainingMs <= timeoutMs;
+    const id = ++innerRequestSequence;
+    return new Promise((resolveRequest, rejectRequest) => {
+      const detachAbort = (pending) => {
+        if (pending?.abortListener) {
+          signal?.removeEventListener("abort", pending.abortListener);
+          pending.abortListener = undefined;
+        }
+      };
+      const timer = setTimeout(() => {
+        const pending = generationState.pending.get(id);
+        if (!pending) return;
+        if (pending.mutating && pending.dispatched) {
+          pending.outcomeUnknown = true;
+          try { pending.onOutcomeUnknown?.(); } catch {}
+          logErr(
+            `[mcp-agents] ${method} timed out after dispatch; ` +
+              "terminating its App Server generation before releasing ownership",
+          );
+          generationState.pending.delete(id);
+          detachAbort(pending);
+          const error = appError(
+            "codex_outcome_unknown",
+            `Codex App Server did not answer ${method}; its outcome is unknown and it was not replayed`,
+          );
+          error.mutationOutcomeUnknown = true;
+          rejectRequest(error);
+          killChildGroup(generationState.child);
+          onGenerationGone(
+            generationState,
+            `was terminated after ${method} exceeded its response deadline`,
+          );
+          return;
+        }
+        generationState.pending.delete(id);
+        detachAbort(pending);
+        rejectRequest(appError(
+          deadlineLimited ? "codex_hard_timeout" : "codex_app_server_timeout",
+          deadlineLimited
+            ? `Codex call exceeded its hard deadline while waiting for ${method}`
+            : `Codex App Server did not answer ${method} within ${effectiveTimeoutMs}ms`,
+        ));
+      }, effectiveTimeoutMs);
+      const pending = {
+        generation: generationState.generation,
+        method,
+        mutating,
+        dispatched: false,
+        outcomeUnknown: false,
+        onOutcomeUnknown,
+        resolve: resolveRequest,
+        reject: rejectRequest,
+        timer,
+      };
+      pending.detachAbort = () => detachAbort(pending);
+      const onAbort = () => {
+        if (pending.canceled || !generationState.pending.has(id)) return;
+        pending.canceled = true;
+        clearTimeout(pending.timer);
+        if (pending.mutating && pending.dispatched) {
+          pending.outcomeUnknown = true;
+          try { pending.onOutcomeUnknown?.(); } catch {}
+        }
+        const remainingGrace = deadlineAt === undefined
+          ? cancelGraceMs
+          : Math.max(0, deadlineAt - Date.now());
+        pending.cancelTimer = setTimeout(() => {
+          if (generationState.pending.get(id) !== pending) return;
+          generationState.pending.delete(id);
+          detachAbort(pending);
+          const error = appError(
+            "codex_turn_interrupted",
+            `Codex call was canceled while waiting for ${method}`,
+          );
+          if (pending.outcomeUnknown) error.mutationOutcomeUnknown = true;
+          rejectRequest(error);
+        }, Math.min(cancelGraceMs, remainingGrace));
+      };
+      pending.abortListener = onAbort;
+      generationState.pending.set(id, pending);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+      try {
+        if (pending.canceled) return;
+        writeAppMessage(generationState, { id, method, params });
+        if (generationState.pending.get(id) === pending) pending.dispatched = true;
+      } catch (err) {
+        clearTimeout(timer);
+        generationState.pending.delete(id);
+        detachAbort(pending);
+        rejectRequest(err);
+      }
+    });
+  };
+
+  const anotherBridgeMayBeLive = () => {
+    let names;
+    try { names = readdirSync(durableBridges); } catch { return true; }
+    for (const name of names) {
+      if (name === bridgeId) continue;
+      const candidate = join(durableBridges, name);
+      try {
+        const candidateStat = lstatSync(candidate);
+        if (!candidateStat.isDirectory() || candidateStat.isSymbolicLink()) return true;
+        const owner = JSON.parse(readFileSync(join(candidate, "owner.json"), "utf8"));
+        const alive = processExists(owner.pid);
+        if (alive !== false) return true;
+        rmSync(candidate, { recursive: true, force: true });
+      } catch {
+        return true;
+      }
     }
     return false;
   };
-  const canArmResponseSuppression = () =>
-    lastForwardedByteWasNewline && rewriteBuf.length === 0 &&
-    !rewriteSkipUntilNewline && !rewriteDropUntilNewline;
-  const canInjectGeneratedFrame = () =>
-    !stdoutPaused && canArmResponseSuppression();
-  // Session-level delivery backstop. Suppressing a request id (per-call timeout,
-  // terminal-grace fallback, or cancel) latches buffer mode for the WHOLE stream;
-  // if codex then leaves a native frame unterminated and neither completes it nor
-  // exits, canInjectGeneratedFrame() stays false forever and EVERY queued
-  // generated frame (local tool responses, other requests' aborts) is blocked —
-  // a whole-bridge hang no per-request timer covers once its entry has settled.
-  // Armed when a frame cannot flush; on fire, escalate to a bounded teardown ONLY
-  // if still wedged on FRAMING (not mere client backpressure, which resolves on
-  // drain/EPIPE); otherwise disarm or re-arm while frames remain queued.
-  let flushStallTimer;
-  const clearFlushStallGuard = () => {
-    if (!flushStallTimer) return;
-    clearTimeout(flushStallTimer);
-    flushStallTimer = undefined;
-  };
-  const armFlushStallGuard = () => {
-    if (flushStallTimer || finalizing || flushStallLimitMs <= 0) return;
-    flushStallTimer = setTimeout(() => {
-      flushStallTimer = undefined;
-      if (finalizing || generatedFrames.length === 0) return;
-      if (!stdoutPaused && !canInjectGeneratedFrame()) {
-        finalize({
-          reason:
-            `generated frames undeliverable for ${flushStallLimitMs}ms ` +
-            `(codex left a native frame unterminated)`,
-          emit: true,
-          exitCode: 1,
-        });
-        return;
+  const retentionJournalPath = join(durableRoot, "retention-journal.json");
+  const validRetentionJournal = (record) =>
+    record && typeof record === "object" && !Array.isArray(record) &&
+    record.version === 1 && typeof record.threadId === "string" &&
+    record.threadId.trim().length > 0 && typeof record.archived === "boolean" &&
+    ["idle", "notLoaded"].includes(record.status?.type) &&
+    (record.phase === undefined ||
+      ["selected", "goalCleared", "deleteDispatched"].includes(record.phase)) &&
+    typeof record.startedAt === "string";
+  const isNativeThreadNotFound = (err) =>
+    [-32600, -32602].includes(err?.appServerCode) &&
+    (/^thread not found:/iu.test(err.message ?? "") ||
+      /^no rollout found for thread id /iu.test(err.message ?? ""));
+  const deleteExpiredThread = async (generationState, record) => {
+    const { threadId } = record;
+    if (
+      !threadId || activeTurnsByThread.has(threadId) ||
+      !["idle", "notLoaded"].includes(record.status?.type)
+    ) return false;
+    let release;
+    let provisional;
+    try {
+      release = acquireThreadLease(threadId, "retention");
+      provisional = beginProvisionalTurn({
+        generationState,
+        threadId,
+        tool: "codex-retention",
+      });
+      const journal = {
+        version: 1,
+        bridgeId,
+        threadId,
+        archived: Boolean(record.archived),
+        status: record.status,
+        phase: record.phase ?? "selected",
+        startedAt: new Date().toISOString(),
+      };
+      atomicPrivateJson(retentionJournalPath, journal);
+      if (goalStoreCompatible && journal.phase === "selected") {
+        try {
+          await requestApp(
+            generationState,
+            "thread/goal/clear",
+            { threadId },
+            appMutationTimeoutMs,
+            mutationOptions(provisional),
+          );
+        } catch (err) {
+          if (!isNativeThreadNotFound(err)) throw err;
+        }
+        journal.phase = "goalCleared";
+        atomicPrivateJson(retentionJournalPath, journal);
       }
-      armFlushStallGuard(); // still queued but backpressured/flushable — wait more
-    }, flushStallLimitMs);
-    flushStallTimer.unref?.();
-  };
-  const queueGeneratedFrame = (frame, { requestKey, kind } = {}) => {
-    const queued = {
-      buffer: Buffer.from(`${JSON.stringify(frame)}\n`, "utf8"),
-      requestKey,
-      kind,
-    };
-    if (kind === "progress") {
-      // Backpressure or a partial native frame can delay injection. Retain only
-      // the latest progress update for this request so silence cannot grow an
-      // unbounded side queue. Coalesce IN PLACE (replace the matching frame's
-      // buffer) rather than remove-then-push: a remove-then-push would transiently
-      // empty the queue and reset the flush-stall delivery backstop on every
-      // heartbeat, defeating it for a genuinely wedged request that keeps
-      // emitting progress. In-place replacement preserves the backstop's original
-      // arm time (how long the queue has actually been stuck).
-      const existing = generatedFrames.findIndex(
-        (f) => f.kind === "progress" && f.requestKey === requestKey,
+      journal.phase = "deleteDispatched";
+      atomicPrivateJson(retentionJournalPath, journal);
+      try {
+        await requestApp(
+          generationState,
+          "thread/delete",
+          { threadId },
+          appMutationTimeoutMs,
+          mutationOptions(provisional),
+        );
+      } catch (err) {
+        if (!isNativeThreadNotFound(err)) throw err;
+      }
+      try { unlinkSync(retentionJournalPath); } catch {}
+      logErr(`[mcp-agents] expired durable Codex thread ${threadId}`);
+      return true;
+    } catch (err) {
+      logErr(
+        `[mcp-agents] deferred Codex retention for ${threadId}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
       );
-      if (existing !== -1) {
-        generatedFrames[existing] = queued;
-        queueMicrotask(() => flushGeneratedFrames());
-        return;
+      return false;
+    } finally {
+      if (!provisional || provisional.state !== "outcome_unknown") {
+        forgetProvisionalTurn(provisional);
+        try { release?.(); } catch {}
       }
     }
-    generatedFrames.push(queued);
-    if (!canInjectGeneratedFrame()) armFlushStallGuard();
-    queueMicrotask(() => flushGeneratedFrames());
   };
-  const generatedFrameIsLive = (frame) => {
-    const entry = inFlight.get(frame.requestKey);
-    if (frame.kind === "progress") {
-      return !finalizing && entry != null && entry.state === "open";
+  const runRetention = async (generationState) => {
+    if (
+      resolvedRetentionDays === 0 || shuttingDown ||
+      app !== generationState || !generationState.alive || anotherBridgeMayBeLive()
+    ) return;
+    const cutoffSeconds = Math.floor(
+      (Date.now() - resolvedRetentionDays * 24 * 60 * 60 * 1_000) / 1_000,
+    );
+    try {
+      if (existsSync(retentionJournalPath)) {
+        const journal = JSON.parse(readFileSync(retentionJournalPath, "utf8"));
+        if (!validRetentionJournal(journal)) {
+          throw new Error("invalid Codex retention journal schema");
+        }
+        await deleteExpiredThread(generationState, journal);
+        if (existsSync(retentionJournalPath)) return;
+      }
+    } catch {
+      logErr("[mcp-agents] malformed Codex retention journal; skipping retention");
+      return;
     }
-    if (frame.kind === "local_response") {
-      return entry != null && entry.state === "local_response";
+    for (const archived of [false, true]) {
+      let cursor;
+      let pages = 0;
+      do {
+        if (
+          shuttingDown || app !== generationState || !generationState.alive ||
+          anotherBridgeMayBeLive()
+        ) return;
+        const result = await requestApp(generationState, "thread/list", {
+          archived,
+          cursor,
+          limit: 100,
+          sourceKinds: ["appServer", "subAgentReview"],
+          useStateDbOnly: false,
+          sortKey: "recency_at",
+          sortDirection: "desc",
+        }, 60_000);
+        for (const thread of result?.data ?? []) {
+          const recency = thread.recencyAt ?? thread.updatedAt ?? thread.createdAt;
+          if (Number.isFinite(recency) && recency < cutoffSeconds) {
+            const deleted = await deleteExpiredThread(generationState, {
+              threadId: thread.id,
+              archived,
+              status: thread.status,
+            });
+            if (!deleted || existsSync(retentionJournalPath)) return;
+          }
+        }
+        cursor = result?.nextCursor ?? undefined;
+        pages += 1;
+      } while (cursor && pages < 100);
+    }
+  };
+  const scheduleRetention = (generationState) => {
+    if (resolvedRetentionDays === 0) return;
+    if (!retentionStartupTimer && !retentionRunning) {
+      retentionStartupTimer = setTimeout(() => {
+        retentionStartupTimer = undefined;
+        if (app !== generationState || !generationState.alive || retentionRunning) return;
+        retentionRunning = runRetention(generationState)
+          .catch((err) => logErr(
+            `[mcp-agents] Codex retention failed closed: ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          ))
+          .finally(() => { retentionRunning = undefined; });
+      }, retentionStartupMs);
+      retentionStartupTimer.unref();
+    }
+    if (!retentionTimer) {
+      retentionTimer = setInterval(() => {
+        if (app?.alive && !retentionRunning) {
+          retentionRunning = runRetention(app)
+            .catch((err) => logErr(
+              `[mcp-agents] Codex retention failed closed: ` +
+                `${err instanceof Error ? err.message : String(err)}`,
+            ))
+            .finally(() => { retentionRunning = undefined; });
+        }
+      }, 24 * 60 * 60 * 1_000);
+      retentionTimer.unref();
+    }
+  };
+
+  const resolveTurnProgressMessage = (item, phase = "started") => {
+    if (!item || typeof item !== "object") return undefined;
+    switch (item.type) {
+      case "commandExecution":
+        return phase === "completed" ? "command finished" : "running command";
+      case "fileChange":
+        return phase === "completed" ? "file changes finished" : "applying file changes";
+      case "plan":
+        return boundedText(item.text) || "updated plan";
+      case "collabAgentToolCall":
+      case "subAgentActivity":
+        return "native sub-agent activity";
+      case "webSearch":
+        return "searching the web";
+      case "contextCompaction":
+        return "compacting context";
+      default:
+        return undefined;
+    }
+  };
+  const appendJobCommentary = (job, value) => {
+    if (!job || typeof value !== "string" || !value) return;
+    job.commentary += value;
+    let bytes = Buffer.byteLength(job.commentary, "utf8");
+    if (bytes <= commentaryLimit) return;
+    const points = Array.from(job.commentary);
+    let removed = 0;
+    while (bytes > commentaryLimit && removed < points.length) {
+      bytes -= Buffer.byteLength(points[removed], "utf8");
+      removed += 1;
+    }
+    job.commentary = points.slice(removed).join("");
+    job.commentaryStartOffset += removed;
+  };
+  const scheduleProgress = (turn, message, commentary) => {
+    turn.updatedAt = new Date().toISOString();
+    turn.lastActivityAt = Date.now();
+    if (turn.idleTimer && resolvedIdleMs > 0) clearTimeout(turn.idleTimer);
+    if (resolvedIdleMs > 0 && turn.state === "active") {
+      turn.idleTimer = setTimeout(() => {
+        void interruptTurn(turn, "idle timeout");
+        turn.reject(appError(
+          "codex_idle_timeout",
+          `Codex produced no correlated activity for ${resolvedIdleMs}ms`,
+        ));
+      }, resolvedIdleMs);
+    }
+    const job = turn.jobId ? jobs.get(turn.jobId) : undefined;
+    if (job) {
+      job.lastActivityAt = turn.lastActivityAt;
+      if (commentary) appendJobCommentary(job, commentary);
+      if (message && message !== job.statusMessage) {
+        const update = () => {
+          job.statusMessage = `Codex: ${message}`;
+          job.statusCursor += 1;
+          job.lastStatusAt = Date.now();
+          for (const wake of job.waiters) wake();
+          job.waiters.clear();
+        };
+        if (
+          statusIntervalMs === 0 || !job.lastStatusAt ||
+          Date.now() - job.lastStatusAt >= statusIntervalMs
+        ) update();
+        else job.pendingStatusMessage = message;
+      }
+    }
+    if (message && turn.extra?._meta?.progressToken !== undefined) {
+      turn.pendingProgress = `Codex: ${boundedText(message)}`;
+      const flush = () => {
+        turn.progressTimer = undefined;
+        if (!turn.pendingProgress || turn.state !== "active") return;
+        const visible = turn.pendingProgress;
+        turn.pendingProgress = undefined;
+        turn.lastProgressAt = Date.now();
+        turn.progressSequence += 1;
+        void turn.extra.sendNotification({
+          method: "notifications/progress",
+          params: {
+            progressToken: turn.extra._meta.progressToken,
+            progress: turn.progressSequence,
+            message: visible,
+          },
+        }).catch(() => {});
+      };
+      if (
+        !turn.lastProgressAt || progressIntervalMs === 0 ||
+        Date.now() - turn.lastProgressAt >= progressIntervalMs
+      ) flush();
+      else if (!turn.progressTimer) {
+        turn.progressTimer = setTimeout(
+          flush,
+          progressIntervalMs - (Date.now() - turn.lastProgressAt),
+        );
+      }
+    }
+    writeBridgeState();
+  };
+
+  const finishTurn = (turn, params) => {
+    if (!turn || turn.terminal) return;
+    turn.terminal = true;
+    turn.state = "terminal_undelivered";
+    turn.updatedAt = new Date().toISOString();
+    for (const timerName of [
+      "idleTimer",
+      "hardTimer",
+      "progressTimer",
+      "cancelSettleTimer",
+    ]) {
+      if (turn[timerName]) clearTimeout(turn[timerName]);
+      turn[timerName] = undefined;
+    }
+    const completed = params?.turn ?? {};
+    const status = completed.status ?? "completed";
+    for (const item of completed.items ?? []) {
+      if (item?.type === "exitedReviewMode" && typeof item.review === "string") {
+        turn.finalAnswers.push(item.review);
+      } else if (item?.type === "agentMessage" && typeof item.text === "string") {
+        turn.agentMessages.push(item.text);
+        if (item.phase === "final_answer") turn.finalAnswers.push(item.text);
+      }
+    }
+    let finalText = turn.finalAnswers.at(-1) ?? turn.agentMessages.at(-1) ?? "";
+    if (!finalText && typeof completed.output === "string") finalText = completed.output;
+    writeBridgeState();
+    if (status === "completed") {
+      turn.resolve({ status, content: finalText, turn: completed });
+    } else {
+      turn.reject(appError(
+        status === "interrupted" ? "codex_turn_interrupted" : "codex_turn_failed",
+        completed.error?.message || `Codex turn ${status}`,
+      ));
+    }
+    if (turn.abandoned) queueMicrotask(() => forgetTurn(turn));
+  };
+  const registerTurn = ({
+    generationState,
+    threadId,
+    turnId,
+    cwd,
+    sandbox,
+    requestId,
+    jobId,
+    extra,
+    releaseLease,
+    reviewThreadId,
+    sourceThreadId,
+    tool,
+    cwdInferred = false,
+    provisional,
+    deadlineAt,
+  }) => {
+    let resolveTurn;
+    let rejectTurn;
+    const completion = new Promise((resolvePromise, rejectPromise) => {
+      resolveTurn = resolvePromise;
+      rejectTurn = rejectPromise;
+    });
+    const now = Date.now();
+    const turn = {
+      generation: generationState.generation,
+      threadId,
+      turnId,
+      cwd,
+      sandbox,
+      requestId,
+      jobId,
+      extra,
+      reviewThreadId,
+      sourceThreadId,
+      tool,
+      cwdInferred,
+      state: "active",
+      startedAt: new Date(now).toISOString(),
+      updatedAt: new Date(now).toISOString(),
+      lastActivityAt: now,
+      hardDeadlineAt: deadlineAt ?? now + resolvedHardMs,
+      itemPhases: new Map(),
+      agentMessages: [],
+      finalAnswers: [],
+      resolve: resolveTurn,
+      reject: rejectTurn,
+      completion,
+      releaseLease,
+      terminal: false,
+      progressSequence: 0,
+    };
+    activeTurns.set(turnId, turn);
+    activeTurnsByThread.set(threadId, turn);
+    if (reviewThreadId && reviewThreadId !== threadId) {
+      activeTurnsByThread.set(reviewThreadId, turn);
+    }
+    if (sourceThreadId && sourceThreadId !== threadId) {
+      activeTurnsByThread.set(sourceThreadId, turn);
+    }
+    if (provisional) provisionalTurns.delete(provisional.provisionalId);
+    turn.hardTimer = setTimeout(() => {
+      const interaction = [...interactions.values()].find((candidate) =>
+        candidate.turnId === turn.turnId && !candidate.resolved
+      );
+      if (interaction) {
+        expireInteraction(interaction, turn);
+        return;
+      }
+      void interruptTurn(turn, "hard timeout");
+      turn.reject(appError(
+        "codex_hard_timeout",
+        `Codex turn exceeded ${resolvedHardMs}ms`,
+      ));
+    }, Math.max(1, turn.hardDeadlineAt - now));
+    scheduleProgress(turn, "turn started");
+    drainDeferredAppRequests(generationState, turnId);
+    const early = takeEarlyCompletion(turnId);
+    if (early?.generation === generationState.generation) {
+      finishTurn(turn, early.params);
+    }
+    return turn;
+  };
+  const forgetTurn = (turn) => {
+    if (!turn) return;
+    for (const timerName of [
+      "idleTimer",
+      "hardTimer",
+      "progressTimer",
+      "silenceTimer",
+      "cancelSettleTimer",
+    ]) {
+      if (turn[timerName]) clearTimeout(turn[timerName]);
+      turn[timerName] = undefined;
+    }
+    activeTurns.delete(turn.turnId);
+    if (activeTurnsByThread.get(turn.threadId) === turn) {
+      activeTurnsByThread.delete(turn.threadId);
+    }
+    if (turn.reviewThreadId && activeTurnsByThread.get(turn.reviewThreadId) === turn) {
+      activeTurnsByThread.delete(turn.reviewThreadId);
+    }
+    if (turn.sourceThreadId && activeTurnsByThread.get(turn.sourceThreadId) === turn) {
+      activeTurnsByThread.delete(turn.sourceThreadId);
+    }
+    try { turn.releaseLease?.(); } catch {}
+    writeBridgeState();
+  };
+  async function interruptTurn(turn, reason = "canceled") {
+    if (!turn || turn.terminal || turn.state === "outcome_unknown") return;
+    if (turn.state !== "canceling") {
+      turn.state = "canceling";
+      turn.updatedAt = new Date().toISOString();
+      writeBridgeState();
+    }
+    if (!turn.cancelSettleTimer) {
+      turn.cancelSettleTimer = setTimeout(() => {
+        turn.cancelSettleTimer = undefined;
+        if (turn.terminal || turn.locallySettled) return;
+        turn.locallySettled = true;
+        turn.reject(appError(
+          "codex_turn_interrupted",
+          "Codex cancellation was requested; the native turn may still be finishing",
+        ));
+      }, cancelGraceMs);
+    }
+    if (turn.interruptRequested) return;
+    turn.interruptRequested = true;
+    const generationState = app;
+    if (!generationState || generationState.generation !== turn.generation) return;
+    try {
+      await requestApp(generationState, "turn/interrupt", {
+        threadId: turn.threadId,
+        turnId: turn.turnId,
+      }, cancelGraceMs);
+    } catch (err) {
+      logErr(
+        `[mcp-agents] Codex interrupt was not confirmed (${reason}): ${err.message}`,
+      );
+    }
+  }
+
+  const sanitizedInteraction = (interaction) => ({
+    interactionId: interaction.interactionId,
+    kind: interaction.kind,
+    threadId: interaction.threadId,
+    turnId: interaction.turnId,
+    ...(interaction.jobId ? { jobId: interaction.jobId } : {}),
+    createdAt: interaction.createdAt,
+    expiresAt: interaction.expiresAt,
+    ...(interaction.display ? { display: interaction.display } : {}),
+    ...(interaction.questions ? { questions: interaction.questions } : {}),
+  });
+  const settleInteraction = (interaction, value, error) => {
+    if (!interaction || interaction.resolved || !interactions.has(interaction.interactionId)) {
+      return false;
+    }
+    interaction.resolved = true;
+    clearTimeout(interaction.timer);
+    interactions.delete(interaction.interactionId);
+    respondToApp(interaction.generationState, interaction.nativeId, value, error);
+    const turn = activeTurns.get(interaction.turnId);
+    if (turn && turn.state === "waiting_for_input") {
+      turn.state = "active";
+      scheduleProgress(turn, "interaction resolved");
     }
     return true;
   };
-  const normalizeProgressText = (value) => {
-    if (typeof value !== "string") return "";
-    return value
-      .replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ")
-      .replace(/\s+/gu, " ")
-      .trim();
+  function expireInteraction(interaction, turn) {
+    const fallback = interaction.kind === "user_input"
+      ? { answers: {} }
+      : interaction.kind === "permissions"
+        ? { permissions: {} }
+        : { decision: "cancel" };
+    if (!settleInteraction(interaction, fallback)) return;
+    if (turn) {
+      void interruptTurn(turn, "interaction timeout");
+      turn.reject(appError(
+        "codex_interaction_timeout",
+        "Codex interaction was not resolved before the turn deadline",
+      ));
+    }
+  }
+  const resolveInteractionValue = (interaction, args) => {
+    if (interaction.kind === "user_input") {
+      if (!Array.isArray(args.answers)) {
+        throw appError(
+          "interaction_type_mismatch",
+          "This interaction requires structured answers",
+        );
+      }
+      const known = new Set(interaction.questions.map((question) => question.id));
+      if (args.answers.some((entry) => !known.has(entry.questionId))) {
+        throw appError("interaction_answer_unknown", "An answer names an unknown question");
+      }
+      return {
+        answers: Object.fromEntries(args.answers.map((entry) => [
+          entry.questionId,
+          { answers: entry.answers },
+        ])),
+      };
+    }
+    if (typeof args.decision !== "string") {
+      throw appError(
+        "interaction_type_mismatch",
+        "This interaction requires an approval decision",
+      );
+    }
+    return { decision: args.decision };
   };
-  const formatProgressMessage = (value) => {
-    const normalized = normalizeProgressText(value);
-    if (!normalized) return undefined;
-    return Array.from(`Codex: ${normalized}`)
-      .slice(0, MAX_CODEX_PROGRESS_CODEPOINTS)
-      .join("");
-  };
-  const markGeneratedFrameDelivered = (frame) => {
-    if (frame.kind === "local_response") {
-      const entry = inFlight.get(frame.requestKey);
-      if (entry?.state === "local_response") {
-        if (entry.startJobId) {
-          const job = jobs.get(entry.startJobId);
-          if (job?.startRequestKey === frame.requestKey) job.startRequestKey = undefined;
+  const tryElicitInteraction = async (outerServer, interaction) => {
+    const capability = outerServer.getClientCapabilities()?.elicitation;
+    if (!capability || capability.form === false) return;
+    let elicitationSignal;
+    try {
+      let request;
+      if (interaction.kind === "user_input") {
+        const properties = Object.fromEntries(interaction.questions.map((question) => [
+          question.id,
+          {
+            type: "string",
+            title: question.header,
+            description: question.question,
+            ...(question.options?.length
+              ? { enum: question.options.map((option) => option.label) }
+              : {}),
+          },
+        ]));
+        request = {
+          mode: "form",
+          message: "Codex needs input to continue.",
+          requestedSchema: {
+            type: "object",
+            properties,
+            required: interaction.questions.map((question) => question.id),
+          },
+        };
+      } else {
+        request = {
+          mode: "form",
+          message: interaction.display || "Codex requests approval to continue.",
+          requestedSchema: {
+            type: "object",
+            properties: {
+              decision: {
+                type: "string",
+                enum: ["accept", "acceptForSession", "decline", "cancel"],
+              },
+            },
+            required: ["decision"],
+          },
+        };
+      }
+      elicitationSignal = AbortSignal.timeout(
+        Math.max(1, interaction.expiresAtMs - Date.now()),
+      );
+      const requestOptions = { signal: elicitationSignal };
+      const result = capability.form
+        ? await outerServer.elicitInput(request, requestOptions)
+        : await outerServer.request(
+          { method: "elicitation/create", params: request },
+          ElicitResultSchema,
+          requestOptions,
+        );
+      if (!interactions.has(interaction.interactionId)) return;
+      if (result.action === "accept") {
+        if (interaction.kind === "user_input") {
+          const answers = Object.entries(result.content ?? {}).map(([questionId, answer]) => ({
+            questionId,
+            answers: [String(answer)],
+          }));
+          settleInteraction(
+            interaction,
+            resolveInteractionValue(interaction, { answers }),
+          );
+        } else {
+          settleInteraction(interaction, { decision: result.content?.decision ?? "decline" });
         }
-        rememberLocallyHandledResponse(frame.requestKey);
-        settleInFlight(entry.id);
+      } else {
+        settleInteraction(
+          interaction,
+          interaction.kind === "user_input" ? { answers: {} } : {
+            decision: result.action === "cancel" ? "cancel" : "decline",
+          },
+        );
+      }
+    } catch {
+      if (!interaction.foreground || !interactions.has(interaction.interactionId)) return;
+      const turn = activeTurns.get(interaction.turnId);
+      if (
+        elicitationSignal?.aborted &&
+        elicitationSignal.reason?.name === "TimeoutError"
+      ) {
+        expireInteraction(interaction, turn);
+        return;
+      }
+      settleInteraction(
+        interaction,
+        interaction.kind === "user_input" ? { answers: {} } : { decision: "cancel" },
+      );
+      if (turn) {
+        void interruptTurn(turn, "foreground elicitation failed");
+        turn.reject(appError(
+          "codex_interaction_requires_background",
+          "The MCP client could not complete Codex elicitation; use a background start tool",
+        ));
+      }
+    }
+  };
+
+  let outerServer;
+  const appInteractionMethods = new Set([
+    "item/tool/requestUserInput",
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+  ]);
+  const failClosedAppInteraction = (generationState, message) => {
+    const result = message.method === "item/tool/requestUserInput"
+      ? { answers: {} }
+      : message.method === "item/permissions/requestApproval"
+      ? { permissions: {} }
+      : { decision: "cancel" };
+    respondToApp(generationState, message.id, result);
+  };
+  const deferAppInteraction = (generationState, message) => {
+    const turnId = message.params?.turnId;
+    if (typeof turnId !== "string" || !turnId) {
+      failClosedAppInteraction(generationState, message);
+      return;
+    }
+    const deferred = generationState.deferredRequests.get(turnId) ?? [];
+    if (deferred.length >= 16) {
+      failClosedAppInteraction(generationState, message);
+      return;
+    }
+    const entry = { message };
+    entry.timer = setTimeout(() => {
+      const current = generationState.deferredRequests.get(turnId);
+      if (!current) return;
+      const index = current.indexOf(entry);
+      if (index >= 0) current.splice(index, 1);
+      if (current.length === 0) generationState.deferredRequests.delete(turnId);
+      failClosedAppInteraction(generationState, message);
+    }, 1_000);
+    entry.timer.unref();
+    deferred.push(entry);
+    generationState.deferredRequests.set(turnId, deferred);
+  };
+  function drainDeferredAppRequests(generationState, turnId) {
+    const deferred = generationState.deferredRequests.get(turnId);
+    if (!deferred) return;
+    generationState.deferredRequests.delete(turnId);
+    for (const entry of deferred) {
+      clearTimeout(entry.timer);
+      handleAppServerRequest(generationState, entry.message);
+    }
+  }
+  const handleAppServerRequest = (generationState, message) => {
+    const { id, method, params = {} } = message;
+    const candidate = activeTurns.get(params.turnId) ??
+      activeTurnsByThread.get(params.threadId);
+    const turn = candidate?.generation === generationState.generation
+      ? candidate
+      : undefined;
+    if (!turn && appInteractionMethods.has(method)) {
+      deferAppInteraction(generationState, message);
+      return;
+    }
+    if (turn?.terminal || turn?.state === "canceling" || turn?.state === "outcome_unknown") {
+      failClosedAppInteraction(generationState, message);
+      return;
+    }
+    const jobId = turn?.jobId;
+    if (method === "item/tool/requestUserInput") {
+      const questions = Array.isArray(params.questions) ? params.questions : [];
+      if (questions.some((question) => question?.isSecret === true)) {
+        respondToApp(generationState, id, { answers: {} });
+        if (turn) {
+          void interruptTurn(turn, "secret input unsupported");
+          turn.reject(appError(
+            "codex_secret_input_unsupported",
+            "Secret Codex input cannot be transported through MCP elicitation",
+          ));
+        }
+        return;
+      }
+      const elicitation = outerServer.getClientCapabilities()?.elicitation;
+      const canElicit = Boolean(elicitation && elicitation.form !== false);
+      if (turn && !jobId && !canElicit) {
+        respondToApp(generationState, id, { answers: {} });
+        void interruptTurn(turn, "foreground interaction requires background mode");
+        turn.reject(appError(
+          "codex_interaction_requires_background",
+          "Codex requested user input, but this blocking MCP call cannot elicit it; use a background start tool",
+        ));
+        return;
+      }
+      const interactionId = randomUUID();
+      const now = Date.now();
+      const expiresAtMs = Math.max(now + 1, Math.min(
+        now + interactionTimeoutMs,
+        (turn?.hardDeadlineAt ?? Infinity) - 1,
+      ));
+      const interaction = {
+        interactionId,
+        nativeId: id,
+        generationState,
+        kind: "user_input",
+        threadId: params.threadId,
+        turnId: params.turnId,
+        jobId,
+        foreground: Boolean(turn && !jobId),
+        createdAt: new Date(now).toISOString(),
+        expiresAt: new Date(expiresAtMs).toISOString(),
+        expiresAtMs,
+        questions: questions.map((question) => ({
+          id: question.id,
+          header: question.header,
+          question: question.question,
+          options: Array.isArray(question.options)
+            ? question.options.map((option) => ({
+              label: option.label,
+              description: option.description,
+            }))
+            : undefined,
+        })),
+      };
+      interaction.timer = setTimeout(
+        () => expireInteraction(interaction, turn),
+        Math.max(1, expiresAtMs - now),
+      );
+      interactions.set(interactionId, interaction);
+      if (turn) {
+        turn.state = "waiting_for_input";
+        scheduleProgress(turn, "waiting for user input");
+      }
+      void tryElicitInteraction(outerServer, interaction);
+      return;
+    }
+    if (method === "item/permissions/requestApproval") {
+      respondToApp(generationState, id, { permissions: {} });
+      if (turn) {
+        void interruptTurn(turn, "additional permissions unsupported");
+        turn.reject(appError(
+          "codex_permissions_unsupported",
+          "Additional Codex permission grants are not supported by this MCP bridge",
+        ));
       }
       return;
     }
-    if (frame.kind !== "progress") return;
-    const entry = inFlight.get(frame.requestKey);
-    if (!entry || entry.state !== "open") return;
-    entry.lastProgressDeliveredAt = Date.now();
-    entry.lastWaitAttemptAt = undefined;
-    clearTimer(entry, "waitTimer");
-    armProgressWait(entry);
+    if (
+      method === "item/commandExecution/requestApproval" ||
+      method === "item/fileChange/requestApproval"
+    ) {
+      const kind = method.includes("fileChange") ? "file_change_approval" :
+        "command_approval";
+      if (resolvedApproval === "never") {
+        respondToApp(generationState, id, { decision: "cancel" });
+        if (turn) {
+          void interruptTurn(turn, "unexpected approval request under never policy");
+          turn.reject(appError(
+            "codex_unexpected_approval",
+            "Codex requested approval despite approval_policy=never",
+          ));
+        }
+        return;
+      }
+      const interactionId = randomUUID();
+      const now = Date.now();
+      const expiresAtMs = Math.max(now + 1, Math.min(
+        now + interactionTimeoutMs,
+        (turn?.hardDeadlineAt ?? Infinity) - 1,
+      ));
+      const display = kind === "command_approval"
+        ? `Approve Codex command: ${boundedText(params.command ?? params.reason, 500)}`
+        : `Approve Codex file changes: ${boundedText(params.reason, 500)}`;
+      const interaction = {
+        interactionId,
+        nativeId: id,
+        generationState,
+        kind,
+        threadId: params.threadId,
+        turnId: params.turnId,
+        jobId,
+        foreground: Boolean(turn && !jobId),
+        display,
+        createdAt: new Date(now).toISOString(),
+        expiresAt: new Date(expiresAtMs).toISOString(),
+        expiresAtMs,
+      };
+      interaction.timer = setTimeout(
+        () => expireInteraction(interaction, turn),
+        Math.max(1, expiresAtMs - now),
+      );
+      interactions.set(interactionId, interaction);
+      if (turn) {
+        turn.state = "waiting_for_input";
+        scheduleProgress(turn, "waiting for approval");
+      }
+      void tryElicitInteraction(outerServer, interaction);
+      return;
+    }
+    respondToApp(generationState, id, undefined, {
+      code: -32601,
+      message: `mcp-agents does not expose App Server request ${method}`,
+    });
   };
-  const codePointLength = (value) => Array.from(value ?? "").length;
-  const sanitizeCommentaryText = (value) => {
-    if (typeof value !== "string") return "";
-    return value
-      .replace(/\r/gu, "")
-      .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, "")
-      .replace(/[\u2028\u2029\u202a-\u202e\u2066-\u2069]/gu, "");
+
+  const handleAppNotification = (generationState, method, params = {}) => {
+    if (app !== generationState || !generationState.alive) return;
+    if (method === "turn/completed") {
+      const turnId = params.turn?.id;
+      const turn = activeTurns.get(turnId);
+      if (turn) finishTurn(turn, params);
+      else if (turnId) rememberEarlyCompletion(generationState, turnId, params);
+      return;
+    }
+    const turn = activeTurns.get(params.turnId) ??
+      activeTurnsByThread.get(params.threadId);
+    if (method === "error") {
+      const info = params.error?.codexErrorInfo ?? params.error?.codex_error_info;
+      const message = params.error?.message ?? "Codex App Server reported an error";
+      if (info === "unauthorized" || /unauthoriz|refresh token/iu.test(message)) {
+        codexAuthInvalidated = true;
+        if (turn) turn.reject(appError(CODEX_AUTH_FAILURE_CODE, CODEX_AUTH_FAILURE_MESSAGE));
+      } else if (turn && params.willRetry !== true) {
+        turn.reject(appError("codex_turn_failed", message));
+      } else if (turn) {
+        scheduleProgress(turn, boundedText(message));
+      }
+      return;
+    }
+    if (!turn) return;
+    if (method === "item/started") {
+      const item = params.item;
+      if (item?.id) turn.itemPhases.set(item.id, item.phase);
+      const progress = resolveTurnProgressMessage(item, "started");
+      if (progress) scheduleProgress(turn, progress);
+      return;
+    }
+    if (method === "item/agentMessage/delta") {
+      const phase = turn.itemPhases.get(params.itemId);
+      if (phase === "commentary") {
+        scheduleProgress(turn, boundedText(params.delta), params.delta);
+      } else {
+        scheduleProgress(turn);
+      }
+      return;
+    }
+    if (method === "item/completed") {
+      const item = params.item;
+      if (item?.type === "exitedReviewMode" && typeof item.review === "string") {
+        turn.finalAnswers.push(item.review);
+      } else if (item?.type === "agentMessage" && typeof item.text === "string") {
+        turn.agentMessages.push(item.text);
+        if (item.phase === "final_answer") turn.finalAnswers.push(item.text);
+        if (item.phase === "commentary") {
+          scheduleProgress(turn, boundedText(item.text), `${item.text}\n\n`);
+        }
+      } else {
+        const progress = resolveTurnProgressMessage(item, "completed");
+        if (progress) scheduleProgress(turn, progress);
+      }
+      return;
+    }
+    if (method === "turn/started" || method === "thread/status/changed") {
+      scheduleProgress(turn, method === "turn/started" ? "turn active" : "thread status changed");
+    }
   };
-  const localToolResult = (text, structuredContent, { isError = false } = {}) => ({
-    content: [{ type: "text", text }],
-    structuredContent,
-    ...(isError ? { isError: true } : {}),
-  });
-  const prepareLocalEntry = (entry, state = "local_response") => {
-    clearEntryTimers(entry);
-    stopEntryProgress(entry);
-    entry.state = state;
+
+  const cleanupGeneration = (generationState) => {
+    if (generationState.cleaned) return;
+    generationState.cleaned = true;
+    if (codexAuthInvalidated) {
+      logErr("[mcp-agents] skipped Codex auth write-back after authentication invalidation");
+    } else {
+      persistIsolatedCodexAuth(generationState.codexHome, generationState.initialAuth);
+    }
+    for (const dir of [generationState.codexHome, generationState.sqliteHome]) {
+      try { rmSync(dir, { recursive: true, force: true }); } catch {}
+    }
   };
-  const detachLocalWaiter = (entry) => {
-    if (!entry?.waitJobId) return;
-    jobs.get(entry.waitJobId)?.waiters.delete(idKey(entry.id));
-    entry.waitJobId = undefined;
-    clearTimer(entry, "localWaitTimer");
+  const onGenerationGone = (generationState, reason) => {
+    if (!generationState.alive) return;
+    generationState.alive = false;
+    generationState.initialized = false;
+    if (app === generationState) app = undefined;
+    for (const pending of generationState.pending.values()) {
+      clearTimeout(pending.timer);
+      if (pending.cancelTimer) clearTimeout(pending.cancelTimer);
+      pending.detachAbort?.();
+      const outcomeUnknown = pending.mutating && pending.dispatched;
+      if (outcomeUnknown) {
+        try { pending.onOutcomeUnknown?.(); } catch {}
+      }
+      pending.reject(appError(
+        outcomeUnknown ? "codex_outcome_unknown" : "codex_app_server_unavailable",
+        outcomeUnknown
+          ? `Codex App Server ${reason} after ${pending.method} was dispatched; its outcome is unknown and it was not replayed`
+          : `Codex App Server ${reason}`,
+      ));
+    }
+    generationState.pending.clear();
+    clearEarlyCompletions();
+    for (const interaction of [...interactions.values()]) {
+      if (interaction.generationState === generationState) {
+        clearTimeout(interaction.timer);
+        interactions.delete(interaction.interactionId);
+      }
+    }
+    for (const deferred of generationState.deferredRequests.values()) {
+      for (const entry of deferred) clearTimeout(entry.timer);
+    }
+    generationState.deferredRequests.clear();
+    for (const provisional of provisionalTurns.values()) {
+      if (provisional.generation !== generationState.generation) continue;
+      provisional.state = "outcome_unknown";
+      provisional.updatedAt = new Date().toISOString();
+    }
+    for (const turn of activeTurns.values()) {
+      if (turn.generation !== generationState.generation || turn.terminal) continue;
+      turn.state = "outcome_unknown";
+      turn.safeToRelease = false;
+      turn.uncertain = true;
+      turn.updatedAt = new Date().toISOString();
+      for (const timerName of [
+        "idleTimer",
+        "hardTimer",
+        "progressTimer",
+        "silenceTimer",
+        "cancelSettleTimer",
+      ]) {
+        if (turn[timerName]) clearTimeout(turn[timerName]);
+        turn[timerName] = undefined;
+      }
+      turn.reject(appError(
+        "codex_outcome_unknown",
+        "Codex App Server exited before the turn outcome was known; the turn was not replayed",
+      ));
+    }
+    cleanupGeneration(generationState);
+    writeBridgeState();
+    generationState.resolveGone?.();
   };
-  const queueLocalToolResponse = (entry, result) => {
-    detachLocalWaiter(entry);
-    prepareLocalEntry(entry);
-    queueGeneratedFrame(
-      { jsonrpc: "2.0", id: entry.id, result },
-      { requestKey: idKey(entry.id), kind: "local_response" },
+  const parseAppLine = (generationState, line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let message;
+    try {
+      message = JSON.parse(trimmed);
+      generationState.noiseLines = 0;
+    } catch {
+      if (/^[{[]/u.test(trimmed)) {
+        logErr("[mcp-agents] malformed JSON frame from Codex App Server; restarting child");
+        killChildGroup(generationState.child);
+        return;
+      }
+      generationState.noiseLines += 1;
+      logErr(`[mcp-agents] Codex App Server stdout diagnostic: ${boundedText(trimmed, 500)}`);
+      if (generationState.noiseLines >= 3) killChildGroup(generationState.child);
+      return;
+    }
+    if (!message || typeof message !== "object" || Array.isArray(message)) {
+      killChildGroup(generationState.child);
+      return;
+    }
+    if (Object.hasOwn(message, "id") && typeof message.method !== "string") {
+      const pending = generationState.pending.get(message.id);
+      if (!pending || pending.generation !== generationState.generation) return;
+      if (pending.outcomeUnknown || pending.canceled) return;
+      generationState.pending.delete(message.id);
+      clearTimeout(pending.timer);
+      pending.detachAbort?.();
+      if (message.error) {
+        pending.reject(appError(
+          "codex_app_server_error",
+          boundedText(message.error.message, 2_000) || `${pending.method} failed`,
+          { appServerCode: message.error.code },
+        ));
+      } else pending.resolve(message.result);
+      return;
+    }
+    if (Object.hasOwn(message, "id") && typeof message.method === "string") {
+      handleAppServerRequest(generationState, message);
+      return;
+    }
+    if (typeof message.method === "string") {
+      handleAppNotification(generationState, message.method, message.params);
+      return;
+    }
+    killChildGroup(generationState.child);
+  };
+
+  const prepareGenerationStorage = () => {
+    const homesRoot = prepareIsolatedCodexHomesRoot(durableRuntime);
+    let swept = 0;
+    try {
+      const cutoff = Date.now() - STALE_CODEX_HOME_MAX_AGE_MS;
+      for (const name of readdirSync(homesRoot)) {
+        if (!name.startsWith("mcp-agents-codex-")) continue;
+        const candidate = join(homesRoot, name);
+        try {
+          const candidateStat = lstatSync(candidate);
+          if (!candidateStat.isDirectory() || candidateStat.isSymbolicLink() ||
+              candidateStat.mtimeMs >= cutoff) continue;
+          const markerPath = join(candidate, ".mcp-agents-owner.json");
+          if (existsSync(markerPath)) {
+            const marker = JSON.parse(readFileSync(markerPath, "utf8"));
+            if (processExists(marker.pid) !== false) continue;
+          }
+          rmSync(candidate, { recursive: true, force: true });
+          swept += 1;
+        } catch {}
+      }
+    } catch {}
+    if (swept > 0) logErr(`[mcp-agents] swept ${swept} stale isolated Codex home(s)`);
+    const codexHome = createIsolatedCodexHome({
+      homesRoot,
+      sourceCodexHome,
+      model: resolvedModel,
+      modelReasoningEffort: resolvedEffort,
+      sandboxMode: resolvedSandbox,
+      approvalPolicy: resolvedApproval,
+      workspaceNetworkAccess: resolvedNetwork,
+      fastModeEnabled,
+      agentsEnabledKeySupported,
+    });
+    const sqliteHome = mkdtempSync(join(homesRoot, "mcp-agents-codex-sqlite-"));
+    chmodSync(sqliteHome, 0o700);
+    for (const dir of [codexHome, sqliteHome]) {
+      writeFileSync(
+        join(dir, ".mcp-agents-owner.json"),
+        `${JSON.stringify({ bridgeId, pid: process.pid, createdAt: new Date().toISOString() })}\n`,
+        { encoding: "utf8", mode: 0o600 },
+      );
+    }
+    for (const [name, target] of [
+      ["sessions", durableSessions],
+      ["archived_sessions", durableArchivedSessions],
+      ["thread-writer-locks", durableWriterLocks],
+    ]) symlinkSync(target, join(codexHome, name), "dir");
+    if (goalStoreCompatible) {
+      for (const name of durableGoalFiles) {
+        symlinkSync(join(durableGoals, name), join(sqliteHome, name), "file");
+      }
+    }
+    let initialAuth;
+    try { initialAuth = readFileSync(join(codexHome, "auth.json")); } catch {}
+    return { codexHome, sqliteHome, initialAuth };
+  };
+  const startApp = async () => {
+    if (!codexVersion) {
+      throw appError(
+        "codex_app_server_incompatible",
+        "Codex App Server adapter could not determine the installed Codex version",
+      );
+    }
+    if (
+      codexVersion.major === 0 &&
+      (codexVersion.minor < 149 ||
+        (codexVersion.minor === 149 && codexVersion.patch < 1))
+    ) {
+      throw appError(
+        "codex_app_server_incompatible",
+        `Codex App Server adapter requires Codex >= ${CODEX_GOAL_STORE_VERSION}; found ${versionText}`,
+      );
+    }
+    const generation = ++appGeneration;
+    const storage = prepareGenerationStorage();
+    const child = spawn("codex", ["app-server", "--stdio"], {
+      env: {
+        ...process.env,
+        CODEX_HOME: storage.codexHome,
+        CODEX_SQLITE_HOME: storage.sqliteHome,
+        NO_COLOR: "1",
+      },
+      detached: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let resolveGone;
+    const gone = new Promise((resolveGonePromise) => {
+      resolveGone = resolveGonePromise;
+    });
+    const generationState = {
+      generation,
+      child,
+      ...storage,
+      alive: true,
+      initialized: false,
+      gone,
+      resolveGone,
+      cleaned: false,
+      pending: new Map(),
+      deferredRequests: new Map(),
+      buffer: Buffer.alloc(0),
+      noiseLines: 0,
+    };
+    app = generationState;
+    child.stdin.on("error", () => {});
+    child.stdout.on("data", (chunk) => {
+      if (!generationState.alive) return;
+      generationState.buffer = generationState.buffer.length
+        ? Buffer.concat([generationState.buffer, chunk])
+        : Buffer.from(chunk);
+      if (generationState.buffer.length > MAX_BUFFER_BYTES &&
+          generationState.buffer.indexOf(0x0a) === -1) {
+        logErr("[mcp-agents] Codex App Server frame exceeded 10 MiB; restarting child");
+        killChildGroup(child);
+        return;
+      }
+      let newline;
+      while ((newline = generationState.buffer.indexOf(0x0a)) !== -1) {
+        if (newline > MAX_BUFFER_BYTES) {
+          logErr("[mcp-agents] Codex App Server frame exceeded 10 MiB; restarting child");
+          generationState.buffer = Buffer.alloc(0);
+          killChildGroup(child);
+          return;
+        }
+        const line = generationState.buffer.subarray(0, newline).toString("utf8");
+        generationState.buffer = generationState.buffer.subarray(newline + 1);
+        parseAppLine(generationState, line);
+      }
+      if (generationState.buffer.length > MAX_BUFFER_BYTES) {
+        logErr("[mcp-agents] Codex App Server frame exceeded 10 MiB; restarting child");
+        generationState.buffer = Buffer.alloc(0);
+        killChildGroup(child);
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      const text = boundedText(chunk.toString("utf8"), 2_000);
+      if (text) logErr(`[codex app-server] ${text}`);
+    });
+    child.once("error", (err) => onGenerationGone(
+      generationState,
+      `failed to start: ${err.message}`,
+    ));
+    child.once("exit", (code, signal) => {
+      killChildGroup(child);
+      onGenerationGone(
+        generationState,
+        signal ? `was killed by ${signal}` : `exited with code ${code}`,
+      );
+    });
+    writeBridgeState();
+    let initialized;
+    try {
+      initialized = await requestApp(generationState, "initialize", {
+        clientInfo: { name: "mcp-agents", title: "mcp-agents", version: VERSION },
+        capabilities: {},
+      }, appInitTimeoutMs);
+      if (
+        !initialized || typeof initialized !== "object" ||
+        typeof initialized.userAgent !== "string" ||
+        typeof initialized.platformFamily !== "string" ||
+        typeof initialized.platformOs !== "string" ||
+        typeof initialized.codexHome !== "string" ||
+        !isAbsolute(initialized.codexHome) ||
+        realpathSync(initialized.codexHome) !== realpathSync(generationState.codexHome)
+      ) {
+        throw appError(
+          "codex_protocol_error",
+          "Codex App Server returned an invalid or non-isolated initialize response",
+        );
+      }
+      writeAppMessage(generationState, { method: "initialized" });
+      generationState.initialized = true;
+    } catch (err) {
+      killChildGroup(child);
+      onGenerationGone(generationState, "failed during initialization");
+      throw appError(
+        "codex_app_server_unavailable",
+        `Codex App Server initialization failed: ${boundedText(err?.message, 1_000)}`,
+      );
+    }
+    logErr(
+      `[mcp-agents] Codex App Server generation ${generation} ready ` +
+        `(codex=${versionText}, app=${initialized?.userAgent ?? "unknown"}, ` +
+        `durable_sessions=true, goals=${goalStoreCompatible ? "durable" : "disabled"})`,
     );
-    flushGeneratedFrames();
+    scheduleRetention(generationState);
+    return generationState;
+  };
+  const ensureApp = async () => {
+    if (shuttingDown) {
+      throw appError("codex_server_shutting_down", "Codex provider is shutting down");
+    }
+    if (appStarting) return appStarting;
+    if (app?.alive && app.initialized) return app;
+    appStarting = startApp().finally(() => { appStarting = undefined; });
+    return appStarting;
+  };
+
+  const mutationOptions = (provisional, { signal, deadlineAt } = {}) => {
+    if (provisional?.persisted === false) {
+      throw appError(
+        "codex_state_unavailable",
+        "Codex work was not started because its provisional liveness state could not be persisted",
+      );
+    }
+    return {
+      mutating: true,
+      signal,
+      deadlineAt,
+      onOutcomeUnknown: () => {
+        if (provisional) {
+          updateProvisionalTurn(provisional, { state: "outcome_unknown" });
+        }
+      },
+    };
+  };
+  const awaitSetupBoundary = (promise, signal, deadlineAt) => {
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      return Promise.reject(appError(
+        "codex_hard_timeout",
+        "Codex call exceeded its hard deadline during App Server setup",
+      ));
+    }
+    return new Promise((resolveBoundary, rejectBoundary) => {
+      let settled = false;
+      let canceled = false;
+      let cancelTimer;
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadlineTimer);
+        if (cancelTimer) clearTimeout(cancelTimer);
+        signal?.removeEventListener("abort", onAbort);
+        callback(value);
+      };
+      const deadlineTimer = setTimeout(() => finish(
+        rejectBoundary,
+        appError(
+          "codex_hard_timeout",
+          "Codex call exceeded its hard deadline during App Server setup",
+        ),
+      ), remainingMs);
+      const onAbort = () => {
+        if (settled || canceled) return;
+        canceled = true;
+        cancelTimer = setTimeout(() => finish(
+          rejectBoundary,
+          appError("codex_turn_interrupted", "Codex call was canceled during setup"),
+        ), Math.min(cancelGraceMs, Math.max(0, deadlineAt - Date.now())));
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+      promise.then(
+        (value) => { if (!canceled) finish(resolveBoundary, value); },
+        (err) => { if (!canceled) finish(rejectBoundary, err); },
+      );
+    });
+  };
+
+  const applyNativeGoal = async (
+    generationState,
+    threadId,
+    requestedGoal,
+    isInitial,
+    provisional,
+    callContext,
+  ) => {
+    const effective = requestedGoal === undefined && isInitial ? goal : requestedGoal;
+    if (effective === undefined) return;
+    if (!goalStoreCompatible) {
+      throw appError(
+        "codex_goal_store_incompatible",
+        `Durable native goals require Codex ${CODEX_GOAL_STORE_VERSION} on POSIX; found ${versionText}`,
+      );
+    }
+    if (effective.trim()) {
+      await requestApp(
+        generationState,
+        "thread/goal/set",
+        { threadId, objective: effective },
+        appMutationTimeoutMs,
+        mutationOptions(provisional, callContext),
+      );
+    } else if (!isInitial) {
+      await requestApp(
+        generationState,
+        "thread/goal/clear",
+        { threadId },
+        appMutationTimeoutMs,
+        mutationOptions(provisional, callContext),
+      );
+    }
+  };
+  const threadStartConfig = (args) => {
+    const config = {
+      model_reasoning_effort: args.model_reasoning_effort ?? resolvedEffort,
+    };
+    if (args.allow_subagents === true) {
+      config.features = { multi_agent: true };
+      if (agentsEnabledKeySupported) config.agents = { enabled: true };
+    }
+    return config;
+  };
+  const awaitTurn = async (turn, signal) => {
+    const onAbort = () => void interruptTurn(turn, "MCP request canceled");
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      return await turn.completion;
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+    }
+  };
+  const runTurn = async (args, extra, { reply = false, backgroundJob } = {}) => {
+    if (codexAuthInvalidated) throw appError(CODEX_AUTH_FAILURE_CODE, CODEX_AUTH_FAILURE_MESSAGE);
+    const signal = backgroundJob ? undefined : extra.signal;
+    const deadlineAt = backgroundJob?.deadlineAt ?? Date.now() + resolvedHardMs;
+    let threadId = args.threadId;
+    let workspace = reply ? lookupThreadWorkspace(threadId) : {
+      cwd: args.cwd,
+      sandbox: args.sandbox,
+    };
+    assertWorkspaceOutsideState(workspace?.cwd);
+    const generationState = await awaitSetupBoundary(ensureApp(), signal, deadlineAt);
+    let releaseLease;
+    let turn;
+    const provisional = beginProvisionalTurn({
+      generationState,
+      threadId,
+      cwd: workspace?.cwd,
+      sandbox: workspace?.sandbox,
+      requestId: backgroundJob ? undefined : idKey(extra.requestId),
+      jobId: backgroundJob?.jobId,
+      tool: reply ? "codex-reply" : "codex",
+      cwdInferred: Boolean(reply && workspace?.cwd),
+      deadlineAt,
+    });
+    try {
+      if (reply) {
+        releaseLease = acquireThreadLease(threadId, "turn");
+        const resumed = await requestApp(
+          generationState,
+          "thread/resume",
+          { threadId },
+          30_000,
+          { signal, deadlineAt },
+        );
+        workspace ??= {
+          cwd: resumed?.thread?.cwd,
+          sandbox: resumed?.thread?.sandbox,
+        };
+        assertWorkspaceOutsideState(resumed?.thread?.cwd ?? workspace?.cwd);
+        rememberThreadWorkspace(threadId, workspace?.cwd, workspace?.sandbox);
+        updateProvisionalTurn(provisional, {
+          cwd: workspace?.cwd ?? null,
+          sandbox: workspace?.sandbox ?? null,
+          cwdInferred: Boolean(workspace?.cwd),
+        });
+        await applyNativeGoal(
+          generationState,
+          threadId,
+          args.goal,
+          false,
+          provisional,
+          { signal, deadlineAt },
+        );
+      } else {
+        const started = await requestApp(
+          generationState,
+          "thread/start",
+          {
+            model: args.model ?? resolvedModel,
+            cwd: args.cwd,
+            sandbox: args.sandbox,
+            approvalPolicy: resolvedApproval,
+            config: threadStartConfig(args),
+            ephemeral: false,
+          },
+          appMutationTimeoutMs,
+          mutationOptions(provisional, { signal, deadlineAt }),
+        );
+        threadId = started?.thread?.id;
+        if (!threadId) {
+          throw appError("codex_protocol_error", "thread/start returned no thread ID");
+        }
+        updateProvisionalTurn(provisional, { threadId });
+        rememberThreadWorkspace(threadId, args.cwd, args.sandbox);
+        releaseLease = acquireThreadLease(threadId, "turn");
+        await applyNativeGoal(
+          generationState,
+          threadId,
+          args.goal,
+          true,
+          provisional,
+          { signal, deadlineAt },
+        );
+      }
+      const startedTurn = await requestApp(
+        generationState,
+        "turn/start",
+        {
+          threadId,
+          input: [{ type: "text", text: args.prompt }],
+          effort: reply ? undefined : (args.model_reasoning_effort ?? resolvedEffort),
+        },
+        appMutationTimeoutMs,
+        mutationOptions(provisional, { signal, deadlineAt }),
+      );
+      const turnId = startedTurn?.turn?.id;
+      if (!turnId) {
+        updateProvisionalTurn(provisional, { state: "outcome_unknown" });
+        killChildGroup(generationState.child);
+        await generationState.gone;
+        throw appError(
+          "codex_outcome_unknown",
+          "turn/start returned no turn ID; its App Server generation was terminated",
+        );
+      }
+      updateProvisionalTurn(provisional, { turnId });
+      turn = registerTurn({
+        generationState,
+        threadId,
+        turnId,
+        cwd: workspace?.cwd,
+        sandbox: workspace?.sandbox,
+        requestId: backgroundJob ? undefined : idKey(extra.requestId),
+        jobId: backgroundJob?.jobId,
+        extra: backgroundJob ? undefined : extra,
+        releaseLease,
+        tool: reply ? "codex-reply" : "codex",
+        cwdInferred: Boolean(reply && workspace?.cwd),
+        provisional,
+        deadlineAt,
+      });
+      releaseLease = undefined;
+      if (backgroundJob) {
+        backgroundJob.threadId = threadId;
+        backgroundJob.turnId = turnId;
+        backgroundJob.state = "running";
+        backgroundJob.statusMessage = "Codex: running";
+        backgroundJob.statusCursor += 1;
+        backgroundJob.resolveReady();
+      }
+    } catch (err) {
+      if (!isUncertainMutationError(err)) {
+        try { releaseLease?.(); } catch {}
+        forgetProvisionalTurn(provisional);
+      }
+      throw err;
+    }
+    try {
+      const completed = await awaitTurn(turn, backgroundJob ? undefined : extra.signal);
+      return { threadId, content: completed.content };
+    } finally {
+      if (turn.terminal || turn.safeToRelease) forgetTurn(turn);
+      else turn.abandoned = true;
+    }
+  };
+
+  const runReview = async (args, extra, backgroundJob) => {
+    if (codexAuthInvalidated) throw appError(CODEX_AUTH_FAILURE_CODE, CODEX_AUTH_FAILURE_MESSAGE);
+    const signal = backgroundJob ? undefined : extra.signal;
+    const deadlineAt = backgroundJob?.deadlineAt ?? Date.now() + resolvedHardMs;
+    let workspace = lookupThreadWorkspace(args.threadId);
+    assertWorkspaceOutsideState(workspace?.cwd);
+    const generationState = await awaitSetupBoundary(ensureApp(), signal, deadlineAt);
+    const provisional = beginProvisionalTurn({
+      generationState,
+      threadId: args.threadId,
+      cwd: workspace?.cwd,
+      sandbox: workspace?.sandbox,
+      requestId: backgroundJob ? undefined : idKey(extra.requestId),
+      jobId: backgroundJob?.jobId,
+      tool: "codex-review",
+      cwdInferred: Boolean(workspace?.cwd),
+      deadlineAt,
+    });
+    let releaseSourceLease;
+    let releaseTurnLease;
+    let turn;
+    let reviewThreadId;
+    try {
+      releaseSourceLease = acquireThreadLease(args.threadId, "review");
+      const resumed = await requestApp(
+        generationState,
+        "thread/resume",
+        { threadId: args.threadId },
+        30_000,
+        { signal, deadlineAt },
+      );
+      workspace ??= {
+        cwd: resumed?.thread?.cwd,
+        sandbox: resumed?.thread?.sandbox,
+      };
+      assertWorkspaceOutsideState(resumed?.thread?.cwd ?? workspace?.cwd);
+      updateProvisionalTurn(provisional, {
+        cwd: workspace?.cwd ?? null,
+        sandbox: workspace?.sandbox ?? null,
+        cwdInferred: Boolean(workspace?.cwd),
+      });
+      const response = await requestApp(
+        generationState,
+        "review/start",
+        {
+          threadId: args.threadId,
+          target: args.target,
+          delivery: args.delivery ?? "inline",
+        },
+        appMutationTimeoutMs,
+        mutationOptions(provisional, { signal, deadlineAt }),
+      );
+      const turnId = response?.turn?.id;
+      reviewThreadId = response?.reviewThreadId;
+      if (!turnId || !reviewThreadId) {
+        updateProvisionalTurn(provisional, { state: "outcome_unknown" });
+        killChildGroup(generationState.child);
+        await generationState.gone;
+        throw appError(
+          "codex_outcome_unknown",
+          "review/start returned incomplete ownership identifiers; its generation was terminated",
+        );
+      }
+      updateProvisionalTurn(provisional, { threadId: reviewThreadId, turnId });
+      if (reviewThreadId !== args.threadId) {
+        try {
+          releaseTurnLease = acquireThreadLease(reviewThreadId, "detached-review");
+        } catch (err) {
+          updateProvisionalTurn(provisional, { state: "outcome_unknown" });
+          killChildGroup(generationState.child);
+          await generationState.gone;
+          throw err;
+        }
+        releaseSourceLease();
+        releaseSourceLease = undefined;
+      } else {
+        releaseTurnLease = releaseSourceLease;
+        releaseSourceLease = undefined;
+      }
+      turn = registerTurn({
+        generationState,
+        threadId: reviewThreadId,
+        turnId,
+        cwd: workspace?.cwd,
+        sandbox: workspace?.sandbox,
+        requestId: backgroundJob ? undefined : idKey(extra.requestId),
+        jobId: backgroundJob?.jobId,
+        extra: backgroundJob ? undefined : extra,
+        releaseLease: releaseTurnLease,
+        reviewThreadId,
+        sourceThreadId: args.threadId,
+        tool: "codex-review",
+        cwdInferred: Boolean(workspace?.cwd),
+        provisional,
+        deadlineAt,
+      });
+      releaseTurnLease = undefined;
+      if (backgroundJob) {
+        backgroundJob.threadId = reviewThreadId;
+        backgroundJob.turnId = turnId;
+        backgroundJob.state = "running";
+        backgroundJob.statusMessage = "Codex: running";
+        backgroundJob.statusCursor += 1;
+        backgroundJob.resolveReady();
+      }
+    } catch (err) {
+      if (!isUncertainMutationError(err)) {
+        try { releaseSourceLease?.(); } catch {}
+        try { releaseTurnLease?.(); } catch {}
+        forgetProvisionalTurn(provisional);
+      }
+      throw err;
+    }
+    try {
+      const completed = await awaitTurn(turn, backgroundJob ? undefined : extra.signal);
+      return { threadId: args.threadId, reviewThreadId, content: completed.content };
+    } finally {
+      if (turn.terminal || turn.safeToRelease) forgetTurn(turn);
+      else turn.abandoned = true;
+    }
+  };
+
+  const createJob = (kind) => {
+    const now = Date.now();
+    let resolveReady;
+    let rejectReady;
+    const ready = new Promise((resolvePromise, rejectPromise) => {
+      resolveReady = resolvePromise;
+      rejectReady = rejectPromise;
+    });
+    return {
+      jobId: randomUUID(),
+      kind,
+      state: "starting",
+      statusCursor: 0,
+      statusMessage: "Codex: starting",
+      createdAt: now,
+      deadlineAt: now + resolvedHardMs,
+      lastActivityAt: now,
+      commentary: "",
+      commentaryStartOffset: 0,
+      resultText: "",
+      resultRead: false,
+      terminalRead: false,
+      waiters: new Set(),
+      ready,
+      resolveReady,
+      rejectReady,
+    };
   };
   const isTerminalJob = (job) => TERMINAL_CODEX_JOB_STATES.has(job?.state);
-  const jobStatusStructuredContent = (job) => ({
+  const jobStructured = (job) => ({
     jobId: job.jobId,
     state: job.state,
     cursor: job.statusCursor,
     message: job.statusMessage,
     elapsedSeconds: Math.max(0, Math.floor((Date.now() - job.createdAt) / 1_000)),
-    lastActivitySeconds: Math.max(
-      0,
-      Math.floor((Date.now() - job.lastActivityAt) / 1_000),
-    ),
+    lastActivitySeconds: Math.max(0, Math.floor((Date.now() - job.lastActivityAt) / 1_000)),
     ...(job.threadId ? { threadId: job.threadId } : {}),
     ...(job.errorCode ? { code: job.errorCode } : {}),
     resultAvailable: job.state === "completed",
     resultTruncated: false,
     commentaryStartOffset: job.commentaryStartOffset,
-    commentaryEndOffset: job.commentaryEndOffset,
+    commentaryEndOffset: job.commentaryStartOffset + codePointLength(job.commentary),
     commentaryTruncated: job.commentaryStartOffset > 0,
   });
-  const jobStatusResult = (job, { heartbeat = false } = {}) => {
-    const structuredContent = jobStatusStructuredContent(job);
-    const visibleMessage = heartbeat && !isTerminalJob(job)
-      ? `Codex: still running; last activity ${structuredContent.lastActivitySeconds}s ago`
-      : job.statusMessage;
-    structuredContent.message = visibleMessage;
-    let instruction;
-    if (job.state === "completed") {
-      instruction = `Call codex-result with jobId ${job.jobId} to read the final answer.`;
-    } else if (job.state === "failed" || job.state === "canceled") {
-      instruction = "The Codex job is terminal.";
-    } else {
-      instruction =
-        `Call codex-status again with jobId ${job.jobId} and cursor ` +
-        `${job.statusCursor}. If commentaryEndOffset advanced, call codex-commentary.`;
-    }
-    return localToolResult(
-      `Codex job ${job.jobId} is ${job.state}: ${visibleMessage}\n\n${instruction}`,
-      structuredContent,
-    );
-  };
-  const queueJobStatusResponse = (entry, job, options) => {
-    queueLocalToolResponse(entry, jobStatusResult(job, options));
-  };
-  const wakeJobWaiters = (job) => {
-    for (const requestKey of [...job.waiters]) {
-      const entry = inFlight.get(requestKey);
-      if (!entry || entry.state !== "local_wait") {
-        job.waiters.delete(requestKey);
-        continue;
-      }
-      if (job.statusCursor > entry.waitCursor || isTerminalJob(job)) {
-        queueJobStatusResponse(entry, job);
-      }
-    }
-  };
-  const setJobStatusNow = (job, message, { state } = {}) => {
-    if (!job || isTerminalJob(job)) return;
-    const formatted = formatProgressMessage(message) ?? job.statusMessage;
-    const stateChanged = state && state !== job.state;
-    if (!stateChanged && formatted === job.statusMessage) return;
-    if (state) job.state = state;
-    job.statusMessage = formatted;
-    job.statusCursor += 1;
-    job.lastStatusAt = Date.now();
-    job.pendingStatusMessage = undefined;
-    if (job.statusTimer) {
-      clearTimeout(job.statusTimer);
-      job.statusTimer = undefined;
-    }
-    wakeJobWaiters(job);
-  };
-  const flushPendingJobStatus = (job) => {
-    job.statusTimer = undefined;
-    const message = job.pendingStatusMessage;
-    job.pendingStatusMessage = undefined;
-    if (message) setJobStatusNow(job, message, { state: "running" });
-  };
-  const scheduleJobStatus = (job, message) => {
-    if (!job || isTerminalJob(job)) return;
-    const formatted = formatProgressMessage(message);
-    if (
-      !formatted || formatted === job.statusMessage ||
-      formatted === formatProgressMessage(job.pendingStatusMessage)
-    ) {
-      return;
-    }
-    const elapsed = job.lastStatusAt == null
-      ? Number.POSITIVE_INFINITY
-      : Date.now() - job.lastStatusAt;
-    if (elapsed >= statusIntervalMs) {
-      setJobStatusNow(job, formatted.slice("Codex: ".length), { state: "running" });
-      return;
-    }
-    job.pendingStatusMessage = formatted.slice("Codex: ".length);
-    if (!job.statusTimer) {
-      job.statusTimer = setTimeout(
-        () => flushPendingJobStatus(job),
-        Math.max(1, statusIntervalMs - elapsed),
-      );
-    }
-  };
-  const appendJobCommentary = (job, value) => {
-    const text = sanitizeCommentaryText(value);
-    if (!text) return "";
-    job.commentary += text;
-    job.commentaryEndOffset += codePointLength(text);
-    let byteLength = Buffer.byteLength(job.commentary, "utf8");
-    if (byteLength > commentaryByteLimit) {
-      const codePoints = Array.from(job.commentary);
-      let dropped = 0;
-      while (byteLength > commentaryByteLimit && dropped < codePoints.length) {
-        byteLength -= Buffer.byteLength(codePoints[dropped], "utf8");
-        dropped += 1;
-      }
-      job.commentary = codePoints.slice(dropped).join("");
-      job.commentaryStartOffset += dropped;
-      if (!job.commentaryTruncationLogged) {
-        logErr(
-          `[mcp-agents] Codex job ${job.jobId} commentary exceeded ` +
-            `${commentaryByteLimit} bytes; retaining tail`,
-        );
-        job.commentaryTruncationLogged = true;
-      }
-    }
-    return text;
-  };
-  const appendJobCommentarySeparator = (job) => {
-    if (job.commentary.endsWith("\n\n")) return;
-    appendJobCommentary(job, job.commentary.endsWith("\n") ? "\n" : "\n\n");
-  };
-  const closeActiveCommentaryItem = (job) => {
-    const itemId = job.activeCommentaryItemId;
-    if (!itemId) return;
-    const item = job.commentaryItems.get(itemId);
-    if (item?.hasText) appendJobCommentarySeparator(job);
-    if (item) item.closed = true;
-    job.activeCommentaryItemId = undefined;
-  };
-  const captureJobCommentary = (job, event) => {
-    if (!job || !event || typeof event !== "object" || job.commentaryComplete) return;
-    if (event.type === "item_started") {
-      const item = event.item;
-      if (
-        item?.type !== "AgentMessage" || item.phase !== "commentary" ||
-        typeof item.id !== "string"
-      ) return;
-      job.streamedCommentarySeen = true;
-      if (job.activeCommentaryItemId && job.activeCommentaryItemId !== item.id) {
-        closeActiveCommentaryItem(job);
-      }
-      job.commentaryItems.set(item.id, {
-        observed: "",
-        observedOverflow: false,
-        sawDelta: false,
-        hasText: false,
-        closed: false,
-      });
-      job.activeCommentaryItemId = item.id;
-      return;
-    }
-    if (event.type === "agent_message_content_delta") {
-      const item = job.commentaryItems.get(event.item_id);
-      if (
-        !item || item.closed || job.activeCommentaryItemId !== event.item_id ||
-        typeof event.delta !== "string"
-      ) return;
-      const text = appendJobCommentary(job, event.delta);
-      if (!text) return;
-      item.sawDelta = true;
-      item.hasText = true;
-      if (!item.observedOverflow) {
-        const combined = `${item.observed}${text}`;
-        if (Buffer.byteLength(combined, "utf8") <= commentaryByteLimit) {
-          item.observed = combined;
-        } else {
-          item.observed = "";
-          item.observedOverflow = true;
-        }
-      }
-      return;
-    }
-    if (event.type === "item_completed") {
-      const completed = event.item;
-      if (
-        completed?.type !== "AgentMessage" || completed.phase !== "commentary" ||
-        typeof completed.id !== "string"
-      ) return;
-      const item = job.commentaryItems.get(completed.id);
-      if (!item || item.closed || job.activeCommentaryItemId !== completed.id) return;
-      const completedText = sanitizeCommentaryText(
-        Array.isArray(completed.content)
-          ? completed.content
-            .filter((part) => part?.type === "Text" && typeof part.text === "string")
-            .map((part) => part.text)
-            .join("")
-          : completed.message,
-      );
-      if (!item.sawDelta) {
-        if (appendJobCommentary(job, completedText)) item.hasText = true;
-      } else if (!item.observedOverflow && completedText.startsWith(item.observed)) {
-        if (appendJobCommentary(job, completedText.slice(item.observed.length))) {
-          item.hasText = true;
-        }
-      }
-      closeActiveCommentaryItem(job);
-      return;
-    }
-    if (
-      event.type === "agent_message" && event.phase === "commentary" &&
-      typeof event.message === "string" && !job.streamedCommentarySeen
-    ) {
-      if (appendJobCommentary(job, event.message)) appendJobCommentarySeparator(job);
-    }
-  };
-  const finishJobCommentary = (job) => {
-    if (!job || job.commentaryComplete) return;
-    closeActiveCommentaryItem(job);
-    job.commentaryComplete = true;
-  };
-  const removeJob = (job) => {
-    if (!job) return;
-    if (job.statusTimer) clearTimeout(job.statusTimer);
-    for (const requestKey of job.waiters) {
-      const entry = inFlight.get(requestKey);
-      if (entry) {
-        clearTimer(entry, "localWaitTimer");
-        settleInFlight(entry.id);
-      }
-    }
-    jobs.delete(job.jobId);
-    jobsByNativeRequest.delete(job.nativeRequestKey);
-  };
-  const pruneJobs = () => {
-    const now = Date.now();
-    for (const job of [...jobs.values()]) {
-      if (isTerminalJob(job) && job.expiresAt <= now) removeJob(job);
-    }
-    if (jobs.size < MAX_RETAINED_CODEX_JOBS) return;
-    const evictable = [...jobs.values()]
-      .filter((job) =>
-        isTerminalJob(job) &&
-        (job.resultRead || (job.state !== "completed" && job.terminalRead))
-      )
-      .sort((a, b) => a.terminalAt - b.terminalAt);
-    while (jobs.size >= MAX_RETAINED_CODEX_JOBS && evictable.length > 0) {
-      removeJob(evictable.shift());
-    }
-  };
-  const activeJobCount = () =>
-    [...jobs.values()].filter((job) => !isTerminalJob(job)).length;
-  const transitionJobTerminal = (
-    job,
-    state,
-    message,
-    { resultText, threadId, code } = {},
-  ) => {
-    if (!job || isTerminalJob(job)) return;
-    if (job.statusTimer) clearTimeout(job.statusTimer);
-    job.statusTimer = undefined;
-    job.pendingStatusMessage = undefined;
-    finishJobCommentary(job);
+  const finishJob = (job, state, message, result) => {
+    if (isTerminalJob(job)) return;
     job.state = state;
-    job.statusMessage = formatProgressMessage(message) ?? `Codex: ${state}`;
+    job.statusMessage = `Codex: ${message}`;
     job.statusCursor += 1;
     job.terminalAt = Date.now();
     job.expiresAt = job.terminalAt + CODEX_JOB_RETENTION_MS;
-    if (typeof threadId === "string" && threadId) job.threadId = threadId;
-    if (typeof code === "string" && code) job.errorCode = code;
-    if (state === "completed") {
-      job.resultText = typeof resultText === "string" ? resultText : "";
-      job.resultEndOffset = codePointLength(job.resultText);
-    }
-    wakeJobWaiters(job);
+    if (result?.threadId) job.threadId = result.threadId;
+    if (state === "completed") job.resultText = result?.content ?? "";
+    for (const wake of job.waiters) wake();
+    job.waiters.clear();
   };
-  const resultTextFromNative = (result) => {
-    if (typeof result?.structuredContent?.content === "string") {
-      return result.structuredContent.content;
+  const pruneJobs = () => {
+    const now = Date.now();
+    for (const [jobId, job] of jobs) {
+      if (isTerminalJob(job) && job.expiresAt <= now) jobs.delete(jobId);
     }
-    if (!Array.isArray(result?.content)) return "";
-    return result.content
-      .filter((part) => part?.type === "text" && typeof part.text === "string")
-      .map((part) => part.text)
-      .join("\n");
+    if (jobs.size < maxRetainedJobs) return;
+    const evictable = [...jobs.values()]
+      .filter((job) => isTerminalJob(job) && (job.resultRead || job.terminalRead))
+      .sort((left, right) => left.terminalAt - right.terminalAt);
+    while (jobs.size >= maxRetainedJobs && evictable.length) {
+      jobs.delete(evictable.shift().jobId);
+    }
   };
-  const handlePrivateResponse = (entry, msg) => {
-    const job = jobs.get(entry.jobId);
-    if (!job || isTerminalJob(job)) return;
-    const nativeThreadId = msg.result?.structuredContent?.threadId ?? entry.threadId ?? job.threadId;
-    if (job.state === "canceling" || entry.state === "canceled") {
-      transitionJobTerminal(job, "canceled", "canceled", { threadId: nativeThreadId });
-      return;
-    }
-    if (entry.terminalOutcome === "aborted") {
-      transitionJobTerminal(
-        job,
-        "failed",
-        `${entry.terminalEventType ?? "turn_aborted"}: Codex aborted the turn before completion`,
-        { threadId: nativeThreadId },
-      );
-      return;
-    }
-    if (entry.codexAuthInvalidated || isCodexAuthFailureResult(msg)) {
-      markCodexAuthInvalidated(entry);
-      transitionJobTerminal(job, "failed", CODEX_AUTH_FAILURE_MESSAGE, {
-        threadId: nativeThreadId,
-        code: CODEX_AUTH_FAILURE_CODE,
+  const startBackground = async (kind, args) => {
+    pruneJobs();
+    const activeCount = [...jobs.values()].filter((job) => !isTerminalJob(job)).length;
+    if (activeCount >= maxActiveJobs || jobs.size >= maxRetainedJobs) {
+      return errorResult("capacity_exceeded", "Codex background-job capacity is full", {
+        activeJobs: activeCount,
+        retainedJobs: jobs.size,
+        maxActiveJobs,
+        maxRetainedJobs,
       });
-      return;
     }
-    if (msg.error) {
-      const message = normalizeProgressText(msg.error.message) || "native Codex request failed";
-      transitionJobTerminal(job, "failed", message, { threadId: nativeThreadId });
-      return;
-    }
-    if (msg.result?.isError === true) {
-      transitionJobTerminal(
+    const job = createJob(kind);
+    jobs.set(job.jobId, job);
+    const work = kind === "review"
+      ? runReview(args, undefined, job)
+      : runTurn(args, undefined, {
+        reply: kind === "reply",
+        backgroundJob: job,
+      });
+    void work.then((result) => finishJob(job, "completed", "completed", result)).catch((err) => {
+      const code = err?.codexCode ?? "codex_job_failed";
+      job.errorCode = code;
+      job.rejectReady(err);
+      finishJob(
         job,
-        "failed",
-        resultTextFromNative(msg.result) || "native Codex tool returned an error",
-        { threadId: nativeThreadId },
+        code === "codex_turn_interrupted" ? "canceled" : "failed",
+        err?.message ?? String(err),
       );
-      return;
-    }
-    transitionJobTerminal(job, "completed", "completed", {
-      resultText: resultTextFromNative(msg.result),
-      threadId: nativeThreadId,
     });
-  };
-  const jobNotFoundResult = (jobId) => localToolResult(
-    `Codex job ${jobId} was not found. Jobs are local to this MCP connection and expire.`,
-    { code: "job_not_found", jobId },
-    { isError: true },
-  );
-  const pageByCodePoint = (text, offset) => {
-    const codePoints = Array.from(text ?? "");
-    const page = codePoints.slice(offset, offset + MAX_CODEX_PAGE_CODEPOINTS);
-    return {
-      text: page.join(""),
-      nextOffset: offset + page.length,
-      endOffset: codePoints.length,
-    };
-  };
-  const commentaryResult = (job, requestedOffset) => {
-    if (requestedOffset > job.commentaryEndOffset) {
-      return localToolResult(
-        `Commentary offset ${requestedOffset} is beyond the available range ` +
-          `${job.commentaryStartOffset}..${job.commentaryEndOffset}.`,
-        {
-          code: "commentary_offset_out_of_range",
-          jobId: job.jobId,
-          requestedOffset,
-          startOffset: job.commentaryStartOffset,
-          endOffset: job.commentaryEndOffset,
-        },
-        { isError: true },
+    try {
+      await job.ready;
+    } catch (err) {
+      return errorResult(
+        err?.codexCode ?? "codex_job_failed",
+        err instanceof Error ? err.message : String(err),
+        { jobId: job.jobId },
       );
     }
-    const startOffset = Math.max(requestedOffset, job.commentaryStartOffset);
-    const relativeOffset = startOffset - job.commentaryStartOffset;
-    const page = pageByCodePoint(job.commentary, relativeOffset);
-    const nextOffset = startOffset + codePointLength(page.text);
-    const structuredContent = {
-      jobId: job.jobId,
-      state: job.state,
-      latestStatus: job.statusMessage,
-      requestedOffset,
-      startOffset,
-      nextOffset,
-      endOffset: job.commentaryEndOffset,
-      caughtUp: nextOffset === job.commentaryEndOffset,
-      commentaryComplete: job.commentaryComplete,
-      truncatedBefore: requestedOffset < job.commentaryStartOffset,
-      text: page.text,
-    };
-    const visible = page.text || "(No new Codex commentary.)";
-    return localToolResult(visible, structuredContent);
-  };
-  const resultPageResult = (job, offset) => {
-    if (!isTerminalJob(job)) {
-      return localToolResult(
-        `Codex job ${job.jobId} is still ${job.state}. Continue with codex-status.`,
-        {
-          jobId: job.jobId,
-          state: job.state,
-          resultAvailable: false,
-          next: { tool: "codex-status", arguments: { jobId: job.jobId, cursor: job.statusCursor } },
-        },
-      );
-    }
-    if (job.state !== "completed") {
-      job.terminalRead = true;
-      return localToolResult(
-        `Codex job ${job.jobId} ${job.state}: ${job.statusMessage}`,
-        {
-          jobId: job.jobId,
-          state: job.state,
-          ...(job.errorCode ? { code: job.errorCode } : {}),
-          resultAvailable: false,
-        },
-        { isError: true },
-      );
-    }
-    if (offset > job.resultEndOffset) {
-      return localToolResult(
-        `Result offset ${offset} is beyond the available range 0..${job.resultEndOffset}.`,
-        { code: "result_offset_out_of_range", jobId: job.jobId, offset },
-        { isError: true },
-      );
-    }
-    const page = pageByCodePoint(job.resultText, offset);
-    const done = page.nextOffset === page.endOffset;
-    if (done) job.resultRead = true;
-    return localToolResult(
-      page.text || "(Codex returned an empty result.)",
+    return toolResult(
+      `Codex job ${job.jobId} started. Call codex-status with cursor 0 until terminal.`,
       {
         jobId: job.jobId,
         state: job.state,
-        ...(job.threadId ? { threadId: job.threadId } : {}),
-        offset,
-        nextOffset: page.nextOffset,
-        endOffset: page.endOffset,
-        done,
-        resultTruncated: false,
-        text: page.text,
+        cursor: 0,
+        message: job.statusMessage,
+        commentaryStartOffset: 0,
+        commentaryEndOffset: 0,
+        next: { tool: "codex-status", arguments: { jobId: job.jobId, cursor: 0 } },
       },
     );
   };
-  const createJob = ({ nativeId, nativeToolName, startRequestKey }) => {
-    const now = Date.now();
-    return {
-      jobId: randomUUID(),
-      nativeId,
-      nativeRequestKey: idKey(nativeId),
-      nativeToolName,
-      startRequestKey,
-      state: "starting",
-      statusCursor: 0,
-      statusMessage: "Codex: starting",
-      createdAt: now,
-      lastActivityAt: now,
-      lastStatusAt: undefined,
-      pendingStatusMessage: undefined,
-      statusTimer: undefined,
-      threadId: undefined,
-      waiters: new Set(),
-      commentary: "",
-      commentaryStartOffset: 0,
-      commentaryEndOffset: 0,
-      commentaryComplete: false,
-      commentaryTruncationLogged: false,
-      commentaryItems: new Map(),
-      activeCommentaryItemId: undefined,
-      streamedCommentarySeen: false,
-      resultText: "",
-      resultEndOffset: 0,
-      resultRead: false,
-      terminalRead: false,
-      terminalAt: undefined,
-      expiresAt: Number.POSITIVE_INFINITY,
-      errorCode: undefined,
-    };
-  };
-  const startResult = (job) => localToolResult(
-    `Codex job ${job.jobId} started. Call codex-status with cursor 0 until terminal.`,
-    {
-      jobId: job.jobId,
-      state: job.state,
-      cursor: job.statusCursor,
-      message: job.statusMessage,
-      commentaryStartOffset: 0,
-      commentaryEndOffset: 0,
-      next: { tool: "codex-status", arguments: { jobId: job.jobId, cursor: 0 } },
-    },
+  const jobNotFound = (jobId) => errorResult(
+    "job_not_found",
+    `Codex job ${jobId} was not found. Jobs are local to this MCP connection and expire.`,
+    { jobId },
   );
-  const requestJobCancellation = (job, reason = "canceled by caller") => {
-    if (!job || isTerminalJob(job) || job.state === "canceling") return;
-    setJobStatusNow(job, "canceling", { state: "canceling" });
-    const nativeEntry = inFlight.get(job.nativeRequestKey);
-    if (!nativeEntry) {
-      transitionJobTerminal(job, "canceled", "canceled");
-      return;
-    }
-    cancelInFlight(job.nativeId);
-    try {
-      child.stdin.write(`${JSON.stringify({
-        jsonrpc: "2.0",
-        method: "notifications/cancelled",
-        params: { requestId: job.nativeId, reason },
-      })}\n`);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      transitionJobTerminal(job, "failed", `cancellation failed: ${message}`);
-    }
-  };
-  const dispatchJob = (msg, clientEntry, nativeToolName) => {
-    pruneJobs();
-    if (
-      activeJobCount() >= MAX_ACTIVE_CODEX_JOBS ||
-      jobs.size >= MAX_RETAINED_CODEX_JOBS
-    ) {
-      queueLocalToolResponse(
-        clientEntry,
-        localToolResult(
-          "Codex background-job capacity is full; collect retained results or wait for expiry.",
-          {
-            code: "capacity_exceeded",
-            activeJobs: activeJobCount(),
-            retainedJobs: jobs.size,
-            maxActiveJobs: MAX_ACTIVE_CODEX_JOBS,
-            maxRetainedJobs: MAX_RETAINED_CODEX_JOBS,
-          },
-          { isError: true },
-        ),
-      );
-      return;
-    }
 
-    const nativeId = `${privateRequestPrefix}${++privateRequestSequence}`;
-    const requestKey = idKey(msg.id);
-    const job = createJob({ nativeId, nativeToolName, startRequestKey: requestKey });
-    const nativeMsg = {
-      jsonrpc: "2.0",
-      id: nativeId,
-      method: "tools/call",
-      params: {
-        name: nativeToolName,
-        arguments: { ...msg.params.arguments },
-      },
-    };
-    jobs.set(job.jobId, job);
-    jobsByNativeRequest.set(job.nativeRequestKey, job);
-    privateJobRequestIds.add(job.nativeRequestKey);
-    if (!addInFlight(nativeMsg)) {
-      privateJobRequestIds.delete(job.nativeRequestKey);
-      removeJob(job);
-      queueLocalToolResponse(
-        clientEntry,
-        localToolResult(
-          "Could not reserve a private Codex request ID.",
-          { code: "private_request_id_collision" },
-          { isError: true },
-        ),
-      );
-      return;
+  const sanitizeThread = (thread, { includeTurns = false, cursor, limit = 20 } = {}) => {
+    if (!thread || typeof thread !== "object") return {};
+    const clean = {};
+    for (const field of [
+      "id", "preview", "modelProvider", "model", "cwd", "createdAt", "updatedAt",
+      "status", "archived", "name", "gitInfo",
+    ]) if (thread[field] !== undefined) clean[field] = thread[field];
+    if (!includeTurns || !Array.isArray(thread.turns)) return clean;
+    const start = cursor ? Number(cursor) : 0;
+    const safeStart = Number.isInteger(start) && start >= 0 ? start : 0;
+    const turns = thread.turns.slice(safeStart, safeStart + limit).map((turn) => ({
+      id: turn.id,
+      status: turn.status,
+      items: Array.isArray(turn.items)
+        ? turn.items.flatMap((item) => {
+          if (item?.type === "agentMessage" && typeof item.text === "string") {
+            return [{ id: item.id, type: item.type, phase: item.phase, text: item.text }];
+          }
+          if (item?.type === "userMessage" && Array.isArray(item.content)) {
+            return [{
+              id: item.id,
+              type: item.type,
+              content: item.content
+                .filter((part) => part?.type === "text" && typeof part.text === "string")
+                .map((part) => ({ type: "text", text: part.text })),
+            }];
+          }
+          return [];
+        })
+        : [],
+    }));
+    clean.turns = turns;
+    clean.nextCursor = safeStart + turns.length < thread.turns.length
+      ? String(safeStart + turns.length)
+      : null;
+    const encoded = JSON.stringify(clean);
+    if (Buffer.byteLength(encoded, "utf8") > MAX_CODEX_COMMENTARY_BYTES) {
+      clean.turns = [];
+      clean.historyTruncated = true;
+      clean.nextCursor = String(safeStart);
     }
-    const nativeEntry = inFlight.get(job.nativeRequestKey);
-    nativeEntry.internalJob = true;
-    nativeEntry.jobId = job.jobId;
-    prepareLocalEntry(clientEntry);
-    clientEntry.startJobId = job.jobId;
-    try {
-      const transformed = transformCodexToolCall(
-        JSON.stringify(nativeMsg),
-        { serverGoal: resolvedGoal, agentsEnabledKeySupported },
-      );
-      child.stdin.write(`${transformed}\n`);
-    } catch (err) {
-      privateJobRequestIds.delete(job.nativeRequestKey);
-      settleInFlight(nativeId);
-      jobsByNativeRequest.delete(job.nativeRequestKey);
-      const message = err instanceof Error ? err.message : String(err);
-      transitionJobTerminal(job, "failed", `dispatch failed: ${message}`);
-    }
-    queueLocalToolResponse(clientEntry, startResult(job));
+    return clean;
   };
-  // Read-only view of the in-flight table for codex-peek. Only real Codex turns are
-  // listed — `codex` and `codex-reply` — whether the client issued one directly or a
-  // job dispatched it privately. The peek call is a different tool, so a peek can
-  // never report itself.
-  const normalizeWorkspace = (value) =>
-    typeof value === "string" && value.length > 1 && value.endsWith("/")
-      ? value.replace(/\/+$/, "")
-      : value;
-  const peekRows = (filter) => {
-    const now = Date.now();
-    const rows = [];
-    for (const entry of inFlight.values()) {
-      if (entry.method !== "tools/call") continue;
-      if (!entry.toolName || !CODEX_TOOL_CONTRACTS[entry.toolName]) continue;
-      // "canceled" is NOT gone. The bridge cancels best-effort and waits out
-      // --codex_cancel_grace, during which Codex is still executing under
-      // workspace-write. Dropping those rows would answer "nothing in flight" to the
-      // one caller who most needs a yes: someone deciding whether it is safe to send a
-      // second writer into that tree.
-      const live = entry.state === "open";
-      const canceling = entry.state === "canceled";
-      if (!live && !canceling) continue;
-      // A job's native request id belongs to the wrapper's private namespace; handing
-      // it out makes it addressable from outside the job state machine. Jobs are
-      // addressed by jobId.
-      const requestId = entry.internalJob ? undefined : idKey(entry.id);
-      if (filter.requestId && filter.requestId !== requestId) continue;
-      if (filter.threadId && filter.threadId !== entry.threadId) continue;
-      const cwd = normalizeWorkspace(entry.cwd);
-      // A cwd filter must never HIDE a turn whose workspace is merely unknown — that
-      // converts "I cannot tell" into "nothing is running there", the exact inversion
-      // this tool exists to prevent. Unknown-workspace turns are always reported.
-      if (filter.cwd && cwd !== undefined && filter.cwd !== cwd) continue;
-      rows.push({
-        ...(requestId ? { requestId } : {}),
-        tool: entry.toolName,
-        state: canceling ? "canceling" : "running",
-        ...(entry.threadId ? { threadId: entry.threadId } : {}),
-        ...(cwd ? { cwd, cwdInferred: Boolean(entry.cwdInferred) } : { cwdUnknown: true }),
-        ...(entry.sandbox ? { sandbox: entry.sandbox } : {}),
-        ...(entry.internalJob && entry.jobId ? { jobId: entry.jobId } : {}),
-        elapsedSeconds: Math.max(0, Math.floor((now - entry.startedAt) / 1_000)),
-        lastActivitySeconds: Math.max(
-          0,
-          Math.floor((now - (entry.lastActivityAt ?? entry.startedAt)) / 1_000),
-        ),
-      });
-    }
-    rows.sort((a, b) =>
-      b.elapsedSeconds - a.elapsedSeconds ||
-      String(a.requestId ?? a.jobId ?? "").localeCompare(String(b.requestId ?? b.jobId ?? ""))
-    );
-    return rows;
-  };
-  const describePeekRow = (turn) =>
-    `${turn.tool} ${turn.requestId ?? turn.jobId ?? "(unidentified)"}: ` +
-    `${turn.elapsedSeconds}s elapsed, last activity ${turn.lastActivitySeconds}s ago` +
-    (turn.state === "canceling" ? ", CANCELING (not confirmed stopped)" : "") +
-    (turn.threadId ? `, thread ${turn.threadId}` : ", thread not yet reported") +
-    (turn.cwd
-      ? `, cwd ${turn.cwd}${turn.cwdInferred ? " (inherited)" : ""}`
-      : ", workspace unknown");
-  const peekResult = (args) => {
-    const filter = {
-      cwd: typeof args.cwd === "string" ? normalizeWorkspace(args.cwd) : undefined,
-      threadId: typeof args.threadId === "string" ? args.threadId : undefined,
-      requestId: typeof args.requestId === "string" ? args.requestId : undefined,
-    };
-    const filtered = Boolean(filter.cwd || filter.threadId || filter.requestId);
-    const turns = peekRows(filter);
-    const canceling = turns.filter((turn) => turn.state === "canceling").length;
-    // An empty peek is the one answer a caller must not over-read: a turn the wrapper
-    // stopped waiting for keeps running inside Codex with no in-flight request left.
-    let text = turns.length === 0
-      ? `No ${filtered ? "matching " : ""}Codex turn is in flight. This is not evidence ` +
-        "one finished — an abandoned turn keeps running with nothing left to report."
-      : turns.map(describePeekRow).join("\n");
-    if (filtered && turns.length > 1) {
-      text += `\n\n${turns.length} turns match; the filter does not identify a single turn.`;
-    }
-    if (canceling > 0) {
-      text += `\n\n${canceling} turn(s) cancelled but NOT confirmed stopped — still writing.`;
-    }
-    if (abandonedTurns.size > 0) {
-      text += `\n\n${abandonedTurns.size} abandoned turn(s) may still be writing` +
-        `${filtered ? " (process-wide; not narrowed by your filter)" : ""}.`;
-    }
-    return localToolResult(text, {
-      turns,
-      count: turns.length,
-      canceling,
-      ambiguous: filtered && turns.length > 1,
-      // Process-wide by nature — abandoned turns retain no workspace — so it is named
-      // for what it is. A machine consumer reading a bare `abandonedTurns` under a cwd
-      // filter would attribute all of them to that workspace.
-      abandonedTurnsProcessWide: abandonedTurns.size,
-    });
-  };
-  const handleJobToolCall = (msg, entry) => {
-    const toolName = msg.params?.name;
-    const args = msg.params?.arguments ?? {};
-    if (toolName === "codex-start" || toolName === "codex-reply-start") {
-      dispatchJob(msg, entry, toolName === "codex-start" ? "codex" : "codex-reply");
-      return true;
-    }
-    if (toolName === "codex-peek") {
-      queueLocalToolResponse(entry, peekResult(args));
-      return true;
-    }
-    if (!CODEX_JOB_TOOL_CONTRACTS[toolName]) return false;
-    pruneJobs();
-    const job = jobs.get(args.jobId);
-    if (!job) {
-      queueLocalToolResponse(entry, jobNotFoundResult(args.jobId));
-      return true;
-    }
-    if (toolName === "codex-status") {
-      if (args.cursor > job.statusCursor) {
-        queueLocalToolResponse(
-          entry,
-          localToolResult(
-            `Status cursor ${args.cursor} is ahead of current cursor ${job.statusCursor}.`,
-            { code: "status_cursor_ahead", jobId: job.jobId, cursor: job.statusCursor },
-            { isError: true },
-          ),
-        );
-        return true;
-      }
-      if (isTerminalJob(job)) {
-        if (job.state !== "completed") job.terminalRead = true;
-        queueJobStatusResponse(entry, job);
-        return true;
-      }
-      // Pacing the cursor alone does not bound wakeups: a caught-up poller is still
-      // re-woken by the heartbeat every wait_ms. Default that wait to the status
-      // cadence so a heartbeat never out-paces the cursor it reports on, capped at the
-      // protocol maximum, and fall back to the plain default when pacing is disabled.
-      const defaultWaitMs = statusIntervalMs > 0
-        ? Math.min(MAX_CODEX_STATUS_WAIT_MS, statusIntervalMs)
-        : DEFAULT_CODEX_WAIT_INTERVAL_MS;
-      const waitMs = args.wait_ms ?? defaultWaitMs;
-      if (args.cursor < job.statusCursor || waitMs === 0) {
-        queueJobStatusResponse(entry, job);
-        return true;
-      }
-      prepareLocalEntry(entry, "local_wait");
-      entry.waitJobId = job.jobId;
-      entry.waitCursor = args.cursor;
-      job.waiters.add(idKey(entry.id));
-      entry.localWaitTimer = setTimeout(() => {
-        if (inFlight.get(idKey(entry.id)) === entry && entry.state === "local_wait") {
-          queueJobStatusResponse(entry, job, { heartbeat: true });
-        }
-      }, waitMs);
-      if (job.statusCursor > args.cursor || isTerminalJob(job)) {
-        queueJobStatusResponse(entry, job);
-      }
-      return true;
-    }
-    if (toolName === "codex-commentary") {
-      queueLocalToolResponse(entry, commentaryResult(job, args.offset ?? 0));
-      return true;
-    }
-    if (toolName === "codex-result") {
-      queueLocalToolResponse(entry, resultPageResult(job, args.offset ?? 0));
-      return true;
-    }
-    if (toolName === "codex-cancel") {
-      requestJobCancellation(job);
-      queueLocalToolResponse(entry, jobStatusResult(job));
-      return true;
-    }
-    return false;
-  };
-  const emitProgressMessage = (entry, message) => {
-    if (
-      finalizing || entry.progressToken == null || entry.state !== "open" ||
-      inFlight.get(idKey(entry.id)) !== entry
-    ) return;
-    const formatted = formatProgressMessage(message);
-    if (!formatted || formatted === entry.lastProgressMessage) return;
-    const now = Date.now();
-    entry.lastProgressQueuedAt = now;
-    entry.lastProgressMessage = formatted;
-    entry.progressSequence += 1;
-    queueGeneratedFrame(
+
+  outerServer = new Server(
+    { name: "mcp-agents", version: VERSION },
+    { capabilities: { tools: {}, resources: {}, prompts: {} } },
+  );
+  outerServer.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
       {
-        jsonrpc: "2.0",
-        method: "notifications/progress",
-        params: {
-          progressToken: entry.progressToken,
-          progress: entry.progressSequence,
-          message: formatted,
-        },
+        name: "ping",
+        description: "Connectivity test. Returns pong without starting Codex.",
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
       },
-      { requestKey: idKey(entry.id), kind: "progress" },
-    );
-  };
-  const flushPendingProgress = (entry) => {
-    clearTimer(entry, "progressFlushTimer");
-    if (finalizing || entry.state !== "open") return;
-    const message = entry.pendingProgressMessage;
-    entry.pendingProgressMessage = undefined;
-    emitProgressMessage(entry, message);
-  };
-  const scheduleProgress = (entry, message, { useful = true } = {}) => {
-    if (finalizing || entry.progressToken == null || entry.state !== "open") return;
-    const formatted = formatProgressMessage(message);
-    if (!formatted) return;
-    if (
-      formatted === entry.lastProgressMessage ||
-      formatted === entry.pendingProgressMessage
-    ) return;
+      ...[
+        ...Object.keys(CODEX_TOOL_CONTRACTS),
+        ...CODEX_JOB_TOOL_NAMES,
+        ...CODEX_LOCAL_TOOL_NAMES,
+        ...CODEX_APP_TOOL_NAMES,
+      ].map((name) => ({ name, ...codexToolPresentation(name) })),
+    ],
+  }));
+  outerServer.setRequestHandler(ListResourcesRequestSchema, async () => ({ resources: [] }));
+  outerServer.setRequestHandler(
+    ListResourceTemplatesRequestSchema,
+    async () => ({ resourceTemplates: [] }),
+  );
+  outerServer.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: [] }));
+  outerServer.setRequestHandler(PingRequestSchema, async () => toolResult("pong"));
 
-    const firstUseful = useful && !entry.hasUsefulProgress;
-    if (useful) entry.hasUsefulProgress = true;
-    const elapsed = entry.lastProgressQueuedAt == null
-      ? Number.POSITIVE_INFINITY
-      : Date.now() - entry.lastProgressQueuedAt;
-    if (firstUseful || elapsed >= progressIntervalMs) {
-      clearTimer(entry, "progressFlushTimer");
-      entry.pendingProgressMessage = undefined;
-      emitProgressMessage(entry, formatted.slice("Codex: ".length));
-      return;
-    }
-
-    entry.pendingProgressMessage = formatted.slice("Codex: ".length);
-    if (entry.progressFlushTimer) return;
-    entry.progressFlushTimer = setTimeout(
-      () => flushPendingProgress(entry),
-      Math.max(1, progressIntervalMs - elapsed),
-    );
-  };
-  const armProgressWait = (entry) => {
-    clearTimer(entry, "waitTimer");
-    if (
-      finalizing || entry.progressToken == null || entry.state !== "open" ||
-      !(waitIntervalMs > 0)
-    ) return;
-    const visibleAt = Math.max(
-      entry.lastProgressDeliveredAt ?? entry.startedAt,
-      entry.lastWaitAttemptAt ?? entry.startedAt,
-    );
-    const delay = Math.max(1, waitIntervalMs - (Date.now() - visibleAt));
-    entry.waitTimer = setTimeout(() => {
-      entry.waitTimer = undefined;
-      if (
-        finalizing || entry.state !== "open" ||
-        inFlight.get(idKey(entry.id)) !== entry
-      ) return;
-      // A generated frame can only be injected at a native frame boundary. Try
-      // again on every silence tick; queueGeneratedFrame keeps only the latest
-      // status if Codex is currently stalled mid-frame.
-      flushGeneratedFrames();
-      const lastActivityAt = entry.lastActivityAt ?? entry.startedAt;
-      const seconds = Math.max(0, Math.floor((Date.now() - lastActivityAt) / 1_000));
-      entry.lastWaitAttemptAt = Date.now();
-      scheduleProgress(
-        entry,
-        `still running; last activity ${seconds}s ago`,
-        { useful: false },
-      );
-      armProgressWait(entry);
-    }, delay);
-  };
-  const progressMessageForEvent = (entry, event) => {
-    if (!event || typeof event !== "object") return undefined;
-    const type = event.type;
-
-    if (type === "item_started") {
-      const item = event.item;
-      if (
-        item?.type === "AgentMessage" && item.phase === "commentary" &&
-        typeof item.id === "string"
-      ) {
-        entry.commentaryItemIds.add(item.id);
-        entry.commentaryBuffers.set(item.id, "");
-      }
-      return undefined;
-    }
-    if (type === "agent_message_content_delta") {
-      const itemId = event.item_id;
-      if (
-        typeof itemId !== "string" || !entry.commentaryItemIds.has(itemId) ||
-        typeof event.delta !== "string"
-      ) return undefined;
-      const prior = entry.commentaryBuffers.get(itemId) ?? "";
-      const combined = Array.from(`${prior}${event.delta}`).slice(-400).join("");
-      entry.commentaryBuffers.set(itemId, combined);
-      return combined;
-    }
-    if (type === "item_completed") {
-      const item = event.item;
-      if (
-        item?.type !== "AgentMessage" || item.phase !== "commentary" ||
-        typeof item.id !== "string"
-      ) return undefined;
-      entry.commentaryItemIds.delete(item.id);
-      const buffered = entry.commentaryBuffers.get(item.id);
-      entry.commentaryBuffers.delete(item.id);
-      const completed = Array.isArray(item.content)
-        ? item.content
-          .filter((content) => content?.type === "Text" && typeof content.text === "string")
-          .map((content) => content.text)
-          .join("")
-        : undefined;
-      return completed || (typeof item.message === "string" ? item.message : buffered);
-    }
-    if (type === "agent_message") {
-      return event.phase === "commentary" && typeof event.message === "string"
-        ? event.message
-        : undefined;
-    }
-    if (type === "plan_update" && Array.isArray(event.plan)) {
-      const active = event.plan.find((step) =>
-        step?.status === "in_progress" && typeof step.step === "string"
-      );
-      return active ? `working on: ${active.step}` : undefined;
-    }
-
-    switch (type) {
-      case "task_started":
-        return "started";
-      case "exec_command_begin":
-        return "running a command";
-      case "exec_command_end":
-        return Number.isInteger(event.exit_code)
-          ? `command finished (exit ${event.exit_code})`
-          : "command finished";
-      case "patch_apply_begin": {
-        const count = event.changes && typeof event.changes === "object"
-          ? Object.keys(event.changes).length
-          : undefined;
-        return count == null ? "applying changes" : `applying changes to ${count} file(s)`;
-      }
-      case "patch_apply_end":
-        return event.success === false ? "change application failed" : "changes applied";
-      case "mcp_tool_call_begin":
-      case "mcp_tool_call_end": {
-        const invocation = event.invocation;
-        const server = normalizeProgressText(invocation?.server);
-        const tool = normalizeProgressText(invocation?.tool);
-        const identifier = [server, tool].filter(Boolean).join("/");
-        const action = type.endsWith("_begin") ? "calling" : "finished calling";
-        return identifier ? `${action} ${identifier}` : `${action} an MCP tool`;
-      }
-      case "web_search_begin":
-        return "searching the web";
-      case "web_search_end":
-        return "web search finished";
-      case "view_image_tool_call":
-        return "inspecting an image";
-      case "image_generation_begin":
-        return "generating an image";
-      case "image_generation_end":
-        return "image generation finished";
-      // Multi-agent V2 (codex >= 0.145.0) reports spawn/lifecycle work as
-      // sub_agent_activity; the older collab_agent_* names remain for
-      // earlier versions.
-      case "sub_agent_activity":
-        return "subagent activity";
-      case "collab_agent_spawn_begin":
-        return "starting a subagent";
-      case "collab_agent_spawn_end":
-        return "subagent started";
-      case "collab_agent_interaction_begin":
-        return "coordinating with a subagent";
-      case "collab_agent_interaction_end":
-        return "subagent coordination finished";
-      case "collab_waiting_begin":
-        return "waiting for a subagent";
-      case "collab_waiting_end":
-        return "subagent wait finished";
-      case "collab_resume_begin":
-        return "resuming a subagent";
-      case "collab_resume_end":
-        return "resuming after subagent work";
-      case "collab_close_begin":
-        return "closing a subagent";
-      case "collab_close_end":
-        return "subagent closed";
-      default:
-        return undefined;
-    }
-  };
-  const terminalResultFrame = (entry) => {
-    const text = entry.lastAgentMessage ?? "";
-    return {
-      jsonrpc: "2.0",
-      id: entry.id,
-      result: {
-        content: [{ type: "text", text }],
-        structuredContent: { threadId: entry.threadId ?? "", content: text },
-      },
+  outerServer.setRequestHandler(CallToolRequestSchema, async ({ params }, extra) => {
+    if (params.name === "ping") return toolResult("pong");
+    const message = {
+      method: "tools/call",
+      params: { name: params.name, arguments: params.arguments },
     };
-  };
-  const terminalAbortErrorFrame = (entry) => ({
-    jsonrpc: "2.0",
-    id: entry.id,
-    error: {
-      code: -32001,
-      message:
-        `mcp-agents: Codex reported ${entry.terminalEventType ?? "turn_aborted"}; ` +
-        `the turn did not complete. Any writes it made are in the tree — verify ` +
-        `the workspace before continuing.` +
-        (entry.threadId ? ` Codex thread: ${entry.threadId}.` : ""),
-    },
-  });
-  const terminalFrameForOutcome = (entry, outcome) =>
-    outcome === "aborted" ? terminalAbortErrorFrame(entry) : terminalResultFrame(entry);
-  const synthesizeTerminalResult = (entry, outcome) => {
+    const validation = validateCodexToolCallMessage(message);
+    if (validation) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `mcp-agents: invalid arguments for ${validation.toolName}`,
+        validation,
+      );
+    }
+    const args = params.arguments ?? {};
+    const elicitationCapability = outerServer.getClientCapabilities()?.elicitation;
+    const canElicit = Boolean(
+      elicitationCapability && elicitationCapability.form !== false,
+    );
     if (
-      finalizing || inFlight.get(idKey(entry.id)) !== entry ||
-      entry.state !== "terminal_grace" || entry.terminalOutcome !== outcome ||
-      (outcome !== "completed" && outcome !== "aborted")
-    ) return;
-    if (entry.internalJob) {
-      const key = idKey(entry.id);
-      const job = jobs.get(entry.jobId);
-      privateJobRequestIds.delete(key);
-      suppressedResponseIds.add(key);
-      if (job?.state === "canceling") {
-        transitionJobTerminal(job, "canceled", "canceled", { threadId: entry.threadId });
-      } else if (job && outcome === "aborted") {
-        transitionJobTerminal(
-          job,
-          "failed",
-          `${entry.terminalEventType ?? "turn_aborted"}: Codex aborted the turn before completion`,
-          { threadId: entry.threadId },
-        );
-      } else if (job) {
-        transitionJobTerminal(job, "completed", "completed", {
-          resultText: entry.lastAgentMessage ?? "",
-          threadId: entry.threadId,
+      resolvedApproval !== "never" && !canElicit &&
+      ["codex", "codex-reply", "codex-review"].includes(params.name)
+    ) {
+      return errorResult(
+        "codex_interaction_requires_background",
+        "This approval policy can prompt, but the MCP client has no elicitation support; use a background start tool and resolve queued interactions",
+      );
+    }
+    try {
+      if (params.name === "codex") {
+        const result = await runTurn(args, extra);
+        return toolResult(result.content, { ...result });
+      }
+      if (params.name === "codex-reply") {
+        const result = await runTurn(args, extra, { reply: true });
+        return toolResult(result.content, { ...result });
+      }
+      if (params.name === "codex-start") return await startBackground("initial", args);
+      if (params.name === "codex-reply-start") return await startBackground("reply", args);
+      if (params.name === "codex-review-start") return await startBackground("review", args);
+      if (params.name === "codex-review") {
+        const result = await runReview(args, extra);
+        return toolResult(result.content, result);
+      }
+      if (params.name === "codex-peek") {
+        const now = Date.now();
+        const turns = [
+          ...provisionalTurns.values(),
+          ...activeTurns.values(),
+        ].filter((turn) => {
+          if (args.threadId && turn.threadId !== args.threadId &&
+              turn.reviewThreadId !== args.threadId &&
+              turn.sourceThreadId !== args.threadId) return false;
+          if (args.requestId && turn.requestId !== args.requestId) return false;
+          if (args.cwd && turn.cwd && turn.cwd.replace(/\/+$/u, "") !==
+              args.cwd.replace(/\/+$/u, "")) return false;
+          return true;
+        }).map((turn) => ({
+          ...(turn.requestId ? { requestId: turn.requestId } : {}),
+          tool: turn.tool ?? (turn.reviewThreadId ? "codex-review" : "codex"),
+          state: ["starting", "canceling", "outcome_unknown"].includes(turn.state)
+            ? turn.state
+            : "running",
+          ...(turn.threadId ? { threadId: turn.threadId } : { threadIdUnknown: true }),
+          ...(turn.cwd
+            ? { cwd: turn.cwd, cwdInferred: Boolean(turn.cwdInferred) }
+            : { cwdUnknown: true }),
+          ...(turn.sandbox ? { sandbox: turn.sandbox } : {}),
+          ...(turn.jobId ? { jobId: turn.jobId } : {}),
+          elapsedSeconds: Math.max(0, Math.floor((now - Date.parse(turn.startedAt)) / 1_000)),
+          lastActivitySeconds: Math.max(0, Math.floor((now - turn.lastActivityAt) / 1_000)),
+        }));
+        const filtered = Boolean(args.cwd || args.threadId || args.requestId);
+        const canceling = turns.filter((turn) => turn.state === "canceling").length;
+        const outcomeUnknown = turns.filter((turn) =>
+          turn.state === "outcome_unknown"
+        ).length;
+        let text = turns.length ? turns.map((turn) =>
+            `${turn.tool} ${turn.requestId ?? turn.jobId ?? "(unidentified)"}: ` +
+            `${turn.elapsedSeconds}s elapsed, last activity ${turn.lastActivitySeconds}s ago` +
+            (turn.state === "canceling"
+              ? ", CANCELING (not confirmed stopped)"
+              : turn.state === "outcome_unknown"
+                ? ", OUTCOME UNKNOWN (not confirmed stopped; may still be writing)"
+                : "") +
+            (turn.threadId ? `, thread ${turn.threadId}` : ", thread not yet reported") +
+            (turn.cwd
+              ? `, cwd ${turn.cwd}${turn.cwdInferred ? " (inherited)" : ""}`
+              : ", workspace unknown")
+          ).join("\n") :
+            `No ${filtered ? "matching " : ""}Codex turn is in flight. This is not evidence ` +
+              "one finished — an abandoned turn keeps running with nothing left to report.";
+        if (canceling > 0) {
+          text += `\n\n${canceling} turn(s) cancelled but NOT confirmed stopped — still writing.`;
+        }
+        if (outcomeUnknown > 0) {
+          text += `\n\n${outcomeUnknown} turn(s) have OUTCOME UNKNOWN — NOT confirmed ` +
+            "stopped and may still be writing.";
+        }
+        return toolResult(text, {
+          turns,
+          count: turns.length,
+          canceling,
+          ambiguous: Boolean(
+            (args.cwd || args.threadId || args.requestId) && turns.length > 1
+          ),
+          abandonedTurnsProcessWide: [...activeTurns.values()]
+            .filter((turn) => turn.abandoned).length,
         });
       }
-      settleInFlight(entry.id);
-      finalizeOnSuppressionCap();
-      return;
-    }
-    if (!canInjectGeneratedFrame()) {
-      entry.fallbackReady = true;
-      return;
-    }
-    entry.fallbackReady = false;
-    const key = idKey(entry.id);
-    suppressedResponseIds.add(key);
-    settleInFlight(entry.id);
-    queueGeneratedFrame(
-      terminalFrameForOutcome(entry, outcome),
-      { kind: "terminal_result" },
-    );
-    logErr(
-      `[mcp-agents] settled ${outcome} codex request from terminal event for request ` +
-        `${JSON.stringify(entry.id)} (thread_id=${entry.threadId ?? "unknown"})`,
-    );
-    finalizeOnSuppressionCap();
-  };
-  // Answer a single request that hit its idle/hard timeout with a JSON-RPC
-  // error, suppress codex's eventual (late) native response, and settle it —
-  // WITHOUT tearing down the bridge. A per-request timeout used to call
-  // finalize(), which process.exit()s; that closed the stdio transport and made
-  // Claude Code route the server to `failed` and strip every mcp__codex__* tool
-  // for the rest of the session (stdio servers are not auto-reconnected). This
-  // mirrors synthesizeTerminalResult's frame-boundary + suppression discipline
-  // so a late native response is dropped in the forward path rather than
-  // double-delivered.
-  const timeoutErrorFrame = (entry, label) => ({
-    jsonrpc: "2.0",
-    id: entry.id,
-    error: {
-      code: -32001,
-      message:
-        `mcp-agents: codex pass-through ${label}; the request was aborted but ` +
-        `the bridge stayed connected. Any applied edits may exist — verify the ` +
-        `tree, then retry the call.` +
-        (entry.threadId ? ` Codex thread: ${entry.threadId}.` : ""),
-    },
-  });
-  // Tell codex to stop working on a request whose deadline we've given up on, so
-  // a slow/hung call is not left running unbounded once we stop waiting for it
-  // (the old finalize path SIGKILLed the whole group; a per-request abort must
-  // cancel just this one). Best-effort and idempotent; also prods a codex that
-  // stalled mid-frame to emit a boundary or exit, which lets a deferred abort
-  // resolve. Written to codex's stdin — it never touches the client stdout frame.
-  const requestNativeCancel = (entry, reason) => {
-    if (!entry || entry.nativeCancelSent) return;
-    entry.nativeCancelSent = true;
-    try {
-      child.stdin.write(`${JSON.stringify({
-        jsonrpc: "2.0",
-        method: "notifications/cancelled",
-        params: { requestId: entry.id, reason },
-      })}\n`);
-    } catch {}
-  };
-  const overSuppressionCap = () =>
-    suppressedResponseIds.size >= MAX_SUPPRESSED_CODEX_RESPONSES;
-  const finalizeOnSuppressionCap = () => {
-    if (!overSuppressionCap()) return;
-    // Re-check inside the tick: a late native response may have relieved the cap
-    // between scheduling and firing, in which case a full teardown is not needed.
-    setImmediate(() => {
-      if (finalizing || !overSuppressionCap()) return;
-      finalize({
-        reason: "late-response suppression limit reached",
-        emit: true,
-        exitCode: 1,
-      });
-    });
-  };
-  const abortRequestNoTeardown = (entry, label) => {
-    if (
-      finalizing || inFlight.get(idKey(entry.id)) !== entry ||
-      entry.state !== "open"
-    ) return;
-    const key = idKey(entry.id);
-    requestNativeCancel(entry, `mcp-agents: ${label}`);
-    if (entry.internalJob) {
-      // Background job: the client already holds the jobId, so there is no
-      // client frame to emit — fail the job and suppress codex's late native
-      // response (mirrors synthesizeTerminalResult's internalJob branch).
-      const job = jobs.get(entry.jobId);
-      privateJobRequestIds.delete(key);
-      suppressedResponseIds.add(key);
-      // A job abandoned by the idle or hard deadline is exactly as unconfirmed as a
-      // blocking call abandoned the same way — Codex may still be writing. Recording it
-      // here is what lets codex-peek's abandonedTurnsProcessWide see it at all; without
-      // this the job path reported nothing in flight and nothing abandoned, which is the
-      // inversion this tool exists to prevent.
-      noteAbandonedTurn(entry, label);
-      if (job && !isTerminalJob(job)) transitionJobTerminal(job, "failed", label);
-      settleInFlight(entry.id);
-      entry.timeoutPending = undefined;
-      finalizeOnSuppressionCap();
-      return;
-    }
-    if (!canInjectGeneratedFrame()) {
-      // No safe frame boundary (codex stalled mid-frame, or stdout is
-      // backpressured): we CANNOT splice a synthetic frame into a partial native
-      // one, so defer. flushReadyTerminalResults retries on the next codex
-      // stdout activity / drain — which the cancellation above helps produce.
-      // But a codex wedged mid-frame that also ignores the cancellation would
-      // never produce that activity, so a one-shot escalation guarantees the
-      // request cannot hang forever: after the cancel grace, fall back to a
-      // bounded teardown (the only safe resolution for a mid-frame wedge; the
-      // client can then reconnect to a clean bridge).
-      entry.timeoutPending = label;
-      if (!entry.abortEscalationTimer) {
-        const escalate = () => {
-          if (finalizing || inFlight.get(idKey(entry.id)) !== entry) return;
-          // Retry first: the boundary may simply not have arrived yet. Only a
-          // stream still wedged after a second window justifies dropping the
-          // bridge (and with it every other request and background job).
-          if (canInjectGeneratedFrame()) {
-            entry.abortEscalationTimer = undefined;
-            abortRequestNoTeardown(entry, label);
-            return;
+      if (CODEX_JOB_TOOL_CONTRACTS[params.name]) {
+        pruneJobs();
+        const job = jobs.get(args.jobId);
+        if (!job) return jobNotFound(args.jobId);
+        if (params.name === "codex-cancel") {
+          const turn = job.turnId ? activeTurns.get(job.turnId) : undefined;
+          if (!isTerminalJob(job)) {
+            job.state = "canceling";
+            job.statusMessage = "Codex: canceling";
+            job.statusCursor += 1;
+            if (turn) void interruptTurn(turn, "background job canceled");
           }
-          if (!entry.abortEscalated) {
-            entry.abortEscalated = true;
-            entry.abortEscalationTimer = setTimeout(escalate, cancelGraceMs);
-            return;
-          }
-          finalize({
-            reason: `request ${JSON.stringify(entry.id)} ${label} could not be ` +
-              `delivered at a frame boundary within ${cancelGraceMs * 2}ms`,
-            emit: true,
-            exitCode: 1,
-          });
-        };
-        entry.abortEscalationTimer = setTimeout(escalate, cancelGraceMs);
-      }
-      return;
-    }
-    entry.timeoutPending = undefined;
-    clearTimer(entry, "abortEscalationTimer");
-    suppressedResponseIds.add(key);
-    settleInFlight(entry.id);
-    queueGeneratedFrame(timeoutErrorFrame(entry, label), { kind: "terminal_result" });
-    noteAbandonedTurn(entry, label);
-    finalizeOnSuppressionCap();
-  };
-  const flushReadyTerminalResults = () => {
-    if (!canInjectGeneratedFrame()) return;
-    for (const entry of [...inFlight.values()]) {
-      if (entry.fallbackReady) {
-        synthesizeTerminalResult(entry, entry.terminalOutcome);
-      } else if (entry.timeoutPending) {
-        abortRequestNoTeardown(entry, entry.timeoutPending);
-      }
-    }
-  };
-  const beginTerminalGrace = (entry, message, outcome) => {
-    if (entry.state !== "open") return;
-    if (entry.internalJob) finishJobCommentary(jobs.get(entry.jobId));
-    entry.state = "terminal_grace";
-    entry.terminalOutcome = outcome;
-    stopEntryProgress(entry);
-    entry.lastAgentMessage = typeof message === "string" ? message : "";
-    clearTimer(entry, "idleTimer");
-    entry.terminalTimer = setTimeout(
-      () => synthesizeTerminalResult(entry, outcome),
-      terminalGraceMs,
-    );
-  };
-  // Record — and shout about — a request the wrapper has stopped waiting for
-  // while codex may still be executing it. This is the single most expensive
-  // failure mode in practice: the client believes the work is dead, codex keeps
-  // editing the workspace, and a second agent is dispatched onto the same files.
-  const noteAbandonedTurn = (entry, label) => {
-    const key = idKey(entry.id);
-    abandonedTurns.set(key, {
-      threadId: entry.threadId,
-      jobId: entry.jobId,
-      at: Date.now(),
-    });
-    logErr(
-      `[mcp-agents] WARNING codex turn abandoned while possibly still running: ` +
-        `request ${JSON.stringify(entry.id)} (${label}); ` +
-        `thread_id=${entry.threadId ?? "unknown"} ` +
-        `job_id=${entry.jobId ?? "none"} ` +
-        `sandbox_mode=${resolvedSandboxMode}. The bridge stays connected, but ` +
-        `codex was NOT confirmed stopped — treat the workspace as having a live ` +
-        `writer until this bridge exits` +
-        (entry.jobId ? `, or stop it with codex-cancel jobId=${entry.jobId}` : "") +
-        `.`,
-    );
-  };
-  // The counterpart: codex finally answered a request nobody is waiting for. It
-  // proves the turn ran to completion after the client gave up, which is the
-  // evidence needed to explain unexpected edits in the tree.
-  const noteAbandonedTurnSettled = (key) => {
-    const info = abandonedTurns.get(key);
-    if (!info) return;
-    abandonedTurns.delete(key);
-    logErr(
-      `[mcp-agents] abandoned codex turn finished after ` +
-        `${Math.round((Date.now() - info.at) / 1_000)}s and its result was ` +
-        `discarded (thread_id=${info.threadId ?? "unknown"} ` +
-        `job_id=${info.jobId ?? "none"}); any writes it made are in the tree`,
-    );
-  };
-  const releaseSuppressedResponse = (key) => {
-    const entry = inFlight.get(key);
-    if (entry?.state === "canceled") entry.suppressedNativeResponseSeen = true;
-    suppressedResponseIds.delete(key);
-    noteAbandonedTurnSettled(key);
-  };
-  const confirmedCancellationMessage = (entry) =>
-    entry.terminalOutcome === "completed"
-      ? `completed after cancellation was requested ` +
-        `(${entry.terminalEventType}; result discarded)`
-      : `canceled (confirmed by ${entry.terminalEventType})`;
-  const settleConfirmedCancellation = (entry) => {
-    if (
-      finalizing || inFlight.get(idKey(entry.id)) !== entry ||
-      entry.state !== "canceled" || entry.confirmedCancelPending
-    ) return;
-    clearTimer(entry, "cancelTimer");
-    const key = idKey(entry.id);
-    if (entry.internalJob) {
-      const job = jobs.get(entry.jobId);
-      privateJobRequestIds.delete(key);
-      if (!entry.suppressedNativeResponseSeen) suppressedResponseIds.add(key);
-      if (job && !isTerminalJob(job)) {
-        transitionJobTerminal(
-          job,
-          "canceled",
-          confirmedCancellationMessage(entry),
-          { threadId: entry.threadId },
-        );
-      }
-      settleInFlight(entry.id);
-      finalizeOnSuppressionCap();
-      return;
-    }
-    if (entry.suppressedNativeResponseSeen) {
-      settleInFlight(entry.id);
-      return;
-    }
-    if (canArmResponseSuppression()) {
-      suppressedResponseIds.add(key);
-      settleInFlight(entry.id);
-      finalizeOnSuppressionCap();
-      return;
-    }
-    // The terminal event proves the turn stopped, but a response suppression
-    // latch still cannot start in the middle of a native frame. Give that frame
-    // one bounded window to finish; only a continuing framing wedge can escalate.
-    if (!entry.confirmedCancelGraceEscalated) {
-      entry.confirmedCancelGraceEscalated = true;
-      entry.confirmedCancelPending = true;
-      entry.cancelTimer = setTimeout(
-        () => {
-          entry.confirmedCancelPending = false;
-          settleConfirmedCancellation(entry);
-        },
-        cancelGraceMs,
-      );
-      return;
-    }
-    finalize({
-      reason:
-        `request ${JSON.stringify(entry.id)} cancellation was confirmed by ` +
-        `${entry.terminalEventType}, but codex left a frame unterminated`,
-      emit: true,
-      exitCode: 1,
-    });
-  };
-  // A cancellation grace expiry used to tear the WHOLE bridge down, which killed
-  // every other in-flight request and every background job in this process, and
-  // destroyed the isolated CODEX_HOME (so no thread could ever be resumed). A
-  // codex mid-turn simply does not service MCP cancellation quickly, so this
-  // fired routinely and was the dominant cause of "the MCP keeps dropping".
-  // The client has already cancelled — it will never read a response for this id
-  // — so the correct resolution is to stop tracking the id and swallow codex's
-  // late response. Teardown is reserved for the one case that genuinely cannot
-  // be resolved per-request: a stream wedged mid-frame with no safe boundary.
-  const onCancelGraceExpired = (entry) => {
-    if (finalizing || inFlight.get(idKey(entry.id)) !== entry) return;
-    const key = idKey(entry.id);
-    if (entry.suppressedNativeResponseSeen) {
-      settleInFlight(entry.id);
-      return;
-    }
-    if (entry.internalJob) {
-      // Background job: the client polls by jobId and never sees this native id,
-      // so there is no client frame to place and no boundary to wait for. Drive
-      // the job terminal, otherwise it sits in "canceling" forever and every
-      // codex-status long-poll against it hangs.
-      const job = jobs.get(entry.jobId);
-      privateJobRequestIds.delete(key);
-      suppressedResponseIds.add(key);
-      if (job && !isTerminalJob(job)) {
-        transitionJobTerminal(
-          job,
-          "canceled",
-          `canceled (codex did not acknowledge within ${cancelGraceMs}ms)`,
-        );
-      }
-      settleInFlight(entry.id);
-      noteAbandonedTurn(
-        entry,
-        `cancellation unacknowledged within ${cancelGraceMs}ms`,
-      );
-      finalizeOnSuppressionCap();
-      return;
-    }
-    if (canArmResponseSuppression()) {
-      suppressedResponseIds.add(key);
-      settleInFlight(entry.id);
-      noteAbandonedTurn(
-        entry,
-        `cancellation unacknowledged within ${cancelGraceMs}ms`,
-      );
-      finalizeOnSuppressionCap();
-      return;
-    }
-    // No frame boundary yet: splicing suppression state in now could corrupt a
-    // partial native frame. Give the stream one more window to reach a boundary
-    // before falling back to the bounded teardown.
-    if (!entry.cancelGraceEscalated) {
-      entry.cancelGraceEscalated = true;
-      entry.cancelTimer = setTimeout(
-        () => onCancelGraceExpired(entry),
-        cancelGraceMs,
-      );
-      return;
-    }
-    finalize({
-      reason:
-        `request ${JSON.stringify(entry.id)} cancellation did not settle ` +
-        `within ${cancelGraceMs * 2}ms and codex left a frame unterminated`,
-      emit: true,
-      exitCode: 1,
-    });
-  };
-  const cancelInFlight = (id) => {
-    const entry = id == null ? undefined : inFlight.get(idKey(id));
-    if (!entry || entry.state === "canceled") return false;
-    if (entry.state === "local_response") {
-      if (entry.startJobId) requestJobCancellation(jobs.get(entry.startJobId), "start canceled");
-      rememberLocallyHandledResponse(idKey(id));
-      dropQueuedLocalResponse(idKey(id));
-      settleInFlight(id);
-      return true;
-    }
-    if (entry.state === "local_wait") {
-      detachLocalWaiter(entry);
-      rememberLocallyHandledResponse(idKey(id));
-      settleInFlight(id);
-      return true;
-    }
-    const terminalEvidenceRecorded =
-      entry.state === "terminal_grace" &&
-      (entry.terminalOutcome === "completed" || entry.terminalOutcome === "aborted");
-    entry.state = "canceled";
-    stopEntryProgress(entry);
-    clearTimer(entry, "idleTimer");
-    clearTimer(entry, "hardTimer");
-    clearTimer(entry, "terminalTimer");
-    clearTimer(entry, "abortEscalationTimer");
-    if (canArmResponseSuppression()) suppressedResponseIds.add(idKey(id));
-    // Ask codex to stop as well. Without this the turn runs to completion even
-    // though nothing will ever read its result.
-    requestNativeCancel(entry, "mcp-agents: client cancelled the request");
-    entry.cancelGraceEscalated = false;
-    entry.confirmedCancelGraceEscalated = false;
-    entry.confirmedCancelPending = false;
-    entry.suppressedNativeResponseSeen = false;
-    if (terminalEvidenceRecorded) {
-      settleConfirmedCancellation(entry);
-      return false;
-    }
-    entry.cancelTimer = setTimeout(
-      () => onCancelGraceExpired(entry),
-      cancelGraceMs,
-    );
-    return false;
-  };
-
-  const killGroup = (signal) => {
-    try {
-      if (child.pid) process.kill(-child.pid, signal);
-      else child.kill(signal);
-    } catch {
-      try { child.kill(signal); } catch {}
-    }
-  };
-
-  // Parse one complete codex->client stdout frame (observation only — the raw
-  // bytes are forwarded separately). Correlated events are the ONLY activity
-  // that extends a request's idle window.
-  const observeOutgoingLine = (line) => {
-    const trimmed = line.trim();
-    if (!trimmed) return;
-    let msg;
-    try { msg = JSON.parse(trimmed); } catch { return; }
-    if (
-      msg && typeof msg === "object" && "id" in msg &&
-      ("result" in msg || "error" in msg)
-    ) {
-      const key = idKey(msg.id);
-      const entry = inFlight.get(key);
-      if (
-        entry && !entry.internalJob && entry.state === "terminal_grace" &&
-        entry.terminalOutcome === "aborted"
-      ) {
-        logErr(
-          `[mcp-agents] WARNING native codex response settled aborted request ` +
-            `${JSON.stringify(entry.id)}; forwarding unchanged because foreground ` +
-            `Codex calls are byte-for-byte passthrough ` +
-            `(thread_id=${entry.threadId ?? "unknown"})`,
-        );
-      }
-      if (entry?.internalJob) handlePrivateResponse(entry, msg);
-      const privateJob = jobsByNativeRequest.get(key);
-      // Forwarding leads observation. A cancellation that began mid-frame may
-      // arm suppression only after this response was already forwarded in the
-      // same chunk; release that newly-created latch before settling the entry.
-      if (suppressedResponseIds.has(key)) releaseSuppressedResponse(key);
-      settleInFlight(msg.id);
-      if (privateJob) jobsByNativeRequest.delete(key);
-      return;
-    }
-    if (msg?.id != null && typeof msg.method === "string") {
-      const correlatedId = msg.params?._meta?.requestId;
-      let entry = correlatedId == null
-        ? undefined
-        : inFlight.get(idKey(correlatedId));
-      if (!entry) {
-        const threadId = msg.params?._meta?.threadId ??
-          msg.params?.threadId ?? msg.params?.thread_id;
-        if (typeof threadId === "string") {
-          entry = [...inFlight.values()].find((candidate) =>
-            candidate.threadId === threadId && candidate.state === "open"
-          );
+          return toolResult(`Codex job ${job.jobId} cancellation requested.`, jobStructured(job));
         }
-      }
-      if (entry) {
-        if (entry.internalJob) {
-          try {
-            child.stdin.write(`${JSON.stringify({
-              jsonrpc: "2.0",
-              id: msg.id,
-              error: {
-                code: -32601,
-                message: "mcp-agents: interactive server requests are unavailable for background jobs",
-              },
-            })}\n`);
-          } catch {}
-          const job = jobs.get(entry.jobId);
-          requestJobCancellation(job, "unsupported interactive request");
-          transitionJobTerminal(
-            job,
-            "failed",
-            "background job required unsupported interactive input",
-          );
-          return;
-        }
-        serverRequestParents.set(idKey(msg.id), idKey(entry.id));
-        clearTimer(entry, "idleTimer");
-      }
-      return;
-    }
-    if (msg?.method !== "codex/event") return;
-    const requestId = msg.params?._meta?.requestId;
-    const entry = requestId == null ? undefined : inFlight.get(idKey(requestId));
-    const event = msg.params?.msg;
-    const eventType = event?.type;
-    if (entry && isTypedCodexAuthFailure(msg)) {
-      markCodexAuthInvalidated(entry);
-    }
-    const terminalOutcome = SUCCESS_TERMINAL_EVENTS.has(eventType)
-      ? "completed"
-      : ABORT_TERMINAL_EVENTS.has(eventType) ? "aborted" : undefined;
-    if (
-      !entry ||
-      (entry.state !== "open" && !(entry.state === "canceled" && terminalOutcome))
-    ) return;
-    const job = entry.internalJob ? jobs.get(entry.jobId) : undefined;
-    const threadId = msg.params?._meta?.threadId;
-    if (typeof threadId === "string" && threadId) {
-      entry.threadId = threadId;
-      // Learned here rather than at dispatch: the opening `codex` call supplies the
-      // cwd but not the thread, and Codex names the thread only once it starts.
-      if (!entry.cwdInferred) rememberThreadWorkspace(threadId, entry.cwd, entry.sandbox);
-    }
-    if (job && typeof threadId === "string" && threadId) job.threadId = threadId;
-    entry.lastActivityAt = Date.now();
-    if (terminalOutcome) {
-      entry.terminalEventType = eventType;
-      entry.terminalEventObservedAt = entry.lastActivityAt;
-      entry.terminalOutcome = terminalOutcome;
-    }
-    if (entry.state === "canceled") {
-      if (job) finishJobCommentary(job);
-      settleConfirmedCancellation(entry);
-      return;
-    }
-    if (job) {
-      job.lastActivityAt = entry.lastActivityAt;
-      captureJobCommentary(job, event);
-    }
-    armEntryIdle(entry);
-    const progressMessage = progressMessageForEvent(entry, event);
-    if (job) {
-      if (job.state === "starting" && !progressMessage) {
-        setJobStatusNow(job, "running", { state: "running" });
-      } else if (progressMessage) {
-        scheduleJobStatus(job, progressMessage);
-      }
-    }
-    if (progressMessage) scheduleProgress(entry, progressMessage);
-    if (terminalOutcome) {
-      if (job) finishJobCommentary(job);
-      beginTerminalGrace(entry, event?.last_agent_message, terminalOutcome);
-    }
-  };
-
-  // Classify a (possibly oversized) frame from a bounded prefix: return the
-  // request id iff it is clearly a RESPONSE — a top-level "result"/"error" with
-  // the "id" appearing before it and no top-level "method" preceding it.
-  // Assumes codex's (serde_json) serialization order: a response is
-  // {jsonrpc,id,result|error} (id/result within the first handful of bytes), and
-  // a notification/request emits its top-level "method" before "params". Under
-  // that contract a nested "result"/"id" inside a non-response's params cannot be
-  // misread as a response. Only ever consulted for frames too large to buffer.
-  const peekCorrelatedRequestId = (prefix) => {
-    const s = prefix
-      .subarray(0, Math.min(prefix.length, FRAME_HEADER_SCAN))
-      .toString("utf8");
-    const match = s.match(
-      /"requestId"\s*:\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|"(?:[^"\\]|\\.)*")/,
-    );
-    if (!match) return undefined;
-    try { return JSON.parse(match[1]); } catch { return undefined; }
-  };
-
-  const logObservationDropOnce = () => {
-    if (!observationDropLogged) {
-      logErr(
-        "[mcp-agents] codex passthrough: stdout frame exceeded observation cap; " +
-          "classifying it via a bounded header scan (forwarding unaffected)",
-      );
-      observationDropLogged = true;
-    }
-  };
-
-  // Resolve a dropped frame's effect on id-tracking. The frame's raw bytes were
-  // already forwarded to the client. If a bounded header scan proves it is the
-  // RESPONSE for an in-flight id, clear exactly that id — so we neither
-  // double-respond with a synthetic error nor falsely idle-kill a healthy
-  // session once codex goes quiet. If it is NOT a response (notification /
-  // server->client request) or cannot be classified, leave the in-flight ids
-  // tracked so a genuine post-frame stall is still caught. ONLY call this once
-  // the frame is COMPLETE (its terminating newline has been seen): clearing on a
-  // still-partial frame would prematurely untrack an id whose response codex may
-  // never finish writing, re-introducing a hang.
-  const resolveDroppedFrame = (prefix) => {
-    const id = peekResponseId(prefix);
-    if (id !== undefined) settleInFlight(id);
-  };
-
-  // Accumulate codex stdout into the observation buffer and parse each complete
-  // frame to clear in-flight ids. Soft-bounded by MAX_BUFFER_BYTES so a
-  // pathologically large single frame cannot exhaust memory — the bound is
-  // approximate (a frame may transiently allocate up to one stream chunk beyond
-  // the cap before being dropped). The RAW bytes are always forwarded untouched
-  // by the caller regardless. A dropped frame is handled by onObservedFrameDropped().
-  const observeOutgoing = (chunk) => {
-    let data = chunk;
-    if (skippingFrame) {
-      const nl = data.indexOf(NEWLINE);
-      if (nl === -1) return; // still inside the oversized frame
-      // The oversized frame just COMPLETED. Apply the deferred clear now: if its
-      // header looked like a response, the response genuinely finished, so clear
-      // that id. (If codex had stalled mid-frame, this newline never arrives and
-      // the id stays tracked so the watchdog still catches the stall.)
-      skippingFrame = false;
-      if (droppedFrameResponseId !== undefined) {
-        settleInFlight(droppedFrameResponseId);
-        droppedFrameResponseId = undefined;
-      }
-      data = data.subarray(nl + 1); // resume parsing after the frame boundary
-    }
-    stdoutObsBuf = stdoutObsBuf.length ? Buffer.concat([stdoutObsBuf, data]) : data;
-    let nl;
-    while ((nl = stdoutObsBuf.indexOf(NEWLINE)) !== -1) {
-      if (nl > MAX_BUFFER_BYTES) {
-        // A COMPLETE frame larger than the cap: it fully arrived, so classify it
-        // from a bounded header prefix and clear its id now (no huge alloc).
-        logObservationDropOnce();
-        resolveDroppedFrame(stdoutObsBuf.subarray(0, nl));
-        stdoutObsBuf = stdoutObsBuf.subarray(nl + 1);
-        continue;
-      }
-      const line = stdoutObsBuf.subarray(0, nl).toString("utf8");
-      stdoutObsBuf = stdoutObsBuf.subarray(nl + 1);
-      observeOutgoingLine(line);
-    }
-    if (stdoutObsBuf.length > MAX_BUFFER_BYTES) {
-      // A PARTIAL frame already past the cap with no newline yet: classify the
-      // prefix but DEFER clearing to the frame's newline (above) — clearing now
-      // would untrack an id whose response codex might never finish, hanging it.
-      logObservationDropOnce();
-      droppedFrameResponseId = peekResponseId(stdoutObsBuf);
-      stdoutObsBuf = Buffer.alloc(0);
-      skippingFrame = true;
-    }
-  };
-
-  const hardExit = (code) => {
-    if (exited) return;
-    exited = true;
-    clearAllEntryTimers();
-    cleanupIsolatedCodexHome();
-    process.exit(code);
-  };
-  const flushThenExit = (code) => {
-    if (exited) return;
-    if (process.stdout.writableLength === 0) {
-      hardExit(code);
-      return;
-    }
-    // Ref'd safety timer guarantees exit if 'drain' never fires (client gone).
-    const safety = setTimeout(() => hardExit(code), 2_000);
-    process.stdout.once("drain", () => {
-      clearTimeout(safety);
-      hardExit(code);
-    });
-  };
-
-  // Single, idempotent teardown. `emit` controls whether open (non-canceled)
-  // requests get a synthetic JSON-RPC error before exit. The detached group is
-  // killed on EVERY teardown path so codex and any descendants are never
-  // orphaned.
-  const finalize = ({ reason, emit, exitCode }) => {
-    if (finalizing) return;
-    finalizing = true;
-    clearAllEntryTimers();
-    stopAllEntryProgress();
-    if (clientGoneTimer) {
-      clearTimeout(clientGoneTimer);
-      clientGoneTimer = undefined;
-    }
-    logErr(`[mcp-agents] codex passthrough finalize: ${reason}`);
-    if (abandonedTurns.size > 0) {
-      logErr(
-        `[mcp-agents] ${abandonedTurns.size} abandoned codex turn(s) were still ` +
-          `unaccounted for at teardown: ` +
-          [...abandonedTurns.values()]
-            .map((info) => info.threadId ?? "unknown")
-            .join(", "),
-      );
-    }
-
-    // Stop forwarding further codex stdout so a late real response cannot race
-    // the synthetic error onto the wire after we've taken over the stream.
-    try { child.stdout?.pause(); } catch {}
-
-    // Kill the whole detached group so codex AND any descendants it spawned are
-    // reaped on EVERY teardown path — never orphaned. On abort paths (idle /
-    // signal / EPIPE / fatal) codex is still alive, so there is no PID-reuse
-    // risk; on a natural close/spawn-error this runs synchronously right after
-    // the child was reaped (a negligible reuse window) to clean up anything
-    // codex left behind in its group. A SIGKILL on an already-empty group is a
-    // harmless ESRCH (swallowed by killGroup).
-    killGroup("SIGKILL");
-
-    const shouldEmitTeardownResponses =
-      emit && (hasEmittableInFlight() || generatedFrames.length > 0);
-    const shouldInspectBufferedOutput =
-      shouldEmitTeardownResponses || rewriteBuf.length > 0 ||
-      stdoutObsBuf.length > 0 || rewriteSkipUntilNewline ||
-      rewriteDropUntilNewline;
-
-    if (shouldInspectBufferedOutput) {
-      // Framing recovery. Precedence handles bytes WITHHELD by buffer mode (which
-      // the plain stdoutObsBuf recovery would mis-handle). EVERY write here is
-      // try/catch-guarded: finalize runs synchronously from close/exit/idle/signal
-      // handlers, so an unguarded EPIPE would escape into uncaughtException ->
-      // fatalShutdown -> a re-entrant finalize early-return, skipping
-      // flushThenExit/process.exit and hanging the wrapper.
-      if (rewriteSkipUntilNewline) {
-        // Oversized/align mid-skip: head already forwarded raw, remainder
-        // unrecoverable. Discard; the -32001 loop covers the still-open id.
-        rewriteBuf = Buffer.alloc(0);
-        rewriteSkipUntilNewline = false;
-        stdoutObsBuf = Buffer.alloc(0);
-        if (shouldEmitTeardownResponses && !lastForwardedByteWasNewline) {
-          try { process.stdout.write("\n"); } catch {}
-          lastForwardedByteWasNewline = true;
-        }
-      } else if (rewriteDropUntilNewline) {
-        rewriteBuf = Buffer.alloc(0);
-        rewriteDropUntilNewline = false;
-        stdoutObsBuf = Buffer.alloc(0);
-      } else if (rewriteBuf.length > 0) {
-        // A withheld buffered partial (never forwarded). If it parses as a COMPLETE
-        // message (only its trailing newline missing) — possible only when the whole
-        // frame arrived post-latch, so NONE of it is on the wire — deliver it
-        // (rewritten if a pending tools/list response, else raw) + "\n" and clear its
-        // id (no -32001). Otherwise (a mode-boundary tail — pre-empted by the
-        // align-skip — or codex died mid-frame) discard; the -32001 loop covers it.
-        const frameStr = rewriteBuf.toString("utf8");
-        let outStr = null;
-        try {
-          const m = JSON.parse(frameStr);
-          outStr = frameStr;
-          const correlatedId = m?.params?._meta?.requestId;
-          const correlatedKey = correlatedId == null ? undefined : idKey(correlatedId);
-          const correlatedEntry = correlatedKey == null
-            ? undefined
-            : inFlight.get(correlatedKey);
-          const privateEntry = m && typeof m === "object" && "id" in m
-            ? inFlight.get(idKey(m.id))
-            : undefined;
-          if (
-            isKnownCodexTurnKey(correlatedKey) && isTypedCodexAuthFailure(m)
-          ) {
-            markCodexAuthInvalidated(correlatedEntry);
-            outStr = null;
-          } else if (
-            privateEntry?.internalJob && ("result" in m || "error" in m)
-          ) {
-            handlePrivateResponse(privateEntry, m);
-            settleInFlight(m.id);
-            jobsByNativeRequest.delete(idKey(m.id));
-            privateJobRequestIds.delete(idKey(m.id));
-            releaseSuppressedResponse(idKey(m.id));
-            outStr = null;
-          } else if (
-            m && typeof m === "object" && "id" in m &&
-            ("result" in m || "error" in m) &&
-            foregroundTurnRequestIds.has(idKey(m.id))
-          ) {
-            if (privateEntry?.codexAuthInvalidated || isCodexAuthFailureResult(m)) {
-              markCodexAuthInvalidated(privateEntry);
-              m.result = authFailureToolResult(
-                m.result?.structuredContent?.threadId ?? privateEntry?.threadId,
-              );
-              delete m.error;
-              outStr = JSON.stringify(m);
-            }
-          } else if (
-            m && typeof m === "object" && "id" in m &&
-            ("result" in m || "error" in m) &&
-            suppressedResponseIds.has(idKey(m.id))
-          ) {
-            releaseSuppressedResponse(idKey(m.id));
-            outStr = null;
-          } else if (
-            m && typeof m === "object" && "id" in m &&
-            ("result" in m || "error" in m) &&
-            pendingToolsListIds.has(idKey(m.id)) &&
-            rewriteCodexToolsListMessage(m)
-          ) {
-            outStr = JSON.stringify(m);
-          }
-        } catch { outStr = null; }
-        rewriteBuf = Buffer.alloc(0);
-        stdoutObsBuf = Buffer.alloc(0);
-        if (outStr !== null && shouldEmitTeardownResponses) {
-          try { process.stdout.write(`${outStr}\n`); } catch {}
-          observeOutgoingLine(frameStr); // clear its id -> no synthetic error for it
-          lastForwardedByteWasNewline = true;
-        } else if (
-          shouldEmitTeardownResponses && !lastForwardedByteWasNewline
-        ) {
-          try { process.stdout.write("\n"); } catch {}
-          lastForwardedByteWasNewline = true;
-        }
-      } else if (stdoutObsBuf.length > 0) {
-        if (shouldEmitTeardownResponses) {
-          observeOutgoingLine(stdoutObsBuf.toString("utf8"));
-        }
-        stdoutObsBuf = Buffer.alloc(0);
-        if (shouldEmitTeardownResponses) {
-          try { process.stdout.write("\n"); } catch {}
-          lastForwardedByteWasNewline = true;
-        }
-      } else if (
-        shouldEmitTeardownResponses && !lastForwardedByteWasNewline
-      ) {
-        try { process.stdout.write("\n"); } catch {}
-        lastForwardedByteWasNewline = true;
-      }
-    }
-
-    if (shouldEmitTeardownResponses) {
-      while (generatedFrames.length > 0 && lastForwardedByteWasNewline) {
-        const frame = generatedFrames.shift();
-        if (!generatedFrameIsLive(frame)) continue;
-        try {
-          process.stdout.write(frame.buffer);
-          markGeneratedFrameDelivered(frame);
-        } catch {}
-      }
-
-      for (const entry of [...inFlight.values()]) {
-        if (entry.state !== "terminal_grace") continue;
-        const outcome = entry.terminalOutcome;
-        const outcomeLabel = outcome === "completed" || outcome === "aborted"
-          ? outcome
-          : "terminal";
-        const job = entry.internalJob ? jobs.get(entry.jobId) : undefined;
-        if (job?.state === "canceling") {
-          transitionJobTerminal(job, "canceled", "canceled", { threadId: entry.threadId });
-        } else if (job && outcome === "aborted") {
-          transitionJobTerminal(
-            job,
-            "failed",
-            `${entry.terminalEventType ?? "turn_aborted"}: Codex aborted the turn before completion`,
-            { threadId: entry.threadId },
-          );
-        } else if (!entry.internalJob && (outcome === "completed" || outcome === "aborted")) {
-          try {
-            process.stdout.write(
-              `${JSON.stringify(terminalFrameForOutcome(entry, outcome))}\n`,
-            );
-          } catch {}
-        }
-        settleInFlight(entry.id);
-        logErr(
-          `[mcp-agents] recovered ${outcomeLabel} codex request ` +
-            `${JSON.stringify(entry.id)} during teardown ` +
-            `(thread_id=${entry.threadId ?? "unknown"})`,
-        );
-      }
-
-      for (const job of jobs.values()) {
-        if (!isTerminalJob(job)) {
-          const nativeEntry = inFlight.get(job.nativeRequestKey);
-          if (nativeEntry?.codexAuthInvalidated) {
-            transitionJobTerminal(job, "failed", CODEX_AUTH_FAILURE_MESSAGE, {
-              threadId: nativeEntry.threadId,
-              code: CODEX_AUTH_FAILURE_CODE,
+        if (params.name === "codex-status") {
+          if (args.cursor > job.statusCursor) {
+            return errorResult("status_cursor_ahead", "Status cursor is ahead", {
+              jobId: job.jobId,
+              cursor: job.statusCursor,
             });
-          } else {
-            transitionJobTerminal(job, "failed", `bridge stopped: ${reason}`);
           }
-        }
-      }
-
-      for (const entry of inFlight.values()) {
-        if (
-          entry.internalJob || entry.state === "canceled" ||
-          entry.state === "local_response"
-        ) continue;
-        const frame = entry.codexAuthInvalidated
-          ? {
-            jsonrpc: "2.0",
-            id: entry.id,
-            result: authFailureToolResult(entry.threadId),
+          const defaultWaitMs = statusIntervalMs > 0
+            ? Math.min(MAX_CODEX_STATUS_WAIT_MS, statusIntervalMs)
+            : DEFAULT_CODEX_WAIT_INTERVAL_MS;
+          const waitMs = args.wait_ms ?? defaultWaitMs;
+          if (!isTerminalJob(job) && args.cursor === job.statusCursor && waitMs > 0) {
+            await new Promise((resolveWait) => {
+              let settled = false;
+              let timer;
+              const wake = () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                job.waiters.delete(wake);
+                extra.signal?.removeEventListener("abort", wake);
+                resolveWait();
+              };
+              timer = setTimeout(wake, waitMs);
+              job.waiters.add(wake);
+              extra.signal?.addEventListener("abort", wake, { once: true });
+              if (extra.signal?.aborted) wake();
+            });
           }
-          : {
-            jsonrpc: "2.0",
-            id: entry.id,
-            error: {
-              code: -32001,
-              message:
-                `mcp-agents: codex pass-through aborted before responding ` +
-                `(${reason}); the request was still open. Any applied edits may ` +
-                `exist — verify the tree.` +
-                (entry.threadId ? ` Codex thread: ${entry.threadId}.` : ""),
-            },
-          };
-        try { process.stdout.write(`${JSON.stringify(frame)}\n`); } catch {}
-      }
-    }
-
-    // Hygiene: drop the rewrite latch/skip state (forwarding has stopped).
-    pendingToolsListIds.clear();
-    suppressedResponseIds.clear();
-    abandonedTurns.clear();
-    privateJobRequestIds.clear();
-    foregroundTurnRequestIds.clear();
-    locallyHandledResponseIds.clear();
-    serverRequestParents.clear();
-    rewriteSkipUntilNewline = false;
-    rewriteSkipReleaseId = undefined;
-    rewriteDropUntilNewline = false;
-    rewriteDropReleaseId = undefined;
-    rewriteBuf = Buffer.alloc(0);
-    generatedFrames.length = 0;
-
-    flushThenExit(exitCode);
-  };
-
-  // Route the global uncaughtException/unhandledRejection handlers through the
-  // same teardown so codex's DETACHED group is always killed — otherwise those
-  // handlers call process.exit() directly and orphan codex (the 'exit' handler
-  // only deletes CODEX_HOME, it cannot reap a detached group).
-  fatalShutdown = (reason, code) =>
-    finalize({ reason: `fatal: ${reason}`, emit: true, exitCode: code ?? 1 });
-
-  child.stderr.on("data", (chunk) => {
-    logErr(`[codex] ${chunk.toString().trimEnd()}`);
-  });
-
-  const logRewriteDropOnce = () => {
-    if (!oversizedToolsListLogged) {
-      logErr(
-        "[mcp-agents] codex passthrough: tools/list-window frame exceeded rewrite cap; " +
-          "forwarding raw (curated wrapper schema not advertised on this response)",
-      );
-      oversizedToolsListLogged = true;
-    }
-  };
-
-  // Raw forward of one buffer plus the existing first-`!ok` backpressure handling
-  // (pause codex + suspend the watchdog until drain). Returns the write result.
-  // Used by BOTH the raw fast path and buffer mode, so the wire-state tracking and
-  // backpressure contract live in exactly one place.
-  const forwardChunk = (buf) => {
-    if (buf.length === 0) return true;
-    lastForwardedByteWasNewline = buf[buf.length - 1] === NEWLINE;
-    const ok = process.stdout.write(buf);
-    if (!ok && !stdoutPaused) {
-      // Downstream full: pause codex and suspend per-request idle timers until
-      // the client drains. Immutable hard deadlines continue running.
-      stdoutPaused = true;
-      for (const entry of inFlight.values()) clearTimer(entry, "idleTimer");
-      child.stdout.pause();
-    }
-    return ok;
-  };
-  flushGeneratedFrames = () => {
-    if (finalizing || stdoutPaused || !canInjectGeneratedFrame()) return;
-    while (generatedFrames.length > 0 && !stdoutPaused) {
-      const frame = generatedFrames.shift();
-      if (!generatedFrameIsLive(frame)) continue;
-      forwardChunk(frame.buffer);
-      markGeneratedFrameDelivered(frame);
-    }
-    // Queue drained (or emptied by dropped/non-live frames): the delivery
-    // backstop is no longer needed until the next stuck frame arms it.
-    if (generatedFrames.length === 0) clearFlushStallGuard();
-  };
-
-  // Once no rewrite/filter id is outstanding (and not mid-skip), a trailing partial in
-  // rewriteBuf has no response expected, so it must not stay
-  // withheld in buffer mode — raw mode forwards partials as they arrive, and
-  // withholding it would byte-lose it if codex dies before its newline. Forward it
-  // raw and drop back to the fast path. Called from BOTH paths that can clear the
-  // latch: the end of flushRewriteBuf (a response completed) and noteInbound's
-  // cancel branch (a tools/list was canceled on stdin, which never runs the flush).
-  const returnToRawIfLatchClear = () => {
-    if (
-      !finalizing && pendingToolsListIds.size === 0 &&
-      suppressedResponseIds.size === 0 && privateJobRequestIds.size === 0 &&
-      foregroundTurnRequestIds.size === 0 &&
-      !rewriteSkipUntilNewline &&
-      !rewriteDropUntilNewline && rewriteBuf.length > 0
-    ) {
-      forwardChunk(rewriteBuf);
-      rewriteBuf = Buffer.alloc(0);
-    }
-  };
-
-  // Flush every COMPLETE frame from rewriteBuf, rewriting only the matched
-  // tools/list/auth response and forwarding everything else byte-for-byte. NEVER
-  // early-returns on backpressure: forwardChunk pauses codex on the first `!ok`,
-  // but this chunk's frames are all queued (Node buffers regardless), so no
-  // COMPLETE frame is ever stranded — exactly today's "one write(chunk), then
-  // pause the source" semantics. After this returns rewriteBuf holds at most one
-  // trailing INCOMPLETE partial.
-  const flushRewriteBuf = () => {
-    if (rewriteDropUntilNewline) {
-      const nl = rewriteBuf.indexOf(NEWLINE);
-      if (nl === -1) {
-        rewriteBuf = Buffer.alloc(0);
-        return;
-      }
-      rewriteBuf = rewriteBuf.subarray(nl + 1);
-      if (rewriteDropReleaseId !== undefined) {
-        releaseSuppressedResponse(rewriteDropReleaseId);
-        // The response finally landed, oversized or not — the turn is no longer
-        // abandoned. Without this an over-limit result left its record forever and
-        // abandonedTurnsProcessWide only ever climbed.
-        rewriteDropReleaseId = undefined;
-      }
-      rewriteDropUntilNewline = false;
-    }
-    if (rewriteSkipUntilNewline) {
-      const nl = rewriteBuf.indexOf(NEWLINE);
-      if (nl === -1) {
-        // Still inside the skipped/aligned frame: forward it all raw, stay skipping.
-        forwardChunk(rewriteBuf);
-        rewriteBuf = Buffer.alloc(0);
-        return;
-      }
-      forwardChunk(rewriteBuf.subarray(0, nl + 1)); // forward through the newline raw
-      rewriteBuf = rewriteBuf.subarray(nl + 1);
-      if (rewriteSkipReleaseId !== undefined) {
-        pendingToolsListIds.delete(rewriteSkipReleaseId);
-        foregroundTurnRequestIds.delete(rewriteSkipReleaseId);
-        rewriteSkipReleaseId = undefined;
-      }
-      rewriteSkipUntilNewline = false;
-    }
-    let nl;
-    while ((nl = rewriteBuf.indexOf(NEWLINE)) !== -1) {
-      const frameBytes = rewriteBuf.subarray(0, nl + 1); // original bytes incl. delimiter
-      rewriteBuf = rewriteBuf.subarray(nl + 1); // consume-first: never re-forward, never wedge
-      if (nl > MAX_BUFFER_BYTES) {
-        // Complete frame larger than the cap: classify it from a bounded prefix.
-        // Private job frames are suppressed; unrelated public frames stay raw.
-        logRewriteDropOnce();
-        const pid = peekResponseId(frameBytes);
-        const key = pid === undefined ? undefined : idKey(pid);
-        const privateJob = key === undefined ? undefined : jobsByNativeRequest.get(key);
-        if (privateJob) {
-          privateJobRequestIds.delete(key);
-          releaseSuppressedResponse(key);
-          jobsByNativeRequest.delete(key);
-          transitionJobTerminal(
-            privateJob,
-            "failed",
-            "native result exceeded the 10 MiB background-job capture limit",
+          if (isTerminalJob(job) && job.state !== "completed") job.terminalRead = true;
+          const status = jobStructured(job);
+          const next = job.state === "completed"
+            ? `Call codex-result with jobId ${job.jobId} to read the final answer.`
+            : isTerminalJob(job) ? "The Codex job is terminal."
+            : `Call codex-status again with jobId ${job.jobId} and cursor ${job.statusCursor}.`;
+          return toolResult(
+            `Codex job ${job.jobId} is ${job.state}: ${job.statusMessage}\n\n${next}`,
+            status,
           );
-          continue;
         }
-        const correlatedId = peekCorrelatedRequestId(frameBytes);
-        if (
-          correlatedId !== undefined &&
-          jobsByNativeRequest.has(idKey(correlatedId))
-        ) {
-          continue;
-        }
-        if (key !== undefined && suppressedResponseIds.has(key)) {
-          releaseSuppressedResponse(key);
-          continue;
-        }
-        if (key !== undefined && pendingToolsListIds.has(key)) {
-          pendingToolsListIds.delete(key);
-        }
-        if (key !== undefined && foregroundTurnRequestIds.has(key)) {
-          foregroundTurnRequestIds.delete(key);
-        }
-        forwardChunk(frameBytes);
-        continue;
-      }
-      let outBuf = frameBytes; // default: byte-for-byte
-      try {
-        const msg = JSON.parse(
-          frameBytes.subarray(0, frameBytes.length - 1).toString("utf8"),
-        );
-        const correlatedId = msg?.params?._meta?.requestId;
-        const correlatedKey = correlatedId == null ? undefined : idKey(correlatedId);
-        const correlatedEntry = correlatedKey == null
-          ? undefined
-          : inFlight.get(correlatedKey);
-        const privateCorrelatedJob = correlatedId == null
-          ? undefined
-          : jobsByNativeRequest.get(correlatedKey);
-        if (isKnownCodexTurnKey(correlatedKey) && isTypedCodexAuthFailure(msg)) {
-          markCodexAuthInvalidated(correlatedEntry);
-          // Codex duplicates this error in the terminal tool result. Suppress
-          // the event so the client receives exactly one wrapper-owned failure.
-          outBuf = null;
-        } else if (privateCorrelatedJob && typeof msg.method === "string") {
-          outBuf = null;
-        } else if (
-          msg && typeof msg === "object" && "id" in msg &&
-          ("result" in msg || "error" in msg)
-        ) {
-          const key = idKey(msg.id);
-          const entry = inFlight.get(key);
-          if (foregroundTurnRequestIds.has(key)) {
-            foregroundTurnRequestIds.delete(key);
-            if (entry?.codexAuthInvalidated || isCodexAuthFailureResult(msg)) {
-              markCodexAuthInvalidated(entry);
-              msg.result = authFailureToolResult(
-                msg.result?.structuredContent?.threadId ?? entry?.threadId,
-              );
-              delete msg.error;
-              outBuf = Buffer.from(`${JSON.stringify(msg)}\n`, "utf8");
-            }
+        if (params.name === "codex-commentary") {
+          const requestedOffset = args.offset ?? 0;
+          const endOffset = job.commentaryStartOffset + codePointLength(job.commentary);
+          if (requestedOffset > endOffset) {
+            return errorResult("commentary_offset_out_of_range", "Commentary offset is out of range", {
+              jobId: job.jobId,
+              requestedOffset,
+              startOffset: job.commentaryStartOffset,
+              endOffset,
+            });
           }
-          if (jobsByNativeRequest.has(key)) {
-            privateJobRequestIds.delete(key);
-            releaseSuppressedResponse(key);
-            // A job's late native response settles its abandonment just as a plain
-            // call's does. Without this the record survived for the life of the
-            // process, so codex-peek's abandonedTurnsProcessWide only ever climbed and
-            // its "may still be writing" warning stopped meaning anything.
-            outBuf = null;
-          } else if (suppressedResponseIds.has(key)) {
-            releaseSuppressedResponse(key);
-            outBuf = null;
-          } else if (pendingToolsListIds.has(key)) {
-            pendingToolsListIds.delete(key);
-            if (rewriteCodexToolsListMessage(msg)) {
-              outBuf = Buffer.from(`${JSON.stringify(msg)}\n`, "utf8");
-            }
-          }
-        }
-      } catch {
-        outBuf = frameBytes; // unparseable (mode-boundary tail / partial) — forward original bytes
-      }
-      if (outBuf) forwardChunk(outBuf);
-    }
-    if (rewriteBuf.length > MAX_BUFFER_BYTES) {
-      // Partial frame already past the cap with no newline: abandon rewriting for
-      // THIS frame, forward what we have raw, and skip to its newline. Release only
-      // a matching id, deferred to that newline.
-      logRewriteDropOnce();
-      const pid = peekResponseId(rewriteBuf);
-      const key = pid === undefined ? undefined : idKey(pid);
-      const privateJob = key === undefined ? undefined : jobsByNativeRequest.get(key);
-      const correlatedId = peekCorrelatedRequestId(rewriteBuf);
-      const privateCorrelated = correlatedId === undefined
-        ? undefined
-        : jobsByNativeRequest.get(idKey(correlatedId));
-      if (privateJob || privateCorrelated) {
-        if (privateJob) {
-          transitionJobTerminal(
-            privateJob,
-            "failed",
-            "native result exceeded the 10 MiB background-job capture limit",
-          );
-          privateJobRequestIds.delete(key);
-          jobsByNativeRequest.delete(key);
-          // Keep suppression until the oversized response reaches its newline;
-          // rewriteDropReleaseId then releases it through the common helper.
-          rewriteDropReleaseId = key;
-        } else {
-          rewriteDropReleaseId = undefined;
-        }
-        rewriteBuf = Buffer.alloc(0);
-        rewriteDropUntilNewline = true;
-      } else if (key !== undefined && suppressedResponseIds.has(key)) {
-        rewriteDropReleaseId = key;
-        rewriteBuf = Buffer.alloc(0);
-        rewriteDropUntilNewline = true;
-      } else {
-        rewriteSkipReleaseId =
-          key !== undefined &&
-          (pendingToolsListIds.has(key) || foregroundTurnRequestIds.has(key))
-            ? key
-            : undefined;
-        forwardChunk(rewriteBuf);
-        rewriteBuf = Buffer.alloc(0);
-        rewriteSkipUntilNewline = true;
-      }
-    }
-    // Latch boundary: a response just completed may have emptied the latch — if so,
-    // flush any trailing NON-tools/list partial raw and return to the fast path.
-    returnToRawIfLatchClear();
-  };
-  const bufferModeForward = (chunk) => {
-    rewriteBuf = rewriteBuf.length ? Buffer.concat([rewriteBuf, chunk]) : chunk;
-    flushRewriteBuf();
-  };
-
-  // Forward codex stdout to the client. Steady state is a byte-for-byte raw
-  // passthrough (forwardChunk). A tools/list response or private background job
-  // activates bounded frame mode for schema rewriting or private-frame filtering.
-  // Observation runs on the ORIGINAL bytes and stays the sole authority for
-  // clearing in-flight ids — by the time it runs, every complete frame in this
-  // chunk was already forwarded/queued, so it never leads forwarding.
-  child.stdout.on("data", (chunk) => {
-    if (finalizing) return; // stream ownership has been taken over
-
-    if (
-      pendingToolsListIds.size > 0 || suppressedResponseIds.size > 0 ||
-      privateJobRequestIds.size > 0 || foregroundTurnRequestIds.size > 0 ||
-      rewriteBuf.length > 0 ||
-      rewriteSkipUntilNewline || rewriteDropUntilNewline
-    ) {
-      bufferModeForward(chunk);
-    } else {
-      forwardChunk(chunk);
-    }
-
-    try {
-      observeOutgoing(chunk); // bounded parse-for-ids; never alters forwarded bytes
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logErr(`[mcp-agents] codex passthrough: stdout observation error (ignored): ${msg}`);
-    }
-    flushReadyTerminalResults();
-    flushGeneratedFrames();
-  });
-
-  process.stdout.on("drain", () => {
-    if (!stdoutPaused) return;
-    stdoutPaused = false;
-    if (finalizing) return;
-    child.stdout.resume();
-    for (const entry of inFlight.values()) armEntryIdle(entry);
-    flushReadyTerminalResults();
-    flushGeneratedFrames();
-  });
-
-  process.stdout.on("error", (err) => {
-    // Client went away mid-write: nothing left to answer, tear codex down.
-    if (err && err.code === "EPIPE") {
-      finalize({ reason: "stdout EPIPE", emit: false, exitCode: 0 });
-    }
-  });
-
-  // Pump client stdin -> codex stdin, splitting on the newline BYTE (0x0a) that
-  // delimits MCP stdio JSON-RPC frames. Buffering raw bytes (not per-chunk
-  // strings) avoids corrupting a multibyte UTF-8 sequence that straddles two
-  // read chunks, which would otherwise break the byte-for-byte passthrough.
-  child.stdin.on("error", () => {}); // ignore EPIPE if codex exits early
-
-  // Track client requests, enforce the strict Codex argument contract, and honor
-  // cancellations. Accepted tools/call frames are transformed only after this
-  // validation succeeds.
-  const noteInbound = (line) => {
-    const trimmed = line.trim();
-    if (!trimmed) return true;
-    let msg;
-    try { msg = JSON.parse(trimmed); } catch { return true; }
-    if (!msg || typeof msg !== "object") return true;
-    if (
-      msg.id != null && typeof msg.method === "string" &&
-      typeof msg.id === "string" && msg.id.startsWith(privateRequestPrefix)
-    ) {
-      if (!addInFlight(msg)) return false;
-      const requestKey = idKey(msg.id);
-      const entry = inFlight.get(requestKey);
-      prepareLocalEntry(entry);
-      queueGeneratedFrame(
-        {
-          jsonrpc: "2.0",
-          id: msg.id,
-          error: {
-            code: -32600,
-            message: "mcp-agents: request id uses the reserved private-job namespace",
-          },
-        },
-        { requestKey, kind: "local_response" },
-      );
-      flushGeneratedFrames();
-      return false;
-    }
-    if (msg.method === "notifications/cancelled") {
-      const rid = msg.params?.requestId;
-      if (rid != null && locallyHandledResponseIds.has(idKey(rid))) return false;
-      const canceledLocalResponse = cancelInFlight(rid);
-      // A canceled/never-answered tools/list must not wedge buffer mode open. If
-      // this cancel cleared the last pending tools/list id while a NON-tools/list
-      // partial is withheld in rewriteBuf, flush it raw — otherwise a codex exit
-      // with only-canceled work would drop those bytes (finalize skips recovery).
-      if (rid != null) {
-        pendingToolsListIds.delete(idKey(rid));
-        returnToRawIfLatchClear();
-      }
-      return !canceledLocalResponse;
-    }
-    if (msg.id != null && typeof msg.method !== "string") {
-      const parentKey = serverRequestParents.get(idKey(msg.id));
-      serverRequestParents.delete(idKey(msg.id));
-      const entry = parentKey == null ? undefined : inFlight.get(parentKey);
-      if (entry?.state === "open") armEntryIdle(entry);
-      return true;
-    }
-    const validation = validateCodexToolCallMessage(msg);
-    if (validation && msg.id == null) {
-      const fields = validation.issues.map((issue) => issue.argument).join(", ");
-      logErr(
-        `[mcp-agents] dropped invalid ${validation.toolName} notification; fields: ${fields}`,
-      );
-      return false;
-    }
-
-    // A client message awaits a response iff it carries BOTH an id and a method.
-    // A bare id with no method is a *response* to a codex elicitation — skip it
-    // for in-flight tracking.
-    if (msg.id != null && typeof msg.method === "string") {
-      if (!addInFlight(msg)) return false;
-      if (validation) {
-        const requestKey = idKey(msg.id);
-        const entry = inFlight.get(requestKey);
-        entry.state = "local_response";
-        stopEntryProgress(entry);
-        queueGeneratedFrame(
-          codexInvalidParamsFrame(msg.id, validation),
-          { requestKey, kind: "local_response" },
-        );
-        const fields = validation.issues.map((issue) => issue.argument).join(", ");
-        logErr(
-          `[mcp-agents] rejected invalid ${validation.toolName} call; fields: ${fields}`,
-        );
-        flushGeneratedFrames();
-        return false;
-      }
-      const toolName = msg.method === "tools/call" ? msg.params?.name : undefined;
-      const startsCodexTurn = Boolean(
-        CODEX_TOOL_CONTRACTS[toolName] ||
-        toolName === "codex-start" || toolName === "codex-reply-start",
-      );
-      if (codexAuthInvalidated && startsCodexTurn) {
-        queueLocalToolResponse(
-          inFlight.get(idKey(msg.id)),
-          authFailureToolResult(),
-        );
-        return false;
-      }
-      if (msg.method === "tools/call" && handleJobToolCall(msg, inFlight.get(idKey(msg.id)))) {
-        return false;
-      }
-      if (msg.method === "tools/call" && CODEX_TOOL_CONTRACTS[toolName]) {
-        const key = idKey(msg.id);
-        if (
-          pendingToolsListIds.size === 0 && suppressedResponseIds.size === 0 &&
-          privateJobRequestIds.size === 0 && foregroundTurnRequestIds.size === 0 &&
-          rewriteBuf.length === 0 && !rewriteSkipUntilNewline &&
-          !rewriteDropUntilNewline && !lastForwardedByteWasNewline
-        ) {
-          rewriteSkipUntilNewline = true;
-          rewriteSkipReleaseId = undefined;
-        }
-        foregroundTurnRequestIds.add(key);
-      }
-      if (msg.method === "tools/list") {
-        // Arm the curated-schema rewrite latch for this tools/list response. If
-        // buffer mode would START mid-frame (a pre-latch frame's head was already
-        // raw-forwarded and its newline hasn't arrived), first align by raw-skipping
-        // the orphan tail to its next newline — so the tail is forwarded
-        // byte-for-byte and never mis-parsed as a standalone frame nor byte-lost at
-        // finalize. Equivalent to today's raw behaviour for that straddled frame.
-        if (
-          pendingToolsListIds.size === 0 && suppressedResponseIds.size === 0 &&
-          rewriteBuf.length === 0 && !rewriteSkipUntilNewline &&
-          !rewriteDropUntilNewline && !lastForwardedByteWasNewline
-        ) {
-          rewriteSkipUntilNewline = true;
-          rewriteSkipReleaseId = undefined;
-        }
-        pendingToolsListIds.add(idKey(msg.id));
-      }
-    }
-    return true;
-  };
-
-  let stdinBuf = Buffer.alloc(0);
-  process.stdin.on("data", (chunk) => {
-    stdinBuf = stdinBuf.length ? Buffer.concat([stdinBuf, chunk]) : chunk;
-    let nl;
-    while ((nl = stdinBuf.indexOf(NEWLINE)) !== -1) {
-      const line = stdinBuf.subarray(0, nl).toString("utf8");
-      stdinBuf = stdinBuf.subarray(nl + 1);
-      if (noteInbound(line) && !finalizing) {
-        child.stdin.write(`${transformCodexToolCall(line, {
-          serverGoal: resolvedGoal,
-          agentsEnabledKeySupported,
-        })}\n`);
-      }
-    }
-  });
-  process.stdin.on("error", () => {});
-  process.stdin.on("end", () => {
-    if (stdinBuf.length > 0) {
-      const line = stdinBuf.toString("utf8");
-      if (noteInbound(line) && !finalizing) {
-        child.stdin.write(transformCodexToolCall(line, {
-          serverGoal: resolvedGoal,
-          agentsEnabledKeySupported,
-        }));
-      }
-    }
-    // The client is gone for good. A background job (codex-start) is polled by
-    // jobId through THIS process, so once the client disconnects nothing can
-    // ever read its result — but codex keeps executing it, writing to the
-    // workspace, invisible to the client's own task registry (a harness
-    // "stop task" cannot reach it; only codex-cancel could, and the jobId died
-    // with the connection). Cancel every non-terminal job and every open
-    // request before closing codex's stdin so the turn is asked to stop rather
-    // than left running as an unattended writer.
-    if (!finalizing) {
-      for (const job of jobs.values()) {
-        if (!isTerminalJob(job)) {
-          logErr(
-            `[mcp-agents] client disconnected; cancelling background job ` +
-              `${job.jobId} (state=${job.state}, ` +
-              `thread_id=${job.threadId ?? "unknown"})`,
-          );
-          requestJobCancellation(job, "client disconnected");
-        }
-      }
-      for (const entry of [...inFlight.values()]) {
-        if (entry.state === "open") {
-          requestNativeCancel(entry, "mcp-agents: client disconnected");
-        }
-      }
-      // Hard backstop. Closing codex's stdin normally makes it exit, but a codex
-      // mid-turn may ignore both the EOF and the cancellations above and keep
-      // writing. Nothing can consume its output any more, so bound the wind-down
-      // and then reap the whole detached group — an unattended writer must never
-      // outlive the client that dispatched it.
-      if (!clientGoneTimer) {
-        clientGoneTimer = setTimeout(() => {
-          if (finalizing) return;
-          finalize({
-            reason:
-              `client disconnected and codex did not wind down within ` +
-              `${clientGoneGraceMs}ms`,
-            emit: false,
-            exitCode: 0,
+          const startOffset = Math.max(requestedOffset, job.commentaryStartOffset);
+          const page = pageByCodePoint(job.commentary, startOffset - job.commentaryStartOffset);
+          const nextOffset = startOffset + codePointLength(page.text);
+          return toolResult(page.text || "(No new Codex commentary.)", {
+            jobId: job.jobId,
+            state: job.state,
+            latestStatus: job.statusMessage,
+            requestedOffset,
+            startOffset,
+            nextOffset,
+            endOffset,
+            caughtUp: nextOffset === endOffset,
+            commentaryComplete: isTerminalJob(job),
+            truncatedBefore: requestedOffset < job.commentaryStartOffset,
+            text: page.text,
           });
-        }, clientGoneGraceMs);
+        }
+        if (params.name === "codex-result") {
+          if (!isTerminalJob(job)) {
+            return toolResult(
+              `Codex job ${job.jobId} is still ${job.state}. Continue with codex-status.`,
+              {
+                jobId: job.jobId,
+                state: job.state,
+                resultAvailable: false,
+                next: {
+                  tool: "codex-status",
+                  arguments: { jobId: job.jobId, cursor: job.statusCursor },
+                },
+              },
+            );
+          }
+          if (job.state !== "completed") {
+            job.terminalRead = true;
+            return errorResult(job.errorCode ?? "codex_job_failed", job.statusMessage, {
+              jobId: job.jobId,
+              state: job.state,
+              resultAvailable: false,
+            });
+          }
+          const offset = args.offset ?? 0;
+          const page = pageByCodePoint(job.resultText, offset);
+          if (offset > page.endOffset) {
+            return errorResult("result_offset_out_of_range", "Result offset is out of range", {
+              jobId: job.jobId,
+              offset,
+            });
+          }
+          const done = page.nextOffset === page.endOffset;
+          if (done) job.resultRead = true;
+          return toolResult(page.text || "(Codex returned an empty result.)", {
+            jobId: job.jobId,
+            state: job.state,
+            ...(job.threadId ? { threadId: job.threadId } : {}),
+            offset,
+            nextOffset: page.nextOffset,
+            endOffset: page.endOffset,
+            done,
+            resultTruncated: false,
+            text: page.text,
+          });
+        }
       }
+      if (params.name === "codex-steer") {
+        const turn = activeTurnsByThread.get(args.threadId);
+        if (!turn || turn.threadId !== args.threadId || turn.state !== "active") {
+          return errorResult("codex_turn_not_active", "No active turn can be steered", {
+            threadId: args.threadId,
+          });
+        }
+        const generationState = await ensureApp();
+        const result = await requestApp(generationState, "turn/steer", {
+          threadId: turn.threadId,
+          expectedTurnId: turn.turnId,
+          input: [{ type: "text", text: args.prompt }],
+        }, appMutationTimeoutMs, {
+          mutating: true,
+          signal: extra.signal,
+          deadlineAt: turn.hardDeadlineAt,
+          onOutcomeUnknown: () => {
+            turn.state = "outcome_unknown";
+            turn.updatedAt = new Date().toISOString();
+            writeBridgeState();
+          },
+        });
+        scheduleProgress(turn, "additional input accepted");
+        return toolResult("Codex accepted the additional input.", {
+          threadId: args.threadId,
+          turnId: turn.turnId,
+          accepted: true,
+          ...(result?.turnId ? { nativeTurnId: result.turnId } : {}),
+        });
+      }
+      if (params.name.startsWith("codex-goal-")) {
+        if (!goalStoreCompatible) {
+          return errorResult(
+            "codex_goal_store_incompatible",
+            `Durable goals require Codex ${CODEX_GOAL_STORE_VERSION} on POSIX; found ${versionText}`,
+          );
+        }
+        const generationState = await ensureApp();
+        const release = acquireThreadLease(args.threadId, params.name);
+        const mutating = params.name !== "codex-goal-get";
+        const provisional = mutating ? beginProvisionalTurn({
+          generationState,
+          threadId: args.threadId,
+          tool: params.name,
+        }) : undefined;
+        let uncertain = false;
+        try {
+          const method = params.name === "codex-goal-set" ? "thread/goal/set" :
+            params.name === "codex-goal-get" ? "thread/goal/get" : "thread/goal/clear";
+          const request = { threadId: args.threadId };
+          if (params.name === "codex-goal-set") {
+            for (const field of ["objective", "status", "tokenBudget"]) {
+              if (Object.hasOwn(args, field)) request[field] = args[field];
+            }
+          }
+          const result = await requestApp(
+            generationState,
+            method,
+            request,
+            mutating ? appMutationTimeoutMs : 30_000,
+            mutating ? mutationOptions(provisional) : undefined,
+          );
+          return toolResult(
+            params.name === "codex-goal-clear" ? "Codex thread goal cleared." :
+              JSON.stringify(result?.goal ?? result ?? null),
+            { threadId: args.threadId, goal: result?.goal ?? null },
+          );
+        } catch (err) {
+          uncertain = isUncertainMutationError(err);
+          throw err;
+        } finally {
+          if (!uncertain) {
+            forgetProvisionalTurn(provisional);
+            release();
+          }
+        }
+      }
+      if (params.name === "codex-thread-list") {
+        const generationState = await ensureApp();
+        const result = await requestApp(generationState, "thread/list", {
+          ...(args.cursor ? { cursor: args.cursor } : {}),
+          limit: args.limit ?? 20,
+          ...(args.cwd ? { cwd: args.cwd } : {}),
+          archived: args.archived ?? false,
+          sourceKinds: ["appServer", "subAgentReview"],
+          useStateDbOnly: false,
+        });
+        const threads = (result?.data ?? []).map((thread) => sanitizeThread(thread));
+        return toolResult(JSON.stringify(threads), {
+          threads,
+          nextCursor: result?.nextCursor ?? null,
+        });
+      }
+      if (params.name === "codex-thread-read") {
+        const generationState = await ensureApp();
+        const result = await requestApp(generationState, "thread/read", {
+          threadId: args.threadId,
+          includeTurns: args.includeTurns ?? false,
+        });
+        const thread = sanitizeThread(result?.thread, {
+          includeTurns: args.includeTurns,
+          cursor: args.cursor,
+          limit: args.limit ?? 20,
+        });
+        return toolResult(JSON.stringify(thread), { thread });
+      }
+      if ([
+        "codex-thread-fork",
+        "codex-thread-archive",
+        "codex-thread-unarchive",
+      ].includes(params.name)) {
+        const generationState = await ensureApp();
+        const release = acquireThreadLease(args.threadId, params.name);
+        const provisional = beginProvisionalTurn({
+          generationState,
+          threadId: args.threadId,
+          tool: params.name,
+        });
+        let uncertain = false;
+        try {
+          const method = params.name === "codex-thread-fork" ? "thread/fork" :
+            params.name === "codex-thread-archive" ? "thread/archive" : "thread/unarchive";
+          const request = { threadId: args.threadId };
+          if (args.lastTurnId) request.lastTurnId = args.lastTurnId;
+          const result = await requestApp(
+            generationState,
+            method,
+            request,
+            appMutationTimeoutMs,
+            mutationOptions(provisional),
+          );
+          const thread = sanitizeThread(result?.thread);
+          return toolResult(
+            params.name === "codex-thread-archive" ? "Codex thread archived." :
+              params.name === "codex-thread-unarchive" ? "Codex thread restored." :
+              `Codex thread forked as ${thread.id ?? "unknown"}.`,
+            { sourceThreadId: args.threadId, thread },
+          );
+        } catch (err) {
+          uncertain = isUncertainMutationError(err);
+          throw err;
+        } finally {
+          if (!uncertain) {
+            forgetProvisionalTurn(provisional);
+            release();
+          }
+        }
+      }
+      if (params.name === "codex-interactions") {
+        const pending = [...interactions.values()]
+          .filter((interaction) => !args.threadId || interaction.threadId === args.threadId)
+          .filter((interaction) => !args.jobId || interaction.jobId === args.jobId)
+          .map(sanitizedInteraction);
+        return toolResult(
+          pending.length ? JSON.stringify(pending) : "No pending Codex interactions.",
+          { interactions: pending, count: pending.length },
+        );
+      }
+      if (params.name === "codex-interaction-resolve") {
+        const interaction = interactions.get(args.interactionId);
+        if (!interaction) {
+          return errorResult(
+            "interaction_not_found",
+            "The interaction is absent, expired, or already resolved",
+            { interactionId: args.interactionId },
+          );
+        }
+        const value = resolveInteractionValue(interaction, args);
+        if (!settleInteraction(interaction, value)) {
+          return errorResult("interaction_already_resolved", "The interaction was already resolved");
+        }
+        return toolResult("Codex interaction resolved.", {
+          interactionId: args.interactionId,
+          resolved: true,
+        });
+      }
+      return errorResult("unknown_tool", `Unknown tool: ${params.name}`);
+    } catch (err) {
+      if (err?.codexCode === CODEX_AUTH_FAILURE_CODE || codexAuthInvalidated) {
+        return authFailureResult(args.threadId);
+      }
+      return errorResult(
+        err?.codexCode ?? "codex_app_server_error",
+        err instanceof Error ? err.message : String(err),
+        args.threadId ? { threadId: args.threadId } : {},
+      );
     }
-    child.stdin.end();
   });
 
-  child.on("error", (err) => {
-    logErr(`[mcp-agents] failed to start codex: ${err.message}`);
-    // codex failed to start. The fix that matters is that we EXIT (instead of
-    // leaving a childless wrapper alive on the client's open stdin, which used
-    // to hang). `emit` synthesizes an error only if a request was already
-    // tracked; spawn 'error' usually fires before any stdin is read, so the
-    // client typically just sees the server exit — the conventional
-    // "server failed to start".
-    finalize({
-      reason: `codex spawn error: ${err.message}`,
-      emit: true,
-      exitCode: 1,
-    });
-  });
-
-  // codex death is handled via BOTH 'exit' and 'close':
-  //  - 'exit' fires when the codex PROCESS terminates. A descendant that
-  //    inherited codex's stdio can hold those pipes open, delaying or even
-  //    preventing 'close' (and would be orphaned), so we kill the group here to
-  //    reap it — which also lets 'close' fire. A ref'd fallback guarantees
-  //    teardown even if a descendant escaped the group (setsid) so 'close'
-  //    never arrives.
-  //  - 'close' fires once all stdio is drained, so codex's final response has
-  //    been delivered and its id cleared — only THEN do we decide whether to
-  //    synthesize, which avoids double-responding.
-  let childExitInfo = null;
-  const onChildGone = () => {
-    const code = childExitInfo?.code;
-    const signal = childExitInfo?.signal;
-    if (signal) logErr(`[mcp-agents] codex killed by ${signal}`);
-    else if (code != null && code !== 0) {
-      logErr(`[mcp-agents] codex exited with code ${code}`);
+  const shutdown = async (reason, exitCode = 0) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logErr(`[mcp-agents] shutting down Codex App Server bridge (${reason})`);
+    if (ownerHeartbeat) clearInterval(ownerHeartbeat);
+    if (retentionTimer) clearInterval(retentionTimer);
+    if (retentionStartupTimer) clearTimeout(retentionStartupTimer);
+    for (const interaction of [...interactions.values()]) {
+      settleInteraction(
+        interaction,
+        interaction.kind === "user_input" ? { answers: {} } : { decision: "cancel" },
+      );
     }
-    finalize({
-      reason: signal ? `codex killed by ${signal}` : `codex exited (code ${code})`,
-      emit: true,
-      exitCode: signal ? 128 + (SIGNAL_CODES[signal] ?? 0) : (code ?? 1),
-    });
+    for (const turn of activeTurns.values()) void interruptTurn(turn, "bridge shutdown");
+    const generationState = app;
+    if (generationState?.alive) {
+      try { generationState.child.stdin.end(); } catch {}
+      killChildGroup(generationState.child, "SIGTERM");
+      setTimeout(() => killChildGroup(generationState.child), 1_000).unref();
+    }
+    writeBridgeState();
+    bridgeStateEnabled = false;
+    try { await outerServer.close(); } catch {}
+    try { rmSync(bridgeDir, { recursive: true, force: true }); } catch {}
+    if (keepAlive) clearInterval(keepAlive);
+    process.exitCode = exitCode;
   };
-
-  child.on("exit", (code, signal) => {
-    childExitInfo = { code, signal };
-    killGroup("SIGKILL");
-    setTimeout(onChildGone, 2_000);
+  fatalShutdown = (reason, exitCode) => { void shutdown(reason, exitCode); };
+  const transport = new StdioServerTransport();
+  await outerServer.connect(transport);
+  keepAlive = setInterval(() => {}, 60_000);
+  process.stdin.once("end", () => { void shutdown("stdin-end"); });
+  process.stdin.once("close", () => { void shutdown("stdin-close"); });
+  process.stdout.on("error", (err) => {
+    if (err?.code === "EPIPE") void shutdown("stdout-epipe");
   });
-  child.on("close", (code, signal) => {
-    if (!childExitInfo) childExitInfo = { code, signal };
-    onChildGone();
-  });
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    process.once(signal, () => {
+      void shutdown(signal, 128 + SIGNAL_CODES[signal]);
+    });
+  }
+  logErr(
+    `[mcp-agents] Codex MCP adapter ready (app-server lazy, model=${resolvedModel}, ` +
+      `effort=${resolvedEffort}, sandbox=${resolvedSandbox}, approval=${resolvedApproval}, ` +
+      `retention_days=${resolvedRetentionDays}, state=${durableRoot})`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -8524,6 +8579,8 @@ async function main() {
     codexIdleTimeoutMs,
     codexCancelGraceMs,
     codexStatusIntervalMs,
+    codexStateRoot,
+    codexSessionRetentionDays,
     browserLeaseCommand,
     browserCommand,
     browserIdleTimeoutMs,
@@ -8543,7 +8600,7 @@ async function main() {
   }
 
   if (providerName === "codex") {
-    runCodexPassthrough({
+    await runCodexAppServer({
       model,
       modelReasoningEffort,
       sandboxMode,
@@ -8556,6 +8613,35 @@ async function main() {
       cancelGraceOverrideMs: codexCancelGraceMs,
       statusIntervalOverrideMs: codexStatusIntervalMs,
       hardTimeoutMs: defaultTimeoutMs,
+      stateRoot: codexStateRoot,
+      sessionRetentionDays: codexSessionRetentionDays,
+    });
+    return;
+  }
+
+  if (providerName === "codex-legacy") {
+    logErr(
+      "[mcp-agents] WARNING: --provider codex-legacy is deprecated and uses " +
+        "the removable `codex mcp-server` transport; there is no fallback when " +
+        "that command disappears",
+    );
+    const { runCodexLegacy } = await import("./codex-legacy.js");
+    runCodexLegacy({
+      model,
+      modelReasoningEffort,
+      sandboxMode,
+      approvalPolicy,
+      workspaceNetworkAccess: resolveCodexWorkspaceNetworkAccess(
+        codexWorkspaceNetworkAccess,
+      ),
+      goal,
+      idleTimeoutMs: codexIdleTimeoutMs,
+      cancelGraceOverrideMs: codexCancelGraceMs,
+      statusIntervalOverrideMs: codexStatusIntervalMs,
+      hardTimeoutMs: defaultTimeoutMs,
+      registerFatalShutdown(handler) {
+        fatalShutdown = handler;
+      },
     });
     return;
   }

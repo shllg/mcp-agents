@@ -38,6 +38,9 @@ mcp-agents
 mcp-agents --provider claude
 mcp-agents --provider gemini
 
+# Temporary native MCP compatibility
+mcp-agents --provider codex-legacy
+
 # Browser provider (example injected lease helper)
 mcp-agents --provider browser \
   --browser_lease_command '["bin/box","--browser"]'
@@ -53,7 +56,8 @@ Each `--provider` flag selects one CLI backend:
 |----------|------------|-------------|
 | `claude` | `claude_code`, `claude-start`, `claude-status`, `claude-result`, `claude-cancel` | `claude --model claude-opus-4-8 --effort xhigh` |
 | `gemini` | `gemini` | `agy --sandbox -p <prompt>` |
-| `codex` | *(pass-through)* | `codex mcp-server` |
+| `codex` | curated blocking, job, thread, goal, review, interaction, and liveness tools | `codex app-server --stdio` |
+| `codex-legacy` | legacy blocking, reply, job, status, commentary, result, cancellation, and peek tools | `codex mcp-server` |
 | `browser` | *(pass-through)* | `chrome-devtools-mcp --browserUrl <leased-loopback-CDP-url>` |
 
 ### Claude reviews
@@ -245,425 +249,242 @@ Use the narrowest patterns compatible with the target application. The provider
 does not enable experimental page-ID routing: one process owns one lease,
 profile, and port.
 
-### `codex` (pass-through)
+### `codex` (MCP adapter over App Server)
 
-The codex provider passes through to Codex's native MCP server (`codex mcp-server`)
-inside an isolated `CODEX_HOME`. The bridge creates each home beneath the server
-startup directory's private `tmp/codex-homes/` tree, copies `auth.json`, writes a
-minimal `config.toml`, and does not inherit your normal external MCP server list.
-That keeps Codex from recursively starting other agent tools like Claude or Gemini
-during bridge calls. The parent and generated home directories use mode `0700`;
-copied credentials and generated runtime files use mode `0600`.
+The default Codex provider is a wrapper-owned MCP server backed internally by the
+documented stdio JSONL interface of
+[`codex app-server`](https://learn.chatgpt.com/docs/app-server). It requires
+Codex CLI 0.149.1 or newer. OpenAI currently labels the App Server command
+experimental and unsupported for production workloads, so the adapter treats
+it as a version-gated private dependency rather than exposing its protocol to
+MCP clients. The outer MCP connection owns initialization, tool discovery,
+validation, progress, jobs, and results; App Server stays a lazy child.
 
-The isolated home is an authentication snapshot: it cannot see a later
-`codex login` until the bridge reconnects. If Codex reports its typed
-`unauthorized` terminal event, the wrapper suppresses the duplicate event and
-returns one MCP tool error with `structuredContent.code` set to
-`codex_auth_invalidated` and `action` set to `reauthenticate_and_restart`.
-New Codex turns are rejected locally while status, result, cancel, peek, ping,
-and other MCP operations stay available. Stop the bridge, run `codex logout`
-and `codex login` as the same OS user, verify with `codex exec`, then reconnect.
-On cleanup, rotated auth is written back only when the isolated copy changed
-and canonical auth still matches the startup snapshot; a stale bridge therefore
-cannot overwrite a newer manual login or another bridge's token rotation.
+This provider never falls back to native MCP automatically. App Server and
+native MCP have different durability, goal, recovery, and error semantics, so
+silently changing transports would make a failed call impossible to reason
+about. Select [`codex-legacy`](#codex-legacy-temporary-native-mcp-compatibility)
+explicitly when temporary native MCP compatibility is required.
 
-The one allowlisted user preference is Fast mode. At startup, the bridge reads the
-source `$CODEX_HOME/config.toml` and enables Fast mode in the isolated home only when
-it finds both top-level `service_tier = "fast"` and `[features].fast_mode = true`.
-Partial, disabled, missing, or unreadable settings keep Standard mode; all other user
-configuration remains isolated. Restart the MCP server after changing either setting.
-[Fast mode uses higher ChatGPT credit consumption or API Priority billing](https://learn.chatgpt.com/docs/agent-configuration/speed#fast-mode).
+This removes the old bridge's biggest stability coupling. `initialize`,
+`tools/list`, `ping`, and wrapper-local status tools do not depend on a healthy
+Codex child. If a child exits, the next safe operation starts a fresh generation
+against the same durable sessions. Any turn that was already dispatched is
+reported as `codex_outcome_unknown` and is never replayed automatically, because
+it may already have changed the workspace.
 
-| CLI Flag | Default | Codex config key |
-|----------|---------|-----------------|
-| `--model` | `gpt-5.6-sol` | `model` |
-| `--model_reasoning_effort` | `xhigh` | `model_reasoning_effort` |
-| `--codex-workspace-network=true\|false` | `true` | `sandbox_workspace_write.network_access` |
+#### Core call contracts
 
-Other startup defaults: `sandbox_mode=workspace-write`, `approval_policy=never`
-(configurable for the whole server with `--sandbox_mode` / `--approval_policy`),
-`web_search=cached`, `check_for_update_on_startup=false`,
-`allow_login_shell=false`, and `history.persistence=none`. Fixed bridge feature
-defaults are `features.multi_agent=false`, `features.apps=false`,
-`features.plugins=false`, `features.hooks=false`, and
-`features.skill_mcp_dependency_install=false`; apps/plugins stay disabled to
-keep ChatGPT app/plugin skills — Figma, Gmail, Presentations, etc. — out of the
-bridged session context. Native subagents are additionally disabled with
-`[agents] enabled = false`, because on Codex >= 0.145.0 the stabilized
-`multi_agent` feature flag alone no longer removes the collab tools; sessions
-opt back in per call with `allow_subagents` (see below). That `[agents]` line
-is version-aware: the bridge probes `codex --version` once at startup and
-omits it on Codex < 0.145.0, where a boolean under `[agents]` is a fatal
-config parse error (0.102–0.144) and the feature flag still gates the collab
-tools by itself. An unparseable version assumes modern Codex.
-
-Workspace-write sessions have network access enabled by default so sandboxed
-commands can reach local services such as DynamoDB, Redis, OpenSearch, and MinIO.
-Set `--codex-workspace-network=false` or
-`MCP_AGENTS_CODEX_WORKSPACE_NETWORK_ACCESS=false` to disable it for the whole
-server; the CLI flag takes precedence over the environment variable. This is a
-server-owned sandbox setting and is intentionally absent from the per-call tool
-schemas.
-
-Codex does not provide localhost-only scoping for this setting. Enabling it
-allows general outbound network access from commands in workspace-write
-sessions. Filesystem writes remain restricted to the workspace and other
-configured writable roots; read-only and danger-full-access sessions do not use
-the `sandbox_workspace_write` setting.
-
-The bridge replaces Codex's broad config-shaped native schema with a deliberately
-small contract:
-
-| `codex` parameter | Type | Required | Description |
-|-------------------|------|----------|-------------|
-| `prompt` | `string` | yes | Initial user prompt |
-| `cwd` | `string` | yes | Absolute working directory |
-| `sandbox` | `string` | yes | `read-only`, `workspace-write`, or `danger-full-access` |
-| `model` | `string` | no | `gpt-5.6-sol` or `gpt-5.6-terra`; defaults to the server model |
-| `model_reasoning_effort` | `string` | no | `medium`, `high`, `xhigh`, or `max`; defaults to the server effort |
-| `allow_subagents` | `boolean` | no | Let the session spawn Codex's native in-process subagents; defaults to `false` |
-| `goal` | `string` | no | Standing objective; `""` suppresses a server-wide goal for this call |
-
-| `codex-reply` parameter | Type | Required | Description |
-|-------------------------|------|----------|-------------|
-| `prompt` | `string` | yes | Follow-up user prompt |
-| `threadId` | `string` | yes | Nonblank thread ID returned by `codex` |
-| `goal` | `string` | no | Optional prompt-level reminder of the standing objective |
-
-Both schemas set `additionalProperties: false`. Unsupported, missing, or invalid
-arguments are rejected locally with JSON-RPC `-32602` before Codex runs. That
-includes native escape hatches such as `config`, `approval-policy`,
-`developer-instructions`, `base-instructions`, and `compact-prompt`; future
-upstream schema additions stay hidden until mcp-agents intentionally adopts them.
-Model values outside the two curated choices are rejected the same way.
-
-**Native subagents.** `allow_subagents: true` on `codex` or `codex-start` lets
-that session use Codex's built-in multi-agent tools (`spawn_agent`,
-`wait_agent`, …). It is session-scoped exactly like `sandbox`: replies inherit
-it and cannot change it, and it defaults to off. Internally the flag flips only
-the native multi-agent gates (`agents.enabled` plus `features.multi_agent`,
-matching the same version gate as above) via a per-call config override;
-everything else about the isolated home is unchanged. In particular the `[mcp_servers]` strip stays in force, so spawned
-subagents are Codex-only in-process workers — they cannot re-enter this bridge
-or reach Claude, Gemini, or any other external MCP tool, and custom agent
-roles from your real `$CODEX_HOME/agents/` are not copied in. The residual
-caveat is concurrency, not reach: subagents inherit the session's
-`sandbox_mode` and `approval_policy`, so under `workspace-write` with
-`approval_policy=never` several agents may write the same workspace at once.
-Codex coordinates them, but scope the commission accordingly.
-
-`approval_policy=never` is intentional for an MCP bridge: a detached tool call
-cannot reliably conduct an interactive approval conversation. Operators can pick
-`untrusted` or `on-request` for the whole server with `--approval_policy`, but
-callers cannot weaken or change that policy per request. Each new session must
-still state its sandbox explicitly, so write authority is visible at the call site.
-
-Startup flags (`--model`, `--model_reasoning_effort`) configure the isolated native
-Codex server defaults (`gpt-5.6-sol` and `xhigh` unless overridden). Each initial
-`codex` call may select one of two models and one of four allowed reasoning
-efforts:
-
-| Model | Use for |
-|-------|---------|
-| `gpt-5.6-sol` | Demanding, open-ended, or high-value work; the default |
-| `gpt-5.6-terra` | Faster everyday work and easier jobs |
-
-| Value | Use for |
-|-------|---------|
-| `medium` | Balanced speed and depth |
-| `high` | Complex work that needs more analysis and checking |
-| `xhigh` | Hard but bounded implementation work |
-| `max` | Extra-hard, quality-first work with high architectural, concurrency, data-integrity, or security risk |
-
-The selectors apply only when creating a session. Omitting either one uses its
-server-configured default. Every `codex-reply` inherits both choices and cannot
-change them. Other models and effort levels are deliberately unavailable through
-the closed wrapper contract.
-
-For example, a read-only review starts with:
-
-```json
-{
-  "prompt": "Review this diff",
-  "cwd": "/absolute/path/to/project",
-  "sandbox": "read-only",
-  "model": "gpt-5.6-terra",
-  "model_reasoning_effort": "high",
-  "goal": "Find correctness and security defects"
-}
-```
-
-**Goal injection.** Set a default objective at server startup with
-`--goal "<text>"`, or pass `goal` on a call. mcp-agents turns the initial goal into
-Codex's native `developer-instructions` internally:
-
-```json
-{
-  "prompt": "Refactor the parser",
-  "cwd": "/absolute/path/to/project",
-  "sandbox": "workspace-write",
-  "model_reasoning_effort": "xhigh",
-  "goal": "Keep the public API unchanged"
-}
-```
-
-A developer message persists for the thread, so replies inherit it. A per-call
-`goal` on `codex-reply` becomes a concise prompt reminder because the native reply
-tool has no developer-instructions field. Direct developer instructions are not
-exposed: `goal` is the narrow, auditable standing-objective interface. A per-call
-goal overrides the server default; `""` suppresses that default for one call.
-
-The bridge rewrites `tools/list` responses to advertise these curated schemas.
-Normal native frames remain byte-for-byte pass-through except for the typed
-authentication failure described above; locally generated validation and auth
-errors use the same frame-safe queue/boundary discipline as progress and recovery
-messages.
-
-**Precedence within a thread.** The objective set on the initial `codex` call is
-a developer-role message and persists for the whole thread, so it takes
-precedence: a *different* `goal` supplied later on a `codex-reply` is only a
-prompt-level reminder and will not reliably override the standing objective
-(verified live — a reply goal that conflicts with the initial one is ignored in
-favor of the standing one). The reply reminder works when it is *not* opposed by
-a conflicting standing objective. To genuinely change the objective mid-stream,
-start a new `codex` call rather than changing it on a `codex-reply`.
-
-> **Note — this is not Codex's native `/goal`.** Codex's `/goal` slash command
-> (durable, thread-scoped goal state with lifecycle/budget/evidence-based
-> completion) is a TUI-only feature — it is parsed in the Codex terminal UI and
-> is *not* reachable through `codex mcp-server`. Prefixing an MCP prompt with
-> `/goal …` does **not** activate it; the text is just passed through as a user
-> message. This wrapper therefore steers Codex with `developer-instructions`
-> (the MCP-native vehicle for a standing objective), which is prompt/role
-> conditioning, not the native goal-lifecycle subsystem.
-
-**Per-call liveness.** The codex pass-through tracks every open `tools/call`
-independently. `--codex_idle_timeout <seconds>` (default `600`, `0` disables)
-bounds how long one call may go without correlated Codex activity. Only a Codex
-event carrying that call's `_meta.requestId` (or its matching response or
-interactive exchange) refreshes its idle deadline. Codex stderr, client pings,
-unrelated requests, and events belonging to another call cannot keep a stalled
-call alive. If a call reaches its idle deadline, the wrapper fails **only that
-call** with a JSON-RPC error (`-32001`), sends Codex a `notifications/cancelled`
-for that request — best-effort, so it asks Codex to stop rather than making it (see
-**Cancellation** below) — suppresses the stalled call's late native response, and **keeps the connection open** — sibling calls and the stdio
-transport are unaffected. This matters because a stdio transport close makes MCP
-clients such as Claude Code mark the server `failed` and permanently unregister
-every `mcp__codex__*` tool for the rest of the session (stdio servers are not
-auto-reconnected), so a single stalled review must never take the whole bridge
-down. The Codex process group is still reaped on a real teardown (client
-disconnect, signal, or `stdout` `EPIPE`). The one exception: if Codex is wedged
-partway through writing a response frame (no safe boundary at which to inject the
-error) and also ignores the cancellation, the wrapper retries once and then
-escalates to a bounded whole-bridge teardown — there is no way to emit a clean
-frame into a partial one, so the client is left to reconnect to a fresh bridge.
-
-**Cancellation.** A client cancellation (`notifications/cancelled` — every ESC,
-aborted turn, or subagent teardown) is treated the same way: it costs exactly one
-request. `--codex_cancel_grace <seconds>` (default `30`) bounds how long Codex may
-take to acknowledge it; on expiry the wrapper settles that request id locally,
-suppresses Codex's late response, and leaves the bridge and every sibling call
-running. Settling the request is **not** proof Codex stopped — an unacknowledged
-turn is recorded as abandoned and may keep running and writing. The mid-frame
-escalation described above arms a second full grace, so that path takes roughly
-twice as long before the bridge finalizes. The grace is generous on purpose — a Codex mid-turn is running sandboxed
-commands and does not service MCP cancellation quickly, so a short grace would
-make the escalation path the default path. This matters more than the timeout
-case because the isolated `CODEX_HOME` holds Codex's `sessions/` directory: a
-whole-bridge teardown makes every `threadId` in that process permanently
-unresumable, and the next `codex-reply` fails with `Session not found`.
-
-> [!WARNING]
-> Abandoning a request does **not** stop Codex. The wrapper asks it to stop, but
-> a turn that ignores the cancellation keeps running — and keeps writing to the
-> workspace — long after the client gave up. Every abandonment is logged to
-> stderr with its `thread_id` and `job_id`, and logged again if the turn later
-> finishes, so an unexpectedly modified tree can be explained rather than
-> guessed at. Background jobs are the sharp edge here: a `codex-start` job lives
-> in this wrapper's job table, **not** in the MCP client's task registry, so a
-> client-side "stop task" cannot reach it — only `codex-cancel` with its `jobId`
-> can. Because a job is polled through this process it can never survive a
-> reconnect, so a client disconnect cancels every non-terminal job and open
-> request, and a bounded wind-down reaps the Codex process group if it keeps
-> working anyway.
-
-`--timeout <seconds>` is also enforced for Codex calls (default `7200`) as an
-immutable hard deadline. Correlated activity can extend the idle window but
-never this hard deadline. Set the wrapper deadline below the MCP client's own
-wall-clock tool timeout when the client must always receive the wrapper's
-explicit error before it gives up.
-
-When the incoming request supplies `_meta.progressToken`, the wrapper sends
-standard MCP `notifications/progress` updates using that exact token. It never
-invents a progress token. The first useful status is immediate; later updates
-are coalesced to at most one per second, with the latest status winning. During
-otherwise silent work, a `Codex: still running` notice is sent every 10 seconds
-and includes the age of the last request-correlated Codex event.
-
-Status text is fail-closed. The bridge exposes explicitly attributed commentary,
-the active plan step, and generic lifecycle summaries for commands, patches,
-MCP tools, web/image work, and subagents. It does not expose final-answer text,
-reasoning, prompts, command strings or output, tool arguments, search queries,
-file paths, or token telemetry. Messages are whitespace-normalized and capped
-at 200 Unicode code points. Native `codex/event` frames remain byte-for-byte
-unchanged except that a typed `unauthorized` error event is replaced by the
-single structured auth failure above; progress is a parallel MCP channel and is
-normally UI status rather than additional tool-result/model context.
-
-**Optional background jobs.** Existing `codex` and `codex-reply` calls remain
-blocking and keep their current behavior. Clients that need transcript-visible
-updates can instead use the six wrapper-owned job tools advertised by the Codex
-bridge:
+The existing tools and result shapes remain available:
 
 | Tool | Purpose |
 | --- | --- |
-| `codex-start` | Start a job with the same arguments as `codex` |
-| `codex-reply-start` | Start a reply with the same arguments as `codex-reply` |
-| `codex-status` | Long-poll status using the returned `jobId` and `cursor` |
-| `codex-commentary` | Read retained commentary from an absolute offset |
-| `codex-result` | Read the terminal answer in bounded pages |
-| `codex-cancel` | Idempotently request cancellation |
+| `codex` | Start a thread and block until its turn completes |
+| `codex-reply` | Resume a durable thread and block for the next turn |
+| `codex-start`, `codex-reply-start` | Start the equivalent work as a connection-local background job |
+| `codex-status`, `codex-commentary`, `codex-result`, `codex-cancel` | Poll, read, collect, or cancel a job |
+| `codex-peek` | Read content-free liveness for turns owned by this bridge |
 
-**Prefer the blocking `codex` call, including for long builds.** It costs one tool
-call instead of one caller turn per status change, still streams
-`notifications/progress` to a progress-aware UI, and is canceled by aborting the
-turn. Reach for a job only when the work must *outlive* the caller — it has to keep
-running after you stop waiting, or another agent must be able to cancel it later by
-`jobId`.
+`codex` accepts:
 
-### `codex-peek` — is that turn still working?
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `prompt` | string | yes | Initial user prompt |
+| `cwd` | absolute path | yes | Working directory |
+| `sandbox` | string | yes | `read-only`, `workspace-write`, or `danger-full-access` |
+| `model` | string | no | `gpt-5.6-sol` or `gpt-5.6-terra` |
+| `model_reasoning_effort` | string | no | `medium`, `high`, `xhigh`, or `max` |
+| `allow_subagents` | boolean | no | Enable native in-process Codex subagents for this thread; default `false` |
+| `goal` | string | no | Set the thread's native durable objective; `""` suppresses the server default |
 
-A blocking call is opaque until it returns, which makes "wedged" and "busy" look
-identical from outside. `codex-peek` answers that without cancelling anything to find
-out: it lists every Codex turn in flight, blocking and background alike, read-only and
-immediate, and takes optional `cwd` / `threadId` / `requestId` filters.
+`codex-reply` requires `prompt` and `threadId`, and optionally accepts
+`goal` to replace or clear the native thread goal. Model, effort, sandbox, and
+subagent policy are inherited. Both schemas set `additionalProperties: false`;
+raw App Server config, instructions, provider selection, and per-call approval
+policy remain unavailable.
 
-| Field | Meaning |
-| --- | --- |
-| `requestId` | A **client** call's handle, stable for its lifetime. This is the wrapper's internal `type:value` key, not the raw JSON-RPC id, and it is not accepted by `notifications/cancelled` |
-| `jobId` | A **background job's** handle, in place of `requestId` — a job's native request runs in the wrapper's private id namespace, which is never handed out |
-| `state` | `running`, or `canceling` for a turn whose cancellation is not confirmed — still executing, still writing |
-| `threadId` | Present once Codex reports it; names the rollout file too |
-| `cwd`, `cwdInferred`, `cwdUnknown` | The workspace; `cwdInferred` when recovered from the thread rather than the call; `cwdUnknown` when it could not be recovered at all |
-| `sandbox` | The sandbox the turn was granted |
-| `elapsedSeconds` | Wall clock since the call started — **not** progress |
-| `lastActivitySeconds` | Since the last correlated Codex event — small and falling means healthy |
+The native App Server goal lifecycle is now real, rather than prompt
+conditioning. Goal status, token budget, usage, and elapsed time survive bridge
+restarts. On Codex versions whose goal-store layout has not been verified, goal
+operations fail closed while goal-free turns remain available. Because
+`--goal` makes every new thread goal-bearing, omit that server-wide default on
+an unverified Codex version if ordinary turns must remain available.
 
-Do not look for a per-turn process instead: `codex mcp-server` is long-lived and
-multiplexes every request, so there is no `codex exec` to find and a process-table
-check reports nothing while a build is running.
+#### Additional curated tools
 
-Three answers that mean less than they look like. An **empty list** is not evidence a
-turn finished — an abandoned turn keeps running inside Codex with nothing in flight
-left to report, and their count comes back as `abandonedTurnsProcessWide` — named for its scope,
-because an abandoned turn retains no workspace and so is never narrowed by a filter. A large `elapsedSeconds` is not a stall — it is only wall clock
-— and a large `lastActivitySeconds` is not one either: a single tool call can
-legitimately run silent for many minutes, so quiet is *unproven*, never *finished*.
-Cancelling to find out is the one thing that cannot be undone. And a `cwd` filter never
-hides a turn whose workspace is unknown — it reports it with `cwdUnknown`, because
-"I cannot tell" must not silently become "nothing is running there".
+The adapter exposes useful curated App Server functionality without exposing its
+general config or filesystem APIs:
 
-The start result returns immediately with an opaque `jobId`, status `cursor`,
-and the next suggested call. Repeated `codex-status` calls produce ordinary MCP
-tool results, so an outer agent or subagent can relay what Codex is doing even
-when its UI does not render `notifications/progress` — the one visibility a job
-offers that a blocking call does not. At the current cursor a status call waits for
-a change and then returns a heartbeat; `wait_ms` may be set from `0` to `60000`, and
-when omitted it defaults to the status interval below (`10000` when that pacing is
-disabled).
+| Tool | Required arguments | Purpose |
+| --- | --- | --- |
+| `codex-steer` | `threadId`, `prompt` | Add input to the active turn; the wrapper supplies the current native `expectedTurnId` precondition |
+| `codex-goal-set` | `threadId` plus one of `objective`, `status`, `tokenBudget` | Create or update the native durable goal |
+| `codex-goal-get`, `codex-goal-clear` | `threadId` | Read counters or clear the goal |
+| `codex-review`, `codex-review-start` | `threadId`, `target` | Run a native inline or detached review, blocking or as a job |
+| `codex-thread-list` | — | List active or archived durable threads with cursor pagination |
+| `codex-thread-read` | `threadId` | Read sanitized metadata and optionally bounded turn history |
+| `codex-thread-fork` | `threadId` | Fork all history or through `lastTurnId` |
+| `codex-thread-archive`, `codex-thread-unarchive` | `threadId` | Move a thread into or out of the archive |
+| `codex-interactions` | — | List unresolved approvals or structured questions |
+| `codex-interaction-resolve` | `interactionId` | Resolve with one decision or a set of question answers |
 
-Two things end a status wait, and both matter to poll cost. A **cursor advance** is
-paced server-side by `--codex_status_interval <seconds>` (default `30`), which
-coalesces intermediate progress instead of bumping the cursor on every message. The
-**`wait_ms` heartbeat** is the other, and it is not paced by that interval — so
-`wait_ms` now tracks the status interval (capped at `60000`, so an interval above 60
-seconds still heartbeats every 60) to keep a heartbeat
-from out-pacing the cursor it reports on. `wait_ms` remains a ceiling on *idle*
-waiting and never a floor on poll spacing: a status call returns **immediately**
-whenever the cursor is already behind the head, so a poller that has fallen behind
-cannot be slowed by raising it — but a caught-up one can, which is why lowering
-`wait_ms` costs turns for nothing.
+Review targets are closed objects: `{"type":"uncommittedChanges"}`,
+`{"type":"baseBranch","branch":"main"}`,
+`{"type":"commit","sha":"...","title":"..."}`, or
+`{"type":"custom","instructions":"..."}`. Delivery is `inline` by default or
+`detached`.
 
-Only intermediate progress updates are paced; lifecycle transitions — the first
-`running`, a cancellation, and any terminal state — bump the cursor and wake every
-waiter directly, bypassing the interval, so raising it never delays completion. Stall detection is likewise
-unaffected — `lastActivitySeconds` is stamped from raw Codex events, not from status
-ticks — and `codex-commentary` still retains the full narrative. `0` restores a cursor
-advance on every change; values above `60` leave the heartbeat ceiling in charge and
-only let the status text go stale. Progress *notifications* keep their own, much finer
-cadence and cost the caller no context — but note they are emitted only for a
-**blocking** call: a background job's request carries no progress token, so a job's
-only visibility is `codex-status` / `codex-commentary`.
+Thread reads and listings are bounded to 100 records per call. Returned history
+is sanitized; the bridge does not expose raw App Server frames, hidden
+reasoning, config, arbitrary filesystem operations, or private native request
+IDs.
 
-When `commentaryEndOffset` advances, call `codex-commentary` with the last
-`nextOffset`. Commentary contains only Codex messages explicitly marked with
-the `commentary` phase. Hidden reasoning, prompts, final-answer drafts, command
-strings and output, tool arguments, paths, search queries, and raw response
-items are excluded. Unsafe terminal controls are stripped, but the remaining
-text is model-authored and must still be treated as untrusted. Offsets count
-Unicode code points. Each read returns at most 32,768 code points; the bridge
-retains a one-MiB UTF-8 tail and reports absolute truncation boundaries when
-older commentary has fallen out of the buffer.
+#### Durable state and recovery
 
-Once status is terminal, use `codex-result` and continue from `nextOffset` until
-`done` is true. Each page returns its payload as both ordinary MCP text content
-and `structuredContent.text` for clients that prioritize structured results.
-Result pages are also capped at 32,768 code points. A native
-result frame larger than the bridge's 10 MiB capture limit fails the job
-atomically instead of leaking its private response onto the MCP transport.
+Each startup working directory gets a project namespace beneath:
 
-Jobs are deliberately connection-local: restarting or reconnecting the MCP
-server loses them. At most eight jobs may be active and 32 records retained;
-terminal records expire after one hour. Cancellation has the same bounded
-settlement semantics as a blocking call, so inspect the working tree before
-retrying a canceled write-capable job. The job API is a call-level opt-in and
-does not require MCP Tasks support from the client.
+```text
+${XDG_STATE_HOME:-$HOME/.local/state}/mcp-agents/codex/
+  projects/<sha256-of-canonical-startup-cwd>/v1/
+```
 
-These notices deliberately keep a progress-aware client's idle window alive,
-leaving liveness authority with the wrapper's idle and hard deadlines. They do
-not refresh `--codex_idle_timeout`, extend the wrapper's hard deadline, or
-extend a client's separate hard wall-clock tool timeout. A generated progress
-frame is inserted only at a native newline boundary; if Codex stalls halfway
-through a frame, the latest notice waits for a safe boundary and the real idle
-watchdog still terminates a permanent stall. Configure the client timeout to
-exceed the longest expected Codex run plus response headroom; when it expires,
-the client cancels the call and the bounded cancellation path below takes over.
+The durable allowlist contains sessions, archived sessions, Codex's native
+thread-writer locks, the version-gated goal store, wrapper operation leases, and
+content-free bridge sidecars. General App Server SQLite state, logs, config,
+cache, and auth snapshots remain in private per-generation homes and are
+removed after the child exits.
 
-**Terminal-result recovery.** Codex announces the thread ID on an early,
-request-correlated session event, so the wrapper retains it before the build
-finishes. If Codex later emits its terminal completion event and final agent
-message but its native `tools/call` response does not arrive within the short
-terminal-response grace period, the wrapper returns an equivalent successful
-result containing both `content` and `structuredContent.threadId`. A matching
-late native response is discarded, preserving exactly-once JSON-RPC response
-semantics. This covers the failure mode where work landed in the tree but the
-caller otherwise received neither the result nor the thread ID.
+| CLI flag | Default | Environment |
+| --- | --- | --- |
+| `--codex-state-root <path>` | XDG state path above | `MCP_AGENTS_CODEX_STATE_ROOT` |
+| `--codex-session-retention-days <days>` | `30`; `0` disables expiry | `MCP_AGENTS_CODEX_SESSION_RETENTION_DAYS` |
+| `--model <model>` | `gpt-5.6-sol` | — |
+| `--model_reasoning_effort <effort>` | `xhigh` | — |
+| `--codex-workspace-network=true\|false` | `true` | `MCP_AGENTS_CODEX_WORKSPACE_NETWORK_ACCESS` |
+| `--codex_idle_timeout <seconds>` | `600`; `0` disables | — |
+| `--codex_cancel_grace <seconds>` | `30` | `MCP_AGENTS_CODEX_CANCEL_GRACE_MS` |
+| `--codex_status_interval <seconds>` | `30` | `MCP_AGENTS_CODEX_STATUS_INTERVAL_MS` |
 
-**Cancellation and reconnect.** Client cancellation starts a short,
-non-resettable grace period bounded by `--codex_cancel_grace` (the mid-frame escalation below arms
-a second one, so that path can take about twice as long). If Codex does not
-settle within it, the wrapper settles that request id locally, suppresses Codex's
-late response, and **leaves the bridge and every sibling call running** — a single
-stalled call must never take the whole bridge down. Two bounded exceptions: a stream
-wedged mid-frame that also ignores the cancellation (with no safe boundary at which
-to inject an error, the wrapper retries once and then escalates to a whole-bridge
-teardown), and the aggregate cap — once suppressed responses reach
-`MAX_SUPPRESSED_CODEX_RESPONSES` the bridge finalizes rather than track them
-indefinitely. After either, the client reconnects to a fresh bridge. A native
-response that arrives inside the grace period is discarded whenever it can be
-intercepted without corrupting a partially forwarded frame. The canceled,
-potentially write-capable call is never replayed automatically. **Cancellation is
-best-effort and does not prove Codex stopped** — an unacknowledged turn is recorded
-as abandoned, not terminated, and may keep running and writing the workspace, so
-inspect the working tree before manually retrying it.
+A custom state root must be absolute and outside the served workspace.
+Directories use mode `0700`, files use `0600`, and the process sets umask
+`0077` before creating credential-bearing or durable state. Retention runs at
+startup and daily, skips live or uncertain ownership, and removes only inactive
+thread state older than the configured window.
 
-This legacy bridge deliberately does **not** respawn `codex mcp-server` inside
-the existing stdio connection or transparently replay threads. `codex-reply`
-state belongs to the old Codex process, so a thread ID from a torn-down child
-cannot be resumed after reconnect. Durable same-connection recovery requires a
-separate migration from the transparent legacy pass-through to an MCP adapter
-over `codex app-server` (`thread/start`, `turn/start`, `turn/interrupt`, and
-`thread/resume`).
+Multiple bridge processes may share the project store, but wrapper operations
+take a per-thread lease and Codex keeps its native writer lock. A live or
+uncertain competing owner returns `codex_thread_busy`; stale wrapper leases are
+recovered only after their owner PID is proven dead.
+
+Bridge sidecars contain IDs, PIDs, generation, workspace, sandbox, timestamps,
+rollout path, and lifecycle state—never prompts, commentary, model output, or
+native request IDs. The lifecycle distinguishes `starting`, `active`,
+`waiting_for_input`, `canceling`, `terminal_undelivered`, and
+`outcome_unknown`, so external liveness checks do not turn uncertainty into
+“finished.”
+
+#### Isolation, approvals, and interactions
+
+Each App Server generation receives an isolated `CODEX_HOME` and
+`CODEX_SQLITE_HOME`. The bridge copies only authentication and the model cache,
+writes a minimal config, strips external MCP servers and unrelated preferences,
+and selectively mirrors an explicit Fast-mode opt-in. Native subagents stay off
+unless the initial call sets `allow_subagents: true`; even then they are
+Codex-only in-process workers and cannot re-enter this MCP bridge.
+
+Workspace-write network access defaults to `true` so commands can reach local
+services. Codex does not offer a localhost-only switch: enabling it permits
+general outbound access while filesystem writes remain sandbox-bounded.
+
+Approval policy is server-owned (`never` by default). Accepted startup values
+are `untrusted`, `on-request`, and `never`; the old `on-failure` value is not
+supported by App Server and is rejected with a migration error. App Server
+approvals and structured questions are correlated to their turn, assigned
+wrapper-owned interaction IDs, and resolved exactly once. A client that
+advertises MCP form elicitation can answer foreground requests inline. A
+foreground call from a non-eliciting client fails with
+`codex_interaction_requires_background`; start that work as a background job,
+then use `codex-interactions` plus `codex-interaction-resolve`. Secret-input
+requests are rejected rather than queued or logged. Interaction waiting does
+not turn into idle-timeout failure, but the immutable hard call deadline
+continues to run.
+
+#### Progress, cancellation, and jobs
+
+Blocking calls remain the preferred path, including for long builds. When the
+caller supplies an MCP progress token, the adapter sends throttled, privacy-safe
+status without exposing prompts, final-answer drafts, command strings/output,
+paths, tool arguments, or hidden reasoning.
+
+Background jobs remain connection-local. At most eight are active and 32 are
+retained for one hour; commentary and final results are read in bounded pages.
+Use jobs only when work must outlive the caller or a client cannot render MCP
+progress.
+
+Cancellation maps to native `turn/interrupt` and is best-effort. A canceled or
+timed-out write-capable turn may still have changed the workspace, so inspect
+state before retrying. MCP deliberately emits no response after the client has
+canceled that request; the bridge still settles its local handler after the
+configured grace while retaining liveness and ownership for any native turn
+that may still be writing. While the MCP connection stays open, elapsed time
+alone never releases that ownership: native completion or generation
+termination must prove the writer stopped. Client disconnect cancels
+connection-local jobs and open turns, then reaps the private App Server process
+group within a bounded grace period.
+
+### `codex-legacy` (temporary native MCP compatibility)
+
+`codex-legacy` preserves the complete 0.28 native MCP bridge and runs
+`codex mcp-server` directly. OpenAI has
+[deprecated that command](https://learn.chatgpt.com/docs/mcp-server), but still
+documents it for existing integrations. This provider is the deliberate
+migration escape hatch while supported Codex CLI releases continue to ship the
+command.
+
+It retains the legacy `codex`, `codex-reply`, `codex-start`,
+`codex-reply-start`, `codex-status`, `codex-commentary`, `codex-result`,
+`codex-cancel`, and `codex-peek` contracts, including native MCP framing,
+validation, auth handling, watchdogs, and connection-local job behavior. It
+does not expose App Server-only steering, native goals, reviews, thread
+administration, structured interactions, durable project state, retention, or
+cross-reconnect recovery. Its `goal` behavior remains the legacy
+instruction/prompt transformation instead of App Server's native durable goal
+lifecycle.
+
+Exact compatibility also preserves the legacy private-home layout beneath the
+server startup directory at `tmp/codex-homes/`. Those directories and copied
+auth files remain permission-hardened and stale homes are swept, but this lane
+does not adopt the App provider's external durable-state design. Keep that
+storage difference in mind when choosing the temporary fallback.
+
+The compatibility provider receives security and compatibility fixes, but no
+new App Server-only capabilities. It will remain available while supported
+Codex CLI releases provide `codex mcp-server`; any later removal will be called
+out as a breaking change. There is intentionally no automatic fallback between
+`codex` and `codex-legacy`.
+
+To temporarily move an existing MCP server entry back to native MCP, change
+only the provider argument and keep the MCP server key unchanged:
+
+```json
+{
+  "mcpServers": {
+    "codex": {
+      "type": "stdio",
+      "command": "mcp-agents",
+      "args": ["--provider", "codex-legacy"],
+      "timeout": 7500000
+    }
+  }
+}
+```
+
+Keeping the key as `codex` preserves client-side tool names such as
+`mcp__codex__codex`. Running both providers side by side requires two server
+keys and therefore two client namespaces; permission and hook rules that match
+the old namespace must then be updated explicitly. App Server state and
+retention flags are rejected by `codex-legacy` instead of being silently
+ignored.
 
 ## Integration with Claude Code
 
@@ -741,8 +562,8 @@ Every initial `codex` call may select `gpt-5.6-sol` or `gpt-5.6-terra` and
 `medium`, `high`, `xhigh`, or `max`; omitted selectors use the server defaults,
 and replies inherit both choices. Other models, raw `config`, and per-call
 approval-policy arguments are rejected before Codex runs. Add
-`"--goal", "<text>"` to `args` to provide a default objective (see
-[Goal injection](#codex-pass-through) above).
+`"--goal", "<text>"` to `args` to provide a default native durable objective
+(see the [Codex adapter](#codex-mcp-adapter-over-app-server) above).
 
 Claude interprets the per-server `timeout` in milliseconds as a hard wall-clock
 cap; progress does not extend it. Keep it above the wrapper's `--timeout`
@@ -825,7 +646,8 @@ npm install
 npm link          # symlinks mcp-agents to your local server.js
 ```
 
-After `npm link`, any edits to `server.js` take effect immediately — no reinstall needed.
+After `npm link`, edits to `server.js` or `codex-legacy.js` take effect
+immediately — no reinstall needed.
 
 Benchmark the startup paths through real `/tmp` project `.mcp.json` files:
 
@@ -847,20 +669,23 @@ the deterministic test-suite gate.
 
 1. An MCP client connects over stdio
 2. The server reads `--provider <name>` from its argv (defaults to `codex`)
-3. Gemini registers one blocking CLI tool; Claude registers its legacy blocking
-   tool plus the one-shot review-job tools; Codex forwards its native tools and
-   adds its background-job tools
+3. Gemini registers one blocking CLI tool; Claude registers its blocking tool
+   plus the one-shot review-job tools; `codex` registers a wrapper-owned MCP
+   surface and starts App Server lazily behind it; `codex-legacy` runs the
+   complete native MCP bridge
 4. Client calls `tools/call` with the tool name and a `prompt`
-5. The server runs the CLI as a detached child process; Claude review jobs parse
-   stream-json into safe status and retained result pages, while blocking tools
-   return normalized provider output
+5. The server runs the selected CLI as a detached child process. Claude review
+   jobs parse stream-json; the App Server adapter correlates documented
+   thread/turn/item events into safe progress, durable thread IDs, and retained
+   result pages; the legacy provider transforms and observes native MCP frames;
+   blocking tools return normalized provider output
 
 The server keeps a small keepalive timer so Node.js does not exit prematurely
 when stdin reaches EOF before an async subprocess registers an active handle.
 For Claude and Gemini provider mode, that keepalive is cleared during shutdown.
-When the MCP stdio connection closes, active Claude jobs receive an interrupt
-and bounded TERM/KILL fallback; any remaining tracked detached provider process
-groups are reaped before the server exits.
+When the MCP stdio connection closes, active Claude and Codex work receives a
+native interrupt where available and bounded TERM/KILL fallback; any remaining
+tracked detached provider process groups are reaped before the server exits.
 
 ## License
 
