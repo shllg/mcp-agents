@@ -305,10 +305,11 @@ policy remain unavailable.
 
 The native App Server goal lifecycle is now real, rather than prompt
 conditioning. Goal status, token budget, usage, and elapsed time survive bridge
-restarts. On Codex versions whose goal-store layout has not been verified, goal
-operations fail closed while goal-free turns remain available. Because
-`--goal` makes every new thread goal-bearing, omit that server-wide default on
-an unverified Codex version if ordinary turns must remain available.
+restarts. On POSIX, mcp-agents shares Codex's current `goals_1.sqlite` storage
+between isolated App Server generations. This layout assumption is documented
+rather than version-gated, so newer Codex releases remain usable; if Codex
+changes the layout, mcp-agents must be updated to preserve goals across bridge
+restarts.
 
 #### Additional curated tools
 
@@ -349,7 +350,7 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/mcp-agents/codex/
 ```
 
 The durable allowlist contains sessions, archived sessions, Codex's native
-thread-writer locks, the version-gated goal store, wrapper operation leases, and
+thread-writer locks, the native goal store, wrapper operation leases, and
 content-free bridge sidecars. General App Server SQLite state, logs, config,
 cache, and auth snapshots remain in private per-generation homes and are
 removed after the child exits.

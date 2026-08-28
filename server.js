@@ -64,7 +64,7 @@ const CODEX_STATE_ROOT_ENV = "MCP_AGENTS_CODEX_STATE_ROOT";
 const CODEX_SESSION_RETENTION_DAYS_ENV =
   "MCP_AGENTS_CODEX_SESSION_RETENTION_DAYS";
 const DEFAULT_CODEX_SESSION_RETENTION_DAYS = 30;
-const CODEX_GOAL_STORE_VERSION = "0.149.1";
+const MINIMUM_CODEX_VERSION = "0.149.1";
 const CODEX_INTERACTION_TIMEOUT_MS = 10 * 60 * 1_000;
 const DEFAULT_CODEX_IDLE_TIMEOUT_MS = 600_000;
 // How long App Server gets to acknowledge a cancellation before the bridge
@@ -5636,8 +5636,7 @@ async function runCodexAppServer({
     ? `${codexVersion.major}.${codexVersion.minor}.${codexVersion.patch}`
     : "unknown";
   const agentsEnabledKeySupported = codexSupportsAgentsEnabledKey(codexVersion);
-  const goalStoreCompatible = process.platform !== "win32" &&
-    versionText === CODEX_GOAL_STORE_VERSION;
+  const durableGoalsSupported = process.platform !== "win32";
   const bridgeId = randomUUID();
   const bridgeStartedAt = new Date().toISOString();
   const canonicalProjectCwd = realpathSync(STARTUP_CWD);
@@ -5723,7 +5722,7 @@ async function runCodexAppServer({
 
   const durableGoalFiles = ["goals_1.sqlite", "goals_1.sqlite-wal", "goals_1.sqlite-shm"];
   const durableGoalDb = join(durableGoals, durableGoalFiles[0]);
-  if (goalStoreCompatible && !existsSync(durableGoalDb)) {
+  if (durableGoalsSupported && !existsSync(durableGoalDb)) {
     const fd = openSync(durableGoalDb, "a", 0o600);
     closeSync(fd);
   }
@@ -6351,7 +6350,7 @@ async function runCodexAppServer({
         startedAt: new Date().toISOString(),
       };
       atomicPrivateJson(retentionJournalPath, journal);
-      if (goalStoreCompatible && journal.phase === "selected") {
+      if (durableGoalsSupported && journal.phase === "selected") {
         try {
           await requestApp(
             generationState,
@@ -7356,7 +7355,7 @@ async function runCodexAppServer({
       ["archived_sessions", durableArchivedSessions],
       ["thread-writer-locks", durableWriterLocks],
     ]) symlinkSync(target, join(codexHome, name), "dir");
-    if (goalStoreCompatible) {
+    if (durableGoalsSupported) {
       for (const name of durableGoalFiles) {
         symlinkSync(join(durableGoals, name), join(sqliteHome, name), "file");
       }
@@ -7379,7 +7378,7 @@ async function runCodexAppServer({
     ) {
       throw appError(
         "codex_app_server_incompatible",
-        `Codex App Server adapter requires Codex >= ${CODEX_GOAL_STORE_VERSION}; found ${versionText}`,
+        `Codex App Server adapter requires Codex >= ${MINIMUM_CODEX_VERSION}; found ${versionText}`,
       );
     }
     const generation = ++appGeneration;
@@ -7492,7 +7491,7 @@ async function runCodexAppServer({
     logErr(
       `[mcp-agents] Codex App Server generation ${generation} ready ` +
         `(codex=${versionText}, app=${initialized?.userAgent ?? "unknown"}, ` +
-        `durable_sessions=true, goals=${goalStoreCompatible ? "durable" : "disabled"})`,
+        `durable_sessions=true, goals=${durableGoalsSupported ? "durable" : "disabled"})`,
     );
     scheduleRetention(generationState);
     return generationState;
@@ -7579,10 +7578,10 @@ async function runCodexAppServer({
   ) => {
     const effective = requestedGoal === undefined && isInitial ? goal : requestedGoal;
     if (effective === undefined) return;
-    if (!goalStoreCompatible) {
+    if (!durableGoalsSupported) {
       throw appError(
         "codex_goal_store_incompatible",
-        `Durable native goals require Codex ${CODEX_GOAL_STORE_VERSION} on POSIX; found ${versionText}`,
+        "Durable native goals require POSIX",
       );
     }
     if (effective.trim()) {
@@ -8357,10 +8356,10 @@ async function runCodexAppServer({
         });
       }
       if (params.name.startsWith("codex-goal-")) {
-        if (!goalStoreCompatible) {
+        if (!durableGoalsSupported) {
           return errorResult(
             "codex_goal_store_incompatible",
-            `Durable goals require Codex ${CODEX_GOAL_STORE_VERSION} on POSIX; found ${versionText}`,
+            "Durable goals require POSIX",
           );
         }
         const generationState = await ensureApp();

@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.29.1] - 2026-08-29
+
+### Fixed
+
+- Allow durable native goals on newer Codex releases instead of rejecting every
+  version other than 0.149.1.
+
 ## [0.29.0] - 2026-08-26
 
 ### Added

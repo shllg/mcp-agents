@@ -1821,7 +1821,7 @@ function onMessage(message) {
       );
       break;
     case "thread/list":
-      if (mode === "retention-unsupported" && !deletedThreads.has("thread-expired")) {
+      if (mode === "retention-newer" && !deletedThreads.has("thread-expired")) {
         respond(message.id, {
           data: [
             {
@@ -1956,8 +1956,8 @@ const child = spawn("node", ["server.js", "--provider", "codex", ...rawServerArg
     MCP_STUB_APP_WORKSPACE: `${stubDir}/workspace`,
     MCP_STUB_REQUIRE_SESSION: scenario === "restart-reply" ? "1" : "0",
     MCP_STUB_CODEX_VERSION: [
-      "goal-default-unsupported",
-      "retention-unsupported",
+      "goal-default-newer",
+      "retention-newer",
       "retention-journal",
     ].includes(scenario)
       ? "codex-cli 0.150.0"
@@ -1977,7 +1977,7 @@ const child = spawn("node", ["server.js", "--provider", "codex", ...rawServerArg
     ...(scenario === "early-stale"
       ? { MCP_AGENTS_TEST_CODEX_EARLY_COMPLETION_TTL_MS: "40" }
       : {}),
-    ...(["retention-unsupported", "retention-journal"].includes(scenario)
+    ...(["retention-newer", "retention-journal"].includes(scenario)
       ? { MCP_AGENTS_CODEX_RETENTION_STARTUP_MS: "50" }
       : {}),
     ...(scenario === "stale-race"
@@ -2312,7 +2312,7 @@ try {
     data.peek = await call("codex-peek", { threadId: "thread-1" });
     data.sidecarsWhileStarting = readSidecars();
     data.call = await open;
-  } else if (scenario === "retention-unsupported" || scenario === "retention-journal") {
+  } else if (scenario === "retention-newer" || scenario === "retention-journal") {
     await mcpInitialize();
     data.list = await call("codex-thread-list", { limit: 5 });
     await sleep(300);
@@ -4184,13 +4184,13 @@ test_codex_app_case "Initial goals become native state before their first turn" 
       (.features.multi_agent == true) and (.agents.enabled == true)) and
    (.appRequests | tostring | contains("allow_subagents") | not)'
 
-test_codex_app_case "A server goal fails closed on an unverified goal-store version" \
-  "goal-default-unsupported" \
-  '(.data.call.result.isError == true) and
-   (.data.call.result.structuredContent.code == "codex_goal_store_incompatible") and
+test_codex_app_case "A server goal works on a newer Codex version" \
+  "goal-default-newer" \
+  '(.data.call.result.isError != true) and
+   (.appSpawns[0].storage.goals.symlink == true) and
    ([.appRequests[] | select(.method == "thread/start")] | length == 1) and
-   ([.appRequests[] | select(.method == "thread/goal/set")] | length == 0) and
-   ([.appRequests[] | select(.method == "turn/start")] | length == 0)' \
+   ([.appRequests[] | select(.method == "thread/goal/set")] | length == 1) and
+   ([.appRequests[] | select(.method == "turn/start")] | length == 1)' \
   "--goal DEFAULT"
 
 test_codex_app_case "Steering targets the wrapper-tracked active turn" \
@@ -4404,14 +4404,15 @@ test_codex_app_cross_bridge_busy \
 test_codex_app_stale_lease_race \
   "Simultaneous stale-lease takeover elects exactly one writer"
 
-test_codex_app_case "Retention does not depend on the exact goal-store fingerprint" \
-  "retention-unsupported" \
-  '(.appSpawns[0].storage.goals == null) and
+test_codex_app_case "Retention clears goals on a newer Codex version" \
+  "retention-newer" \
+  '(.appSpawns[0].storage.goals.symlink == true) and
    ([.appRequests[] | select(.method == "thread/delete" and
       .params.threadId == "thread-expired")] | length == 1) and
    ([.appRequests[] | select(.method == "thread/delete" and
       .params.threadId == "thread-fresh")] | length == 0) and
-   ([.appRequests[] | select(.method == "thread/goal/clear")] | length == 0)' \
+   ([.appRequests[] | select(.method == "thread/goal/clear" and
+      .params.threadId == "thread-expired")] | length == 1)' \
   "--codex-session-retention-days 1"
 
 test_codex_app_case "Retention journal recovery clears a native missing thread" \
@@ -4419,7 +4420,8 @@ test_codex_app_case "Retention journal recovery clears a native missing thread" 
   '(.data.journalExists == false) and
    ([.appRequests[] | select(.method == "thread/delete" and
       .params.threadId == "thread-missing")] | length == 1) and
-   ([.appRequests[] | select(.method == "thread/goal/clear")] | length == 0)' \
+   ([.appRequests[] | select(.method == "thread/goal/clear" and
+      .params.threadId == "thread-missing")] | length == 1)' \
   "--codex-session-retention-days 1"
 
 test_codex_app_case "Structured unauthorized events latch future Codex turns" \
