@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- Exit cleanly when an MCP client's stderr pipe closes instead of repeatedly
+  raising `EPIPE` during shutdown and leaving a CPU-spinning bridge process.
+
 ## [0.29.1] - 2026-08-29
 
 ### Fixed

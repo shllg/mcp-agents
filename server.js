@@ -390,8 +390,27 @@ const CLI_BACKENDS = {
  * Never write debug logs to stdout (it breaks MCP stdio transport).
  * Use stderr only.
  */
+let stderrWritable = true;
+
+process.stderr.on("error", () => {
+  stderrWritable = false;
+});
+
+function writeStderr(message) {
+  if (!stderrWritable || process.stderr.destroyed) return false;
+  try {
+    process.stderr.write(String(message), (err) => {
+      if (err) stderrWritable = false;
+    });
+    return true;
+  } catch {
+    stderrWritable = false;
+    return false;
+  }
+}
+
 function logErr(message) {
-  process.stderr.write(`${message}\n`);
+  writeStderr(`${message}\n`);
 }
 
 /**
@@ -578,21 +597,21 @@ function parseArgs() {
         break;
       case "--provider":
         if (i + 1 >= args.length) {
-          process.stderr.write("error: --provider requires a value\n");
+          writeStderr("error: --provider requires a value\n");
           process.exit(1);
         }
         provider = args[++i];
         break;
       case "--model":
         if (i + 1 >= args.length) {
-          process.stderr.write("error: --model requires a value\n");
+          writeStderr("error: --model requires a value\n");
           process.exit(1);
         }
         model = args[++i];
         break;
       case "--model_reasoning_effort":
         if (i + 1 >= args.length) {
-          process.stderr.write(
+          writeStderr(
             "error: --model_reasoning_effort requires a value\n",
           );
           process.exit(1);
@@ -601,21 +620,21 @@ function parseArgs() {
         break;
       case "--sandbox_mode":
         if (i + 1 >= args.length) {
-          process.stderr.write("error: --sandbox_mode requires a value\n");
+          writeStderr("error: --sandbox_mode requires a value\n");
           process.exit(1);
         }
         sandboxMode = args[++i];
         break;
       case "--approval_policy":
         if (i + 1 >= args.length) {
-          process.stderr.write("error: --approval_policy requires a value\n");
+          writeStderr("error: --approval_policy requires a value\n");
           process.exit(1);
         }
         approvalPolicy = args[++i];
         break;
       case "--codex-workspace-network":
         if (i + 1 >= args.length) {
-          process.stderr.write(
+          writeStderr(
             "error: --codex-workspace-network requires a value\n",
           );
           process.exit(1);
@@ -627,19 +646,19 @@ function parseArgs() {
         break;
       case "--goal":
         if (i + 1 >= args.length) {
-          process.stderr.write("error: --goal requires a value\n");
+          writeStderr("error: --goal requires a value\n");
           process.exit(1);
         }
         goal = args[++i];
         break;
       case "--codex_idle_timeout": {
         if (i + 1 >= args.length) {
-          process.stderr.write("error: --codex_idle_timeout requires a value\n");
+          writeStderr("error: --codex_idle_timeout requires a value\n");
           process.exit(1);
         }
         const secs = Number(args[++i]);
         if (!Number.isFinite(secs) || secs < 0) {
-          process.stderr.write(
+          writeStderr(
             "error: --codex_idle_timeout must be a non-negative number\n",
           );
           process.exit(1);
@@ -649,12 +668,12 @@ function parseArgs() {
       }
       case "--codex_cancel_grace": {
         if (i + 1 >= args.length) {
-          process.stderr.write("error: --codex_cancel_grace requires a value\n");
+          writeStderr("error: --codex_cancel_grace requires a value\n");
           process.exit(1);
         }
         const secs = Number(args[++i]);
         if (!Number.isFinite(secs) || secs < 0) {
-          process.stderr.write(
+          writeStderr(
             "error: --codex_cancel_grace must be a non-negative number\n",
           );
           process.exit(1);
@@ -664,12 +683,12 @@ function parseArgs() {
       }
       case "--codex_status_interval": {
         if (i + 1 >= args.length) {
-          process.stderr.write("error: --codex_status_interval requires a value\n");
+          writeStderr("error: --codex_status_interval requires a value\n");
           process.exit(1);
         }
         const secs = Number(args[++i]);
         if (!Number.isFinite(secs) || secs < 0) {
-          process.stderr.write(
+          writeStderr(
             "error: --codex_status_interval must be a non-negative number\n",
           );
           process.exit(1);
@@ -679,25 +698,25 @@ function parseArgs() {
       }
       case "--codex-state-root":
         if (i + 1 >= args.length) {
-          process.stderr.write("error: --codex-state-root requires a value\n");
+          writeStderr("error: --codex-state-root requires a value\n");
           process.exit(1);
         }
         codexStateRoot = args[++i];
         if (!isAbsolute(codexStateRoot)) {
-          process.stderr.write("error: --codex-state-root must be absolute\n");
+          writeStderr("error: --codex-state-root must be absolute\n");
           process.exit(1);
         }
         break;
       case "--codex-session-retention-days": {
         if (i + 1 >= args.length) {
-          process.stderr.write(
+          writeStderr(
             "error: --codex-session-retention-days requires a value\n",
           );
           process.exit(1);
         }
         const days = Number(args[++i]);
         if (!Number.isInteger(days) || days < 0) {
-          process.stderr.write(
+          writeStderr(
             "error: --codex-session-retention-days must be a non-negative integer\n",
           );
           process.exit(1);
@@ -707,7 +726,7 @@ function parseArgs() {
       }
       case "--browser_lease_command":
         if (i + 1 >= args.length) {
-          process.stderr.write(
+          writeStderr(
             "error: --browser_lease_command requires a value\n",
           );
           process.exit(1);
@@ -717,7 +736,7 @@ function parseArgs() {
         break;
       case "--browser_command":
         if (i + 1 >= args.length) {
-          process.stderr.write("error: --browser_command requires a value\n");
+          writeStderr("error: --browser_command requires a value\n");
           process.exit(1);
         }
         browserFlags.push(arg);
@@ -725,7 +744,7 @@ function parseArgs() {
         break;
       case "--browser_idle_timeout": {
         if (i + 1 >= args.length) {
-          process.stderr.write(
+          writeStderr(
             "error: --browser_idle_timeout requires a value\n",
           );
           process.exit(1);
@@ -733,7 +752,7 @@ function parseArgs() {
         browserFlags.push(arg);
         const secs = Number(args[++i]);
         if (!Number.isFinite(secs) || secs < 0) {
-          process.stderr.write(
+          writeStderr(
             "error: --browser_idle_timeout must be a non-negative number\n",
           );
           process.exit(1);
@@ -743,13 +762,13 @@ function parseArgs() {
       }
       case "--browser_viewport":
         if (i + 1 >= args.length) {
-          process.stderr.write("error: --browser_viewport requires a value\n");
+          writeStderr("error: --browser_viewport requires a value\n");
           process.exit(1);
         }
         browserFlags.push(arg);
         browserViewport = args[++i];
         if (!/^[1-9]\d*x[1-9]\d*$/u.test(browserViewport)) {
-          process.stderr.write(
+          writeStderr(
             "error: --browser_viewport must use positive WxH dimensions\n",
           );
           process.exit(1);
@@ -757,13 +776,13 @@ function parseArgs() {
         break;
       case "--browser_app_port": {
         if (i + 1 >= args.length) {
-          process.stderr.write("error: --browser_app_port requires a value\n");
+          writeStderr("error: --browser_app_port requires a value\n");
           process.exit(1);
         }
         browserFlags.push(arg);
         const port = Number(args[++i]);
         if (!Number.isInteger(port) || port < 1 || port > 65_535) {
-          process.stderr.write(
+          writeStderr(
             "error: --browser_app_port must be an integer from 1 to 65535\n",
           );
           process.exit(1);
@@ -773,19 +792,19 @@ function parseArgs() {
       }
       case "--browser_log_file":
         if (i + 1 >= args.length) {
-          process.stderr.write("error: --browser_log_file requires a value\n");
+          writeStderr("error: --browser_log_file requires a value\n");
           process.exit(1);
         }
         browserFlags.push(arg);
         browserLogFile = args[++i];
         if (!browserLogFile) {
-          process.stderr.write("error: --browser_log_file must not be blank\n");
+          writeStderr("error: --browser_log_file must not be blank\n");
           process.exit(1);
         }
         break;
       case "--browser_allowed_url_pattern":
         if (i + 1 >= args.length) {
-          process.stderr.write(
+          writeStderr(
             "error: --browser_allowed_url_pattern requires a value\n",
           );
           process.exit(1);
@@ -793,7 +812,7 @@ function parseArgs() {
         browserFlags.push(arg);
         browserAllowedUrlPatterns.push(args[++i]);
         if (!browserAllowedUrlPatterns.at(-1)) {
-          process.stderr.write(
+          writeStderr(
             "error: --browser_allowed_url_pattern must not be blank\n",
           );
           process.exit(1);
@@ -801,25 +820,25 @@ function parseArgs() {
         break;
       case "--timeout": {
         if (i + 1 >= args.length) {
-          process.stderr.write("error: --timeout requires a value\n");
+          writeStderr("error: --timeout requires a value\n");
           process.exit(1);
         }
         const secs = Number(args[++i]);
         if (!(secs > 0)) {
-          process.stderr.write("error: --timeout must be a positive number\n");
+          writeStderr("error: --timeout must be a positive number\n");
           process.exit(1);
         }
         defaultTimeoutMs = Math.round(secs * 1000);
         break;
       }
       default:
-        process.stderr.write(`error: unknown option: ${args[i]}\n`);
+        writeStderr(`error: unknown option: ${args[i]}\n`);
         process.exit(1);
     }
   }
 
   if (approvalPolicy === "on-failure" && provider !== "codex-legacy") {
-    process.stderr.write(
+    writeStderr(
       "error: --approval_policy on-failure is only supported by --provider codex-legacy; use on-request or never\n",
     );
     process.exit(1);
@@ -828,27 +847,27 @@ function parseArgs() {
     ? ["untrusted", "on-failure", "on-request", "never"]
     : ["untrusted", "on-request", "never"];
   if (approvalPolicy !== undefined && !approvalPolicies.includes(approvalPolicy)) {
-    process.stderr.write(
+    writeStderr(
       `error: --approval_policy must be ${approvalPolicies.join(", ")}\n`,
     );
     process.exit(1);
   }
 
   if (provider !== "codex" && codexStateRoot !== undefined) {
-    process.stderr.write(
+    writeStderr(
       "error: --codex-state-root is only supported by --provider codex\n",
     );
     process.exit(1);
   }
   if (provider !== "codex" && codexSessionRetentionDays !== undefined) {
-    process.stderr.write(
+    writeStderr(
       "error: --codex-session-retention-days is only supported by --provider codex\n",
     );
     process.exit(1);
   }
 
   if (provider !== "browser" && browserFlags.length > 0) {
-    process.stderr.write(
+    writeStderr(
       `error: ${browserFlags[0]} is only valid with --provider browser\n`,
     );
     process.exit(1);
@@ -868,7 +887,7 @@ function parseArgs() {
     const reserveSecs =
       (DEFAULT_BROWSER_IDENTITY_TIMEOUT_MS + BROWSER_ACQUIRE_RESERVE_MS) / 1000;
     const minSecs = Math.floor(BROWSER_MIN_HARD_TIMEOUT_MS / 1000) + 1;
-    process.stderr.write(
+    writeStderr(
       `error: --timeout ${defaultTimeoutMs / 1000} is too small for --provider browser\n` +
       `       the browser provider reserves ${reserveSecs}s of the request budget for\n` +
       `       identity verification and the first tool call, so lease acquisition\n` +
@@ -914,7 +933,7 @@ function parseArgs() {
 function parseBooleanSetting(value, source) {
   if (value === "true") return true;
   if (value === "false") return false;
-  process.stderr.write(`error: ${source} must be true or false\n`);
+  writeStderr(`error: ${source} must be true or false\n`);
   process.exit(1);
 }
 
