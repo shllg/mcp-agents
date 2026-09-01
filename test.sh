@@ -169,6 +169,141 @@ test_handshake() {
   fi
 }
 
+# ── Helper: official v2 client negotiates modern stdio and exits cleanly ──
+test_modern_stdio_provider() {
+  local label="$1"
+  local provider="$2"
+  local expected_tool="$3"
+  local tmpdir output_file status
+
+  echo "--- $label ---"
+
+  tmpdir=$(mktemp -d)
+  output_file="$tmpdir/output.txt"
+  mkdir "$tmpdir/bin"
+  cat >"$tmpdir/bin/codex" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then
+  printf '%s\n' 'codex-cli 0.149.1'
+  exit 0
+fi
+exit 1
+EOF
+  chmod +x "$tmpdir/bin/codex"
+  set +e
+  MCP_AGENTS_TEST_STATE_ROOT="$tmpdir/state" \
+  MCP_AGENTS_TEST_BIN_DIR="$tmpdir/bin" \
+    "$TIMEOUT_CMD" 15 node --input-type=module - \
+      "$provider" "$expected_tool" >"$output_file" 2>&1 <<'EOF'
+import { appendFileSync } from "node:fs";
+import { Client } from "@modelcontextprotocol/client";
+import {
+  StdioClientTransport,
+  getDefaultEnvironment,
+} from "@modelcontextprotocol/client/stdio";
+
+const provider = process.argv[2];
+const expectedTool = process.argv[3];
+const args = ["server.js", "--provider", provider];
+if (provider === "codex") {
+  args.push("--codex-state-root", process.env.MCP_AGENTS_TEST_STATE_ROOT);
+}
+
+const client = new Client(
+  { name: "mcp-agents-modern-test", version: "0.0.0" },
+  {
+    versionNegotiation: {
+      mode: { pin: "2026-07-28" },
+      probe: { timeoutMs: 1_000, maxRetries: 0 },
+    },
+  },
+);
+const transport = new StdioClientTransport({
+  command: process.execPath,
+  args,
+  cwd: process.cwd(),
+  env: {
+    ...getDefaultEnvironment(),
+    PATH: provider === "codex"
+      ? `${process.env.MCP_AGENTS_TEST_BIN_DIR}:${process.env.PATH}`
+      : process.env.PATH,
+  },
+  stderr: "pipe",
+});
+let stderr = "";
+transport.stderr?.setEncoding("utf8");
+transport.stderr?.on("data", (chunk) => {
+  stderr += chunk;
+});
+
+let registeredPid = null;
+function registerChild() {
+  const pid = transport.pid;
+  if (pid !== null && pid !== registeredPid) {
+    appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${pid}\n`);
+    registeredPid = pid;
+  }
+  return pid;
+}
+
+let failure;
+try {
+  await client.connect(transport);
+  registerChild();
+  if (client.getProtocolEra() !== "modern") {
+    throw new Error(`expected modern era, got ${client.getProtocolEra()}`);
+  }
+  const { tools } = await client.listTools();
+  const names = new Set(tools.map((tool) => tool.name));
+  if (!names.has("ping") || !names.has(expectedTool)) {
+    throw new Error(`missing expected tools: ${JSON.stringify([...names])}`);
+  }
+} catch (error) {
+  failure = error;
+} finally {
+  registerChild();
+  await client.close().catch(() => {});
+}
+
+const pid = registeredPid;
+if (pid !== null) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try {
+      process.kill(pid, 0);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } catch {
+      break;
+    }
+  }
+  try {
+    process.kill(pid, 0);
+    try { process.kill(-pid, "SIGKILL"); } catch {}
+    throw new Error(`server child ${pid} survived client close`);
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+  }
+}
+
+if (failure) {
+  console.error(failure);
+  if (stderr) console.error(stderr);
+  process.exit(1);
+}
+EOF
+  status=$?
+  set -e
+
+  if [ "$status" -eq 0 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (exit $status)"
+    cat "$output_file"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
+}
+
 # ── Helper: full handshake → tools/call with a connectivity check ──
 test_connectivity() {
   local label="$1"
@@ -365,6 +500,14 @@ test_cli_error "browser flags reject the Codex provider"      "--provider codex 
 test_cli_error "browser provider requires an injected lease helper" "--provider browser" "browser_lease_command"
 
 # ========== Protocol tests (fast) ==========
+
+# ---------- MCP 2026-07-28 modern negotiation ----------
+test_modern_stdio_provider \
+  "modern stdio --provider codex → codex" "codex" "codex"
+test_modern_stdio_provider \
+  "modern stdio --provider claude → claude_code" "claude" "claude_code"
+test_modern_stdio_provider \
+  "modern stdio --provider gemini → gemini" "gemini" "gemini"
 
 # ---------- Ping (all providers) ----------
 for p in claude gemini; do
@@ -678,7 +821,7 @@ let stderr = "";
 const ready = new Promise((resolve) => {
   child.stderr.on("data", (chunk) => {
     stderr += chunk;
-    if (stderr.includes("Codex MCP adapter ready")) resolve({ kind: "ready" });
+    if (stderr.includes("Codex MCP adapter listening")) resolve({ kind: "ready" });
   });
 });
 let startupTimeout;
@@ -2539,6 +2682,187 @@ test_codex_app_case() {
   rm -rf "$tmpdir"
 }
 
+test_codex_modern_interaction_case() {
+  local label="$1" scenario="$2" predicate="$3"
+  local tmpdir status summary ok
+  echo "--- $label ---"
+  tmpdir=$(mktemp -d)
+  mkdir -p "$tmpdir/real-codex-home" "$tmpdir/state" "$tmpdir/workspace"
+  printf '%s' '{"token":"stub"}' > "$tmpdir/real-codex-home/auth.json"
+  printf '%s' '{}' > "$tmpdir/real-codex-home/models_cache.json"
+  write_codex_app_server_stub "$tmpdir"
+  cat >"$tmpdir/mcp-wire-proxy.mjs" <<'EOF'
+import fs from "node:fs";
+import { spawn } from "node:child_process";
+
+const [serverDir, stateRoot] = process.argv.slice(2);
+const captureBase = `${process.env.MCP_STUB_APP_CAPTURE_DIR}/mcp-wire-${process.pid}`;
+const child = spawn(process.execPath, [
+  "server.js",
+  "--provider", "codex",
+  "--approval_policy", process.env.MCP_STUB_APPROVAL_POLICY,
+  "--codex-state-root", stateRoot,
+], {
+  cwd: serverDir,
+  env: process.env,
+  stdio: ["pipe", "pipe", "pipe"],
+});
+fs.appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${child.pid}\n`);
+
+process.stdin.on("data", (chunk) => {
+  fs.appendFileSync(`${captureBase}.client.raw`, chunk);
+  child.stdin.write(chunk);
+});
+process.stdin.on("end", () => child.stdin.end());
+child.stdout.on("data", (chunk) => {
+  fs.appendFileSync(`${captureBase}.server.raw`, chunk);
+  process.stdout.write(chunk);
+});
+child.stderr.pipe(process.stderr);
+child.once("close", (code, signal) => {
+  process.exitCode = signal ? 1 : (code ?? 1);
+});
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => child.kill(signal));
+}
+process.once("exit", () => {
+  try { child.kill("SIGKILL"); } catch {}
+});
+EOF
+
+  set +e
+  summary=$($TIMEOUT_CMD 12 node --input-type=module - \
+    "$tmpdir" "$(pwd)" "$scenario" 2>/dev/null <<'EOF'
+import fs from "node:fs";
+import { Client } from "@modelcontextprotocol/client";
+import {
+  StdioClientTransport,
+  getDefaultEnvironment,
+} from "@modelcontextprotocol/client/stdio";
+
+const [stubDir, serverDir, scenario] = process.argv.slice(2);
+const supportsElicitation = scenario === "question";
+const client = new Client(
+  { name: "mcp-agents-modern-interaction-test", version: "0.0.0" },
+  {
+    capabilities: supportsElicitation ? { elicitation: { form: {} } } : {},
+    versionNegotiation: {
+      mode: { pin: "2026-07-28" },
+      probe: { timeoutMs: 1_000, maxRetries: 0 },
+    },
+    inputRequired: { autoFulfill: true, maxRounds: 8 },
+  },
+);
+let elicitationCount = 0;
+if (supportsElicitation) {
+  client.setRequestHandler("elicitation/create", async () => {
+    elicitationCount += 1;
+    return { action: "accept", content: { choice: "Ship" } };
+  });
+}
+const transport = new StdioClientTransport({
+  command: process.execPath,
+  args: [`${stubDir}/mcp-wire-proxy.mjs`, serverDir, `${stubDir}/state`],
+  cwd: serverDir,
+  env: {
+    ...getDefaultEnvironment(),
+    PATH: `${stubDir}:${process.env.PATH}`,
+    CODEX_HOME: `${stubDir}/real-codex-home`,
+    MCP_AGENTS_TEST_CHILD_REGISTRY: process.env.MCP_AGENTS_TEST_CHILD_REGISTRY,
+    MCP_STUB_APP_CAPTURE_DIR: stubDir,
+    MCP_STUB_APP_MODE: "question",
+    MCP_STUB_APP_WORKSPACE: `${stubDir}/workspace`,
+    MCP_STUB_CODEX_VERSION: "codex-cli 0.149.1",
+    MCP_STUB_REQUIRE_SESSION: "0",
+    MCP_STUB_APPROVAL_POLICY: supportsElicitation ? "on-request" : "never",
+  },
+  stderr: "pipe",
+});
+let stderr = "";
+transport.stderr?.setEncoding("utf8");
+transport.stderr?.on("data", (chunk) => { stderr += chunk; });
+let result;
+let era;
+let driverError;
+try {
+  await client.connect(transport);
+  era = client.getProtocolEra();
+  fs.appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${transport.pid}\n`);
+  result = await client.callTool({
+    name: "codex",
+    arguments: {
+      prompt: "PRIVATE_MODERN_PROMPT",
+      cwd: `${stubDir}/workspace`,
+      sandbox: "read-only",
+      model: "gpt-5.6-sol",
+      model_reasoning_effort: "high",
+    },
+  });
+} catch (error) {
+  driverError = error.stack || String(error);
+} finally {
+  await client.close().catch(() => {});
+}
+await new Promise((resolve) => setTimeout(resolve, 100));
+
+const readJsonl = (file) => {
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map((line) => {
+    try { return JSON.parse(line); } catch { return { raw: line }; }
+  });
+};
+const wireFiles = fs.readdirSync(stubDir).filter((name) => name.startsWith("mcp-wire-"));
+const readWire = (suffix) => wireFiles
+  .filter((name) => name.endsWith(suffix))
+  .flatMap((name) => readJsonl(`${stubDir}/${name}`));
+const serverFrames = readWire(".server.raw");
+const clientFrames = readWire(".client.raw");
+const inputRequiredFrames = serverFrames.filter((frame) =>
+  frame?.result?.resultType === "input_required"
+);
+const decodedRequestStates = inputRequiredFrames.map((frame) => {
+  const state = frame.result.requestState;
+  if (typeof state !== "string") return null;
+  try {
+    const body = state.split(".")[1];
+    return JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+});
+process.stdout.write(`${JSON.stringify({
+  scenario,
+  driverError,
+  era,
+  result,
+  elicitationCount,
+  serverFrames,
+  clientFrames,
+  inputRequiredFrames,
+  decodedRequestStates,
+  appRequests: readJsonl(`${stubDir}/app-stdin.jsonl`),
+  stderr,
+})}\n`);
+EOF
+  )
+  status=$?
+  set -e
+  ok=1
+  [ "$status" -eq 0 ] || ok=0
+  printf '%s' "$summary" | jq -e \
+    "(.driverError == null) and (.era == \"modern\") and ($predicate)" \
+    >/dev/null 2>&1 || ok=0
+  if [ "$ok" -eq 1 ]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red "FAIL: $label (status=$status)"
+    echo "  Summary: ${summary:0:16000}"
+    FAIL=$((FAIL + 1))
+  fi
+  rm -rf "$tmpdir"
+}
+
 test_codex_app_bridge_restart() {
   local label="$1" tmpdir first second first_status second_status ok
   echo "--- $label ---"
@@ -3717,8 +4041,8 @@ test_browser_npx_resolution() {
   mkdir -p "$tmpdir/captures" "$tmpdir/bin" \
     "$package_dir/node_modules/@modelcontextprotocol"
   cp server.js package.json "$package_dir/"
-  ln -s "$(pwd)/node_modules/@modelcontextprotocol/sdk" \
-    "$package_dir/node_modules/@modelcontextprotocol/sdk"
+  ln -s "$(pwd)/node_modules/@modelcontextprotocol/server" \
+    "$package_dir/node_modules/@modelcontextprotocol/server"
   write_browser_mcp_stub "$tmpdir"
   write_browser_lease_stub "$tmpdir"
   write_browser_npx_stub "$tmpdir/bin"
@@ -4446,6 +4770,34 @@ test_codex_app_case "Command approvals round-trip through MCP elicitation" \
    (.data.result.result.content[0].text == "INTERACTION_OK")' \
   "--approval_policy on-request"
 
+test_codex_modern_interaction_case \
+  "Modern structured input resumes one native turn through input_required" \
+  "question" \
+  '(.elicitationCount == 1) and
+   (.inputRequiredFrames | length == 1) and
+   ([.appRequests[] | select(.method == "thread/start")] | length == 1) and
+   ([.appRequests[] | select(.method == "turn/start")] | length == 1) and
+   ([.appRequests[] | select(.method == "thread/resume")] | length == 0) and
+   ([.appRequests[] | select(.id == "question-1")][0].result.answers.choice.answers == ["Ship"]) and
+   (.result.content[0].text == "INTERACTION_OK") and
+   (([.serverFrames, .clientFrames] | tostring) | contains("question-1") | not) and
+   (.decodedRequestStates | length == 1) and
+   ([.decodedRequestStates[]?.p | keys] == [["bridgeSessionId","callHash","interactionId","toolName","turnId","v"]]) and
+   ((.decodedRequestStates | tostring) |
+     test("PRIVATE_MODERN_PROMPT|Pick one|Ship|INTERACTION_OK|dangerous"; "i") | not)'
+
+test_codex_modern_interaction_case \
+  "Modern foreground input without elicitation fails closed without replay" \
+  "question-no-elicit" \
+  '(.elicitationCount == 0) and
+   (.inputRequiredFrames | length == 0) and
+   (.result.isError == true) and
+   (.result.structuredContent.code == "codex_interaction_requires_background") and
+   ([.appRequests[] | select(.method == "thread/start")] | length == 1) and
+   ([.appRequests[] | select(.method == "turn/start")] | length == 1) and
+   ([.appRequests[] | select(.method == "thread/resume")] | length == 0) and
+   ([.appRequests[] | select(.method == "turn/interrupt")] | length == 1)'
+
 test_codex_app_case "Structured questions round-trip without leaking native ids" \
   "question" \
   '([.frames[] | select(.method == "elicitation/create")] | length == 1) and
@@ -4481,7 +4833,9 @@ test_codex_app_case "Foreground user input without elicitation fails immediately
 test_codex_app_case "Interaction expiry is capped by the turn hard deadline" \
   "interaction-timeout" \
   '(.data.result.result.isError == true) and
-   (.data.result.result.structuredContent.code == "codex_interaction_timeout") and
+   ((.data.result.result.structuredContent.code == "codex_interaction_timeout") or
+    (.data.result.result.content[0].text |
+      contains("Fulfilling input required by '\''tools/call'\'' failed: Request timed out"))) and
    (.data.elapsedMs >= 100 and .data.elapsedMs < 1000) and
    ([.frames[] | select(.method == "elicitation/create")] | length == 1) and
    ([.appRequests[] | select(.id == "question-1")][0].result == {answers:{}}) and

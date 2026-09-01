@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Negotiate both legacy MCP and revision `2026-07-28` over stdio for the
+  wrapper-owned `codex`, `claude`, and `gemini` providers. Foreground Codex
+  interactions now resume through signed, content-free `input_required`
+  rounds; the raw `browser` and `codex-legacy` transport boundaries are
+  unchanged.
+
 ### Fixed
 
 - Exit cleanly when an MCP client's stderr pipe closes instead of repeatedly

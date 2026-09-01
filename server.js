@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /* eslint-disable no-console */
 
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { get as httpGet } from "node:http";
 import { createRequire } from "node:module";
@@ -28,19 +28,16 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
-  CallToolRequestSchema,
-  ElicitResultSchema,
-  ErrorCode,
-  ListPromptsRequestSchema,
-  ListResourcesRequestSchema,
-  ListResourceTemplatesRequestSchema,
-  ListToolsRequestSchema,
-  McpError,
-  PingRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+  CLIENT_CAPABILITIES_META_KEY,
+  Server,
+  ProtocolError,
+  ProtocolErrorCode,
+  createRequestStateCodec,
+  inputRequired,
+  inputResponse,
+} from "@modelcontextprotocol/server";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const STARTUP_CWD = process.cwd();
@@ -2198,8 +2195,8 @@ function createClaudeJobRuntime({
       },
     );
   };
-  const sendProgress = async (extra, job) => {
-    const progressToken = extra?._meta?.progressToken;
+  const sendProgress = async (ctx, job) => {
+    const progressToken = ctx?.mcpReq._meta?.progressToken;
     if (
       typeof progressToken !== "string" &&
       !(typeof progressToken === "number" && Number.isFinite(progressToken))
@@ -2208,7 +2205,7 @@ function createClaudeJobRuntime({
     }
     try {
       progressSequence += 1;
-      await extra.sendNotification({
+      await ctx.mcpReq.notify({
         method: "notifications/progress",
         params: {
           progressToken,
@@ -2244,7 +2241,7 @@ function createClaudeJobRuntime({
     handles(toolName) {
       return CLAUDE_JOB_TOOL_NAMES.includes(toolName);
     },
-    async call(toolName, rawArgs, extra) {
+    async call(toolName, rawArgs, ctx) {
       const validated = validateArguments(toolName, rawArgs);
       if (validated.issues) return invalidArguments(validated.issues);
       const args = validated.args;
@@ -2316,9 +2313,9 @@ function createClaudeJobRuntime({
         ) {
           result = statusResult(job);
         } else {
-          result = await waitForStatus(job, args.cursor, waitMs, extra?.signal);
+          result = await waitForStatus(job, args.cursor, waitMs, ctx?.mcpReq.signal);
         }
-        await sendProgress(extra, job);
+        await sendProgress(ctx, job);
         return result;
       }
       if (toolName === "claude-result") {
@@ -5657,10 +5654,28 @@ async function runCodexAppServer({
   const agentsEnabledKeySupported = codexSupportsAgentsEnabledKey(codexVersion);
   const durableGoalsSupported = process.platform !== "win32";
   const bridgeId = randomUUID();
+  const interactionStateCodec = createRequestStateCodec({
+    key: randomBytes(32),
+    ttlSeconds: Math.ceil((interactionTimeoutMs + 30_000) / 1_000),
+  });
   const bridgeStartedAt = new Date().toISOString();
   const canonicalProjectCwd = realpathSync(STARTUP_CWD);
   const projectHash = createHash("sha256")
     .update(canonicalProjectCwd)
+    .digest("hex");
+  const canonicalJson = (value) => {
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+    }
+    if (value !== null && typeof value === "object") {
+      return `{${Object.keys(value).sort().map((key) =>
+        `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+      ).join(",")}}`;
+    }
+    return JSON.stringify(value);
+  };
+  const fingerprintToolCall = (toolName, args) => createHash("sha256")
+    .update(`${toolName}\n${canonicalJson(args)}`)
     .digest("hex");
 
   const envRetention = process.env[CODEX_SESSION_RETENTION_DAYS_ENV];
@@ -6563,7 +6578,7 @@ async function runCodexAppServer({
         else job.pendingStatusMessage = message;
       }
     }
-    if (message && turn.extra?._meta?.progressToken !== undefined) {
+    if (message && turn.mcpContext?.mcpReq._meta?.progressToken !== undefined) {
       turn.pendingProgress = `Codex: ${boundedText(message)}`;
       const flush = () => {
         turn.progressTimer = undefined;
@@ -6572,10 +6587,10 @@ async function runCodexAppServer({
         turn.pendingProgress = undefined;
         turn.lastProgressAt = Date.now();
         turn.progressSequence += 1;
-        void turn.extra.sendNotification({
+        void turn.mcpContext.mcpReq.notify({
           method: "notifications/progress",
           params: {
-            progressToken: turn.extra._meta.progressToken,
+            progressToken: turn.mcpContext.mcpReq._meta.progressToken,
             progress: turn.progressSequence,
             message: visible,
           },
@@ -6640,7 +6655,8 @@ async function runCodexAppServer({
     sandbox,
     requestId,
     jobId,
-    extra,
+    mcpContext,
+    canElicit,
     releaseLease,
     reviewThreadId,
     sourceThreadId,
@@ -6664,7 +6680,8 @@ async function runCodexAppServer({
       sandbox,
       requestId,
       jobId,
-      extra,
+      mcpContext,
+      canElicit,
       reviewThreadId,
       sourceThreadId,
       tool,
@@ -6808,6 +6825,7 @@ async function runCodexAppServer({
         : { decision: "cancel" };
     if (!settleInteraction(interaction, fallback)) return;
     if (turn) {
+      if (turn.betweenInputRounds) turn.abandoned = true;
       void interruptTurn(turn, "interaction timeout");
       turn.reject(appError(
         "codex_interaction_timeout",
@@ -6834,115 +6852,69 @@ async function runCodexAppServer({
         ])),
       };
     }
-    if (typeof args.decision !== "string") {
+    if (![
+      "accept",
+      "acceptForSession",
+      "decline",
+      "cancel",
+    ].includes(args.decision)) {
       throw appError(
         "interaction_type_mismatch",
-        "This interaction requires an approval decision",
+        "This interaction requires a supported approval decision",
       );
     }
     return { decision: args.decision };
   };
-  const tryElicitInteraction = async (outerServer, interaction) => {
-    const capability = outerServer.getClientCapabilities()?.elicitation;
-    if (!capability || capability.form === false) return;
-    let elicitationSignal;
-    try {
-      let request;
-      if (interaction.kind === "user_input") {
-        const properties = Object.fromEntries(interaction.questions.map((question) => [
-          question.id,
-          {
-            type: "string",
-            title: question.header,
-            description: question.question,
-            ...(question.options?.length
-              ? { enum: question.options.map((option) => option.label) }
-              : {}),
-          },
-        ]));
-        request = {
-          mode: "form",
-          message: "Codex needs input to continue.",
-          requestedSchema: {
-            type: "object",
-            properties,
-            required: interaction.questions.map((question) => question.id),
-          },
-        };
-      } else {
-        request = {
-          mode: "form",
-          message: interaction.display || "Codex requests approval to continue.",
-          requestedSchema: {
-            type: "object",
-            properties: {
-              decision: {
-                type: "string",
-                enum: ["accept", "acceptForSession", "decline", "cancel"],
-              },
-            },
-            required: ["decision"],
-          },
-        };
-      }
-      elicitationSignal = AbortSignal.timeout(
-        Math.max(1, interaction.expiresAtMs - Date.now()),
-      );
-      const requestOptions = { signal: elicitationSignal };
-      const result = capability.form
-        ? await outerServer.elicitInput(request, requestOptions)
-        : await outerServer.request(
-          { method: "elicitation/create", params: request },
-          ElicitResultSchema,
-          requestOptions,
-        );
-      if (!interactions.has(interaction.interactionId)) return;
-      if (result.action === "accept") {
-        if (interaction.kind === "user_input") {
-          const answers = Object.entries(result.content ?? {}).map(([questionId, answer]) => ({
-            questionId,
-            answers: [String(answer)],
-          }));
-          settleInteraction(
-            interaction,
-            resolveInteractionValue(interaction, { answers }),
-          );
-        } else {
-          settleInteraction(interaction, { decision: result.content?.decision ?? "decline" });
-        }
-      } else {
-        settleInteraction(
-          interaction,
-          interaction.kind === "user_input" ? { answers: {} } : {
-            decision: result.action === "cancel" ? "cancel" : "decline",
-          },
-        );
-      }
-    } catch {
-      if (!interaction.foreground || !interactions.has(interaction.interactionId)) return;
-      const turn = activeTurns.get(interaction.turnId);
-      if (
-        elicitationSignal?.aborted &&
-        elicitationSignal.reason?.name === "TimeoutError"
-      ) {
-        expireInteraction(interaction, turn);
-        return;
-      }
-      settleInteraction(
-        interaction,
-        interaction.kind === "user_input" ? { answers: {} } : { decision: "cancel" },
-      );
-      if (turn) {
-        void interruptTurn(turn, "foreground elicitation failed");
-        turn.reject(appError(
-          "codex_interaction_requires_background",
-          "The MCP client could not complete Codex elicitation; use a background start tool",
-        ));
-      }
-    }
-  };
-
   let outerServer;
+  const supportsFormElicitation = (ctx) => {
+    const envelopeCapabilities = ctx?.mcpReq.envelope?.[CLIENT_CAPABILITIES_META_KEY];
+    const capability = envelopeCapabilities === undefined
+      ? outerServer?.getClientCapabilities()?.elicitation
+      : envelopeCapabilities?.elicitation;
+    return Boolean(capability && capability.form !== false);
+  };
+  const interactionElicitationRequest = (interaction) => {
+    if (interaction.kind === "user_input") {
+      const properties = Object.fromEntries(interaction.questions.map((question) => [
+        question.id,
+        {
+          type: "string",
+          title: question.header,
+          description: question.question,
+          ...(question.options?.length
+            ? { enum: question.options.map((option) => option.label) }
+            : {}),
+        },
+      ]));
+      return {
+        mode: "form",
+        message: "Codex needs input to continue.",
+        requestedSchema: {
+          type: "object",
+          properties,
+          required: interaction.questions.map((question) => question.id),
+        },
+      };
+    }
+    return {
+      mode: "form",
+      message: interaction.display || "Codex requests approval to continue.",
+      requestedSchema: {
+        type: "object",
+        properties: {
+          decision: {
+            type: "string",
+            enum: ["accept", "acceptForSession", "decline", "cancel"],
+          },
+        },
+        required: ["decision"],
+      },
+    };
+  };
+  const revealForegroundInteraction = (turn, interaction) => {
+    turn.pendingInteractionId = interaction.interactionId;
+    turn.resolveForegroundInteraction?.(interaction);
+  };
   const appInteractionMethods = new Set([
     "item/tool/requestUserInput",
     "item/commandExecution/requestApproval",
@@ -7019,8 +6991,7 @@ async function runCodexAppServer({
         }
         return;
       }
-      const elicitation = outerServer.getClientCapabilities()?.elicitation;
-      const canElicit = Boolean(elicitation && elicitation.form !== false);
+      const canElicit = turn?.canElicit;
       if (turn && !jobId && !canElicit) {
         respondToApp(generationState, id, { answers: {} });
         void interruptTurn(turn, "foreground interaction requires background mode");
@@ -7069,7 +7040,7 @@ async function runCodexAppServer({
         turn.state = "waiting_for_input";
         scheduleProgress(turn, "waiting for user input");
       }
-      void tryElicitInteraction(outerServer, interaction);
+      if (interaction.foreground) revealForegroundInteraction(turn, interaction);
       return;
     }
     if (method === "item/permissions/requestApproval") {
@@ -7098,6 +7069,15 @@ async function runCodexAppServer({
             "Codex requested approval despite approval_policy=never",
           ));
         }
+        return;
+      }
+      if (turn && !jobId && !turn.canElicit) {
+        respondToApp(generationState, id, { decision: "cancel" });
+        void interruptTurn(turn, "foreground interaction requires background mode");
+        turn.reject(appError(
+          "codex_interaction_requires_background",
+          "Codex requested approval, but this blocking MCP call cannot elicit it; use a background start tool",
+        ));
         return;
       }
       const interactionId = randomUUID();
@@ -7132,7 +7112,7 @@ async function runCodexAppServer({
         turn.state = "waiting_for_input";
         scheduleProgress(turn, "waiting for approval");
       }
-      void tryElicitInteraction(outerServer, interaction);
+      if (interaction.foreground) revealForegroundInteraction(turn, interaction);
       return;
     }
     respondToApp(generationState, id, undefined, {
@@ -7641,9 +7621,54 @@ async function runCodexAppServer({
       signal?.removeEventListener("abort", onAbort);
     }
   };
-  const runTurn = async (args, extra, { reply = false, backgroundJob } = {}) => {
+  const awaitForegroundRound = async (turn, signal) => {
+    if (turn.terminal) {
+      return { kind: "complete", completed: await awaitTurn(turn, signal) };
+    }
+    const pending = turn.pendingInteractionId
+      ? interactions.get(turn.pendingInteractionId)
+      : undefined;
+    if (pending) return { kind: "interaction", interaction: pending };
+
+    let resolveInteraction;
+    const interactionReady = new Promise((resolvePromise) => {
+      resolveInteraction = resolvePromise;
+    });
+    turn.resolveForegroundInteraction = resolveInteraction;
+    try {
+      return await Promise.race([
+        awaitTurn(turn, signal).then((completed) => ({ kind: "complete", completed })),
+        interactionReady.then((interaction) => ({ kind: "interaction", interaction })),
+      ]);
+    } finally {
+      if (turn.resolveForegroundInteraction === resolveInteraction) {
+        turn.resolveForegroundInteraction = undefined;
+      }
+    }
+  };
+  const awaitForegroundResult = async (turn, ctx) => {
+    turn.mcpContext = ctx;
+    turn.canElicit = supportsFormElicitation(ctx);
+    turn.betweenInputRounds = false;
+    let preserveTurn = false;
+    try {
+      const outcome = await awaitForegroundRound(turn, ctx.mcpReq.signal);
+      if (outcome.kind === "interaction") {
+        preserveTurn = true;
+        turn.betweenInputRounds = true;
+        turn.mcpContext = undefined;
+      }
+      return outcome;
+    } finally {
+      if (!preserveTurn) {
+        if (turn.terminal || turn.safeToRelease) forgetTurn(turn);
+        else turn.abandoned = true;
+      }
+    }
+  };
+  const runTurn = async (args, ctx, { reply = false, backgroundJob } = {}) => {
     if (codexAuthInvalidated) throw appError(CODEX_AUTH_FAILURE_CODE, CODEX_AUTH_FAILURE_MESSAGE);
-    const signal = backgroundJob ? undefined : extra.signal;
+    const signal = backgroundJob ? undefined : ctx.mcpReq.signal;
     const deadlineAt = backgroundJob?.deadlineAt ?? Date.now() + resolvedHardMs;
     let threadId = args.threadId;
     let workspace = reply ? lookupThreadWorkspace(threadId) : {
@@ -7659,7 +7684,7 @@ async function runCodexAppServer({
       threadId,
       cwd: workspace?.cwd,
       sandbox: workspace?.sandbox,
-      requestId: backgroundJob ? undefined : idKey(extra.requestId),
+      requestId: backgroundJob ? undefined : idKey(ctx.mcpReq.id),
       jobId: backgroundJob?.jobId,
       tool: reply ? "codex-reply" : "codex",
       cwdInferred: Boolean(reply && workspace?.cwd),
@@ -7753,9 +7778,10 @@ async function runCodexAppServer({
         turnId,
         cwd: workspace?.cwd,
         sandbox: workspace?.sandbox,
-        requestId: backgroundJob ? undefined : idKey(extra.requestId),
+        requestId: backgroundJob ? undefined : idKey(ctx.mcpReq.id),
         jobId: backgroundJob?.jobId,
-        extra: backgroundJob ? undefined : extra,
+        mcpContext: backgroundJob ? undefined : ctx,
+        canElicit: backgroundJob ? false : supportsFormElicitation(ctx),
         releaseLease,
         tool: reply ? "codex-reply" : "codex",
         cwdInferred: Boolean(reply && workspace?.cwd),
@@ -7778,8 +7804,16 @@ async function runCodexAppServer({
       }
       throw err;
     }
+    if (!backgroundJob) {
+      const outcome = await awaitForegroundResult(turn, ctx);
+      if (outcome.kind === "interaction") return outcome;
+      return {
+        kind: "complete",
+        result: { threadId, content: outcome.completed.content },
+      };
+    }
     try {
-      const completed = await awaitTurn(turn, backgroundJob ? undefined : extra.signal);
+      const completed = await awaitTurn(turn);
       return { threadId, content: completed.content };
     } finally {
       if (turn.terminal || turn.safeToRelease) forgetTurn(turn);
@@ -7787,9 +7821,9 @@ async function runCodexAppServer({
     }
   };
 
-  const runReview = async (args, extra, backgroundJob) => {
+  const runReview = async (args, ctx, backgroundJob) => {
     if (codexAuthInvalidated) throw appError(CODEX_AUTH_FAILURE_CODE, CODEX_AUTH_FAILURE_MESSAGE);
-    const signal = backgroundJob ? undefined : extra.signal;
+    const signal = backgroundJob ? undefined : ctx.mcpReq.signal;
     const deadlineAt = backgroundJob?.deadlineAt ?? Date.now() + resolvedHardMs;
     let workspace = lookupThreadWorkspace(args.threadId);
     assertWorkspaceOutsideState(workspace?.cwd);
@@ -7799,7 +7833,7 @@ async function runCodexAppServer({
       threadId: args.threadId,
       cwd: workspace?.cwd,
       sandbox: workspace?.sandbox,
-      requestId: backgroundJob ? undefined : idKey(extra.requestId),
+      requestId: backgroundJob ? undefined : idKey(ctx.mcpReq.id),
       jobId: backgroundJob?.jobId,
       tool: "codex-review",
       cwdInferred: Boolean(workspace?.cwd),
@@ -7872,9 +7906,10 @@ async function runCodexAppServer({
         turnId,
         cwd: workspace?.cwd,
         sandbox: workspace?.sandbox,
-        requestId: backgroundJob ? undefined : idKey(extra.requestId),
+        requestId: backgroundJob ? undefined : idKey(ctx.mcpReq.id),
         jobId: backgroundJob?.jobId,
-        extra: backgroundJob ? undefined : extra,
+        mcpContext: backgroundJob ? undefined : ctx,
+        canElicit: backgroundJob ? false : supportsFormElicitation(ctx),
         releaseLease: releaseTurnLease,
         reviewThreadId,
         sourceThreadId: args.threadId,
@@ -7900,13 +7935,140 @@ async function runCodexAppServer({
       }
       throw err;
     }
+    if (!backgroundJob) {
+      const outcome = await awaitForegroundResult(turn, ctx);
+      if (outcome.kind === "interaction") return outcome;
+      return {
+        kind: "complete",
+        result: {
+          threadId: args.threadId,
+          reviewThreadId,
+          content: outcome.completed.content,
+        },
+      };
+    }
     try {
-      const completed = await awaitTurn(turn, backgroundJob ? undefined : extra.signal);
+      const completed = await awaitTurn(turn);
       return { threadId: args.threadId, reviewThreadId, content: completed.content };
     } finally {
       if (turn.terminal || turn.safeToRelease) forgetTurn(turn);
       else turn.abandoned = true;
     }
+  };
+
+  const invalidForegroundState = () => new ProtocolError(
+    ProtocolErrorCode.InvalidParams,
+    "Invalid or expired Codex foreground interaction state",
+    { reason: "invalid_foreground_interaction_state" },
+  );
+  const foregroundResult = (turn, completed) => turn.tool === "codex-review"
+    ? {
+      threadId: turn.sourceThreadId,
+      reviewThreadId: turn.reviewThreadId,
+      content: completed.content,
+    }
+    : { threadId: turn.threadId, content: completed.content };
+  const foregroundInputRequired = async (params, interaction) => inputRequired({
+    inputRequests: {
+      interaction: inputRequired.elicit(
+        interactionElicitationRequest(interaction),
+      ),
+    },
+    requestState: await interactionStateCodec.mint({
+      v: 1,
+      bridgeSessionId: bridgeId,
+      interactionId: interaction.interactionId,
+      turnId: interaction.turnId,
+      toolName: params.name,
+      callHash: fingerprintToolCall(params.name, params.arguments ?? {}),
+    }),
+  });
+  const foregroundToolResponse = async (params, outcome, turn) => {
+    if (outcome.kind === "interaction") {
+      return await foregroundInputRequired(params, outcome.interaction);
+    }
+    const result = turn
+      ? foregroundResult(turn, outcome.completed)
+      : outcome.result;
+    return toolResult(result.content, { ...result });
+  };
+  const resumeForegroundInteraction = async (params, ctx) => {
+    const state = ctx.mcpReq.requestState();
+    if (state === undefined) {
+      if (ctx.mcpReq.inputResponses !== undefined) throw invalidForegroundState();
+      return;
+    }
+    if (
+      state === null || typeof state !== "object" || state.v !== 1 ||
+      state.bridgeSessionId !== bridgeId || state.toolName !== params.name ||
+      state.callHash !== fingerprintToolCall(params.name, params.arguments ?? {}) ||
+      typeof state.interactionId !== "string" || typeof state.turnId !== "string"
+    ) throw invalidForegroundState();
+
+    const turn = activeTurns.get(state.turnId);
+    const interaction = interactions.get(state.interactionId);
+    if (
+      !turn || turn.terminal || turn.abandoned || turn.jobId ||
+      turn.tool !== params.name || turn.turnId !== state.turnId ||
+      turn.pendingInteractionId !== state.interactionId ||
+      !interaction || interaction.resolved || !interaction.foreground ||
+      interaction.turnId !== turn.turnId
+    ) throw invalidForegroundState();
+
+    const response = inputResponse(ctx.mcpReq.inputResponses, "interaction");
+    if (
+      response.kind !== "elicit" ||
+      Object.keys(ctx.mcpReq.inputResponses ?? {}).length !== 1 ||
+      ctx.mcpReq.droppedInputResponseKeys?.includes("interaction")
+    ) throw invalidForegroundState();
+
+    let nativeValue;
+    if (response.action === "accept") {
+      if (response.content === undefined) throw invalidForegroundState();
+      if (interaction.kind === "user_input") {
+        const expected = new Set(interaction.questions.map((question) => question.id));
+        const entries = Object.entries(response.content);
+        if (
+          entries.length !== expected.size ||
+          entries.some(([questionId, answer]) =>
+            !expected.has(questionId) || typeof answer !== "string"
+          )
+        ) throw invalidForegroundState();
+        nativeValue = resolveInteractionValue(interaction, {
+          answers: entries.map(([questionId, answer]) => ({
+            questionId,
+            answers: [answer],
+          })),
+        });
+      } else {
+        if (
+          Object.keys(response.content).length !== 1 ||
+          ![
+            "accept",
+            "acceptForSession",
+            "decline",
+            "cancel",
+          ].includes(response.content.decision)
+        ) throw invalidForegroundState();
+        nativeValue = resolveInteractionValue(interaction, {
+          decision: response.content.decision,
+        });
+      }
+    } else {
+      nativeValue = interaction.kind === "user_input"
+        ? { answers: {} }
+        : { decision: response.action === "cancel" ? "cancel" : "decline" };
+    }
+
+    turn.pendingInteractionId = undefined;
+    turn.betweenInputRounds = false;
+    turn.requestId = idKey(ctx.mcpReq.id);
+    turn.mcpContext = ctx;
+    turn.canElicit = supportsFormElicitation(ctx);
+    if (!settleInteraction(interaction, nativeValue)) throw invalidForegroundState();
+
+    const outcome = await awaitForegroundResult(turn, ctx);
+    return { turn, outcome };
   };
 
   const createJob = (kind) => {
@@ -8079,34 +8241,45 @@ async function runCodexAppServer({
     return clean;
   };
 
-  outerServer = new Server(
-    { name: "mcp-agents", version: VERSION },
-    { capabilities: { tools: {}, resources: {}, prompts: {} } },
-  );
-  outerServer.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [
+  const buildCodexMcpServer = (era) => {
+    outerServer = new Server(
+      { name: "mcp-agents", version: VERSION },
       {
-        name: "ping",
-        description: "Connectivity test. Returns pong without starting Codex.",
-        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        capabilities: { tools: {}, resources: {}, prompts: {} },
+        inputRequired: {
+          maxRounds: 8,
+          roundTimeoutMs: Math.max(1, Math.min(
+            interactionTimeoutMs,
+            resolvedHardMs,
+          )),
+        },
+        requestState: { verify: interactionStateCodec.verify },
       },
-      ...[
-        ...Object.keys(CODEX_TOOL_CONTRACTS),
-        ...CODEX_JOB_TOOL_NAMES,
-        ...CODEX_LOCAL_TOOL_NAMES,
-        ...CODEX_APP_TOOL_NAMES,
-      ].map((name) => ({ name, ...codexToolPresentation(name) })),
-    ],
-  }));
-  outerServer.setRequestHandler(ListResourcesRequestSchema, async () => ({ resources: [] }));
-  outerServer.setRequestHandler(
-    ListResourceTemplatesRequestSchema,
-    async () => ({ resourceTemplates: [] }),
-  );
-  outerServer.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: [] }));
-  outerServer.setRequestHandler(PingRequestSchema, async () => toolResult("pong"));
+    );
+    outerServer.setRequestHandler("tools/list", async () => ({
+      tools: [
+        {
+          name: "ping",
+          description: "Connectivity test. Returns pong without starting Codex.",
+          inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        },
+        ...[
+          ...Object.keys(CODEX_TOOL_CONTRACTS),
+          ...CODEX_JOB_TOOL_NAMES,
+          ...CODEX_LOCAL_TOOL_NAMES,
+          ...CODEX_APP_TOOL_NAMES,
+        ].map((name) => ({ name, ...codexToolPresentation(name) })),
+      ],
+    }));
+    outerServer.setRequestHandler("resources/list", async () => ({ resources: [] }));
+    outerServer.setRequestHandler(
+      "resources/templates/list",
+      async () => ({ resourceTemplates: [] }),
+    );
+    outerServer.setRequestHandler("prompts/list", async () => ({ prompts: [] }));
+    outerServer.setRequestHandler("ping", async () => toolResult("pong"));
 
-  outerServer.setRequestHandler(CallToolRequestSchema, async ({ params }, extra) => {
+    outerServer.setRequestHandler("tools/call", async ({ params }, ctx) => {
     if (params.name === "ping") return toolResult("pong");
     const message = {
       method: "tools/call",
@@ -8114,19 +8287,18 @@ async function runCodexAppServer({
     };
     const validation = validateCodexToolCallMessage(message);
     if (validation) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
+      throw new ProtocolError(
+        ProtocolErrorCode.InvalidParams,
         `mcp-agents: invalid arguments for ${validation.toolName}`,
         validation,
       );
     }
     const args = params.arguments ?? {};
-    const elicitationCapability = outerServer.getClientCapabilities()?.elicitation;
-    const canElicit = Boolean(
-      elicitationCapability && elicitationCapability.form !== false,
-    );
+    const hasContinuation = ctx.mcpReq.requestState() !== undefined ||
+      ctx.mcpReq.inputResponses !== undefined;
+    const canElicit = supportsFormElicitation(ctx);
     if (
-      resolvedApproval !== "never" && !canElicit &&
+      !hasContinuation && resolvedApproval !== "never" && !canElicit &&
       ["codex", "codex-reply", "codex-review"].includes(params.name)
     ) {
       return errorResult(
@@ -8135,20 +8307,24 @@ async function runCodexAppServer({
       );
     }
     try {
+      if (hasContinuation) {
+        const resumed = await resumeForegroundInteraction(params, ctx);
+        return await foregroundToolResponse(params, resumed.outcome, resumed.turn);
+      }
       if (params.name === "codex") {
-        const result = await runTurn(args, extra);
-        return toolResult(result.content, { ...result });
+        return await foregroundToolResponse(params, await runTurn(args, ctx));
       }
       if (params.name === "codex-reply") {
-        const result = await runTurn(args, extra, { reply: true });
-        return toolResult(result.content, { ...result });
+        return await foregroundToolResponse(
+          params,
+          await runTurn(args, ctx, { reply: true }),
+        );
       }
       if (params.name === "codex-start") return await startBackground("initial", args);
       if (params.name === "codex-reply-start") return await startBackground("reply", args);
       if (params.name === "codex-review-start") return await startBackground("review", args);
       if (params.name === "codex-review") {
-        const result = await runReview(args, extra);
-        return toolResult(result.content, result);
+        return await foregroundToolResponse(params, await runReview(args, ctx));
       }
       if (params.name === "codex-peek") {
         const now = Date.now();
@@ -8250,13 +8426,13 @@ async function runCodexAppServer({
                 settled = true;
                 clearTimeout(timer);
                 job.waiters.delete(wake);
-                extra.signal?.removeEventListener("abort", wake);
+                ctx.mcpReq.signal.removeEventListener("abort", wake);
                 resolveWait();
               };
               timer = setTimeout(wake, waitMs);
               job.waiters.add(wake);
-              extra.signal?.addEventListener("abort", wake, { once: true });
-              if (extra.signal?.aborted) wake();
+              ctx.mcpReq.signal.addEventListener("abort", wake, { once: true });
+              if (ctx.mcpReq.signal.aborted) wake();
             });
           }
           if (isTerminalJob(job) && job.state !== "completed") job.terminalRead = true;
@@ -8358,7 +8534,7 @@ async function runCodexAppServer({
           input: [{ type: "text", text: args.prompt }],
         }, appMutationTimeoutMs, {
           mutating: true,
-          signal: extra.signal,
+          signal: ctx.mcpReq.signal,
           deadlineAt: turn.hardDeadlineAt,
           onOutcomeUnknown: () => {
             turn.state = "outcome_unknown";
@@ -8522,6 +8698,7 @@ async function runCodexAppServer({
       }
       return errorResult("unknown_tool", `Unknown tool: ${params.name}`);
     } catch (err) {
+      if (err instanceof ProtocolError) throw err;
       if (err?.codexCode === CODEX_AUTH_FAILURE_CODE || codexAuthInvalidated) {
         return authFailureResult(args.threadId);
       }
@@ -8531,8 +8708,17 @@ async function runCodexAppServer({
         args.threadId ? { threadId: args.threadId } : {},
       );
     }
-  });
+    });
+    logErr(
+      `[mcp-agents] Codex MCP adapter ready (era=${era}, app-server lazy, ` +
+        `model=${resolvedModel}, effort=${resolvedEffort}, sandbox=${resolvedSandbox}, ` +
+        `approval=${resolvedApproval}, retention_days=${resolvedRetentionDays}, ` +
+        `state=${durableRoot})`,
+    );
+    return outerServer;
+  };
 
+  let stdioHandle;
   const shutdown = async (reason, exitCode = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -8555,14 +8741,20 @@ async function runCodexAppServer({
     }
     writeBridgeState();
     bridgeStateEnabled = false;
-    try { await outerServer.close(); } catch {}
+    try { await stdioHandle?.close(); } catch {}
     try { rmSync(bridgeDir, { recursive: true, force: true }); } catch {}
     if (keepAlive) clearInterval(keepAlive);
     process.exitCode = exitCode;
   };
   fatalShutdown = (reason, exitCode) => { void shutdown(reason, exitCode); };
-  const transport = new StdioServerTransport();
-  await outerServer.connect(transport);
+  stdioHandle = serveStdio(
+    ({ era }) => buildCodexMcpServer(era),
+    {
+      onerror(error) {
+        logErr(`[mcp-agents] Codex MCP stdio error: ${error.message}`);
+      },
+    },
+  );
   keepAlive = setInterval(() => {}, 60_000);
   process.stdin.once("end", () => { void shutdown("stdin-end"); });
   process.stdin.once("close", () => { void shutdown("stdin-close"); });
@@ -8574,11 +8766,7 @@ async function runCodexAppServer({
       void shutdown(signal, 128 + SIGNAL_CODES[signal]);
     });
   }
-  logErr(
-    `[mcp-agents] Codex MCP adapter ready (app-server lazy, model=${resolvedModel}, ` +
-      `effort=${resolvedEffort}, sandbox=${resolvedSandbox}, approval=${resolvedApproval}, ` +
-      `retention_days=${resolvedRetentionDays}, state=${durableRoot})`,
-  );
+  logErr("[mcp-agents] Codex MCP adapter listening (awaiting protocol era)");
 }
 
 // ---------------------------------------------------------------------------
@@ -8689,10 +8877,7 @@ async function main() {
     return;
   }
 
-  const server = new Server(
-    { name: "mcp-agents", version: VERSION },
-    { capabilities: { tools: {} } },
-  );
+  let stdioHandle;
   let keepAlive;
   let shutdownStarted = false;
   let shutdownExitCode = 0;
@@ -8715,7 +8900,7 @@ async function main() {
     shutdownPromise = Promise.resolve()
       .then(async () => {
         if (keepAlive) clearInterval(keepAlive);
-        await server.close();
+        await stdioHandle?.close();
       })
       .catch((err) => {
         const msg = err instanceof Error ? err.message : String(err);
@@ -8777,7 +8962,12 @@ async function main() {
     ...backend.extraProperties,
   };
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  const buildBlockingProviderServer = (era) => {
+    const server = new Server(
+      { name: "mcp-agents", version: VERSION },
+      { capabilities: { tools: {} } },
+    );
+    server.setRequestHandler("tools/list", async () => ({
     tools: [
       {
         name: "ping",
@@ -8803,7 +8993,7 @@ async function main() {
     ],
   }));
 
-  server.setRequestHandler(CallToolRequestSchema, async ({ params }, extra) => {
+  server.setRequestHandler("tools/call", async ({ params }, ctx) => {
     if (params.name === "ping") {
       return { content: [{ type: "text", text: "pong" }] };
     }
@@ -8818,7 +9008,7 @@ async function main() {
     if (claudeJobs?.handles(params.name)) {
       activeRequests += 1;
       try {
-        return await claudeJobs.call(params.name, params.arguments, extra);
+        return await claudeJobs.call(params.name, params.arguments, ctx);
       } finally {
         activeRequests -= 1;
         maybeFinalizeShutdown();
@@ -9025,21 +9215,24 @@ async function main() {
       activeRequests -= 1;
       maybeFinalizeShutdown();
     }
-  });
+    });
+    logErr(`[mcp-agents] ready (provider: ${providerName}, era=${era})`);
+    return server;
+  };
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  stdioHandle = serveStdio(
+    ({ era }) => buildBlockingProviderServer(era),
+    {
+      onerror(error) {
+        logErr(`[mcp-agents] MCP stdio error: ${error.message}`);
+      },
+    },
+  );
 
   // Prevent premature exit when stdin EOF arrives before async
   // request handlers (tools/call -> execFile) register active handles.
-  // The SDK transport doesn't listen for stdin 'end', so the event
-  // loop loses its only handle when the pipe closes.
+  // Keep the process alive until shutdown drains active work.
   keepAlive = setInterval(() => {}, 60_000);
-  const origOnClose = transport.onclose;
-  transport.onclose = () => {
-    clearInterval(keepAlive);
-    origOnClose?.();
-  };
 
   process.stdin.once("end", () => {
     beginShutdown("stdin-end");
@@ -9055,8 +9248,6 @@ async function main() {
       beginShutdown(sig, 128 + SIGNAL_CODES[sig]);
     });
   }
-
-  logErr(`[mcp-agents] ready (provider: ${providerName})`);
 }
 
 process.on("unhandledRejection", (reason) => {
