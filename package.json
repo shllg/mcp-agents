@@ -34,9 +34,10 @@
   },
   "author": "Thomas Witt",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0"
+    "@modelcontextprotocol/server": "^2.0.0"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "^2.0.0",
     "chrome-devtools-mcp": "latest"
   },
   "overrides": {
