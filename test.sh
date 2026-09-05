@@ -641,6 +641,128 @@ EOF
   rm -rf "$tmpdir"
 }
 
+# ── Helper: verify shutdown survives a client closing stderr first ──
+test_closed_stderr_shutdown() {
+  local label="$1"
+  local tmpdir output_file status
+
+  echo "--- $label ---"
+
+  tmpdir=$(mktemp -d)
+  output_file=$(mktemp)
+  set +e
+  MCP_AGENTS_TEST_STATE_ROOT="$tmpdir/state" \
+    node --input-type=module >"$output_file" 2>&1 <<'EOF'
+import { spawn } from "node:child_process";
+import { appendFileSync } from "node:fs";
+
+const child = spawn(process.execPath, [
+  "server.js",
+  "--provider",
+  "codex",
+  "--codex-state-root",
+  process.env.MCP_AGENTS_TEST_STATE_ROOT,
+], {
+  cwd: process.cwd(),
+  detached: true,
+  stdio: ["pipe", "pipe", "pipe"],
+});
+
+appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${child.pid}\n`);
+child.stdout.resume();
+const closed = new Promise((resolve) => {
+  child.once("exit", (code, signal) => resolve({ kind: "exit", code, signal }));
+});
+child.stderr.setEncoding("utf8");
+let stderr = "";
+const ready = new Promise((resolve) => {
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+    if (stderr.includes("Codex MCP adapter ready")) resolve({ kind: "ready" });
+  });
+});
+let startupTimeout;
+const startup = await Promise.race([
+  ready,
+  closed,
+  new Promise((resolve) => {
+    startupTimeout = setTimeout(() => resolve({ kind: "startup-timeout" }), 5_000);
+  }),
+]);
+clearTimeout(startupTimeout);
+if (startup.kind !== "ready") {
+  try { process.kill(-child.pid, "SIGKILL"); } catch {}
+  await Promise.race([
+    closed,
+    new Promise((resolve) => setTimeout(resolve, 1_000)),
+  ]);
+  console.error(`bridge did not become ready: ${JSON.stringify(startup)}\n${stderr}`);
+  process.exit(123);
+}
+
+child.stderr.destroy();
+child.stdin.end();
+
+let timeout;
+const result = await Promise.race([
+  closed,
+  new Promise((resolve) => {
+    timeout = setTimeout(() => resolve({ kind: "timeout" }), 3_000);
+  }),
+]);
+clearTimeout(timeout);
+
+if (result.kind === "timeout") {
+  try { process.kill(-child.pid, "SIGKILL"); } catch {}
+  await Promise.race([
+    closed,
+    new Promise((resolve) => setTimeout(resolve, 1_000)),
+  ]);
+  console.error("bridge timed out after stderr closed");
+  process.exit(124);
+}
+if (result.signal !== null) {
+  console.error(`bridge exited from signal ${result.signal}`);
+  process.exit(125);
+}
+if (result.code !== 0) {
+  console.error(`bridge exited with status ${result.code}`);
+  process.exit(126);
+}
+EOF
+  status=$?
+  set -e
+
+  case "$status" in
+    0)
+      green "PASS: $label"
+      PASS=$((PASS + 1))
+      ;;
+    123)
+      red "FAIL: $label (bridge did not become ready)"
+      cat "$output_file"
+      FAIL=$((FAIL + 1))
+      ;;
+    124)
+      red "FAIL: $label (bridge survived closed stderr past 3 seconds)"
+      cat "$output_file"
+      FAIL=$((FAIL + 1))
+      ;;
+    125)
+      red "FAIL: $label (bridge exited from a signal)"
+      cat "$output_file"
+      FAIL=$((FAIL + 1))
+      ;;
+    *)
+      red "FAIL: $label (exit $status)"
+      cat "$output_file"
+      FAIL=$((FAIL + 1))
+      ;;
+  esac
+  rm -rf "$tmpdir"
+  rm -f "$output_file"
+}
+
 # ── Helper: fake Claude CLI for background-job contract tests. It captures ──
 # argv/cwd/stdin per process and emits deterministic stream-json, including
 # fragmented, malformed, and unknown frames that the bridge must safely ignore.
@@ -3668,6 +3790,7 @@ test_no_registered_child_leaks() {
 }
 
 test_provider_shutdown_kills_child "stdin shutdown kills detached claude child"
+test_closed_stderr_shutdown "closed stderr exits without an EPIPE shutdown spin"
 
 # Stub-based Claude one-shot review tests (fast — no real Claude needed).
 test_claude_job \
