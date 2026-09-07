@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Update the default Codex model from `gpt-5.6-sol` to `gpt-6-astra` on both
+  the `codex` and `codex-legacy` providers; new sessions may still select the
+  faster `gpt-5.6-terra`. Operators who pinned `--model gpt-5.6-sol` in their
+  MCP client config should switch it to `gpt-6-astra`; the per-session enum
+  no longer offers `gpt-5.6-sol`.
+- Pin the `claude` backend to `claude-fable-5-1` at effort `xhigh` and pass
+  `--fallback-model claude-opus-5` so blocking calls and background reviews
+  fall back to Opus 5 when Fable 5.1 is overloaded or unavailable.
+
 ## [0.29.2] - 2026-09-05
 
 ### Fixed

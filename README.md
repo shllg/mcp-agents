@@ -158,7 +158,7 @@ stdout remains MCP-only.
 | Provider | Best for | Under the hood | State model |
 | --- | --- | --- | --- |
 | `codex` | Implementation, reviews, steering, goals, and resumable sessions | Wrapper-owned MCP adapter over `codex app-server --stdio` | Durable threads and native goals |
-| `claude` | One-shot help and independent read-only reviews | Claude Code CLI, pinned to Opus at `xhigh` effort | Blocking calls and connection-local review jobs |
+| `claude` | One-shot help and independent read-only reviews | Claude Code CLI, pinned to Fable 5.1 at `xhigh` effort with Opus 5 fallback | Blocking calls and connection-local review jobs |
 
 ### Also supported
 
@@ -232,7 +232,7 @@ configuration. To override Codex defaults at server startup:
         "--provider",
         "codex",
         "--model",
-        "gpt-5.6-sol",
+        "gpt-6-astra",
         "--model_reasoning_effort",
         "xhigh",
         "--codex-workspace-network=false"
@@ -243,7 +243,7 @@ configuration. To override Codex defaults at server startup:
 }
 ```
 
-Every initial `codex` call may select `gpt-5.6-sol` or `gpt-5.6-terra` and
+Every initial `codex` call may select `gpt-6-astra` or `gpt-5.6-terra` and
 `medium`, `high`, `xhigh`, or `max`. Omitted selectors use the server defaults;
 replies inherit the thread's model, effort, sandbox, and subagent policy. Other
 models, raw `config`, and per-call approval-policy arguments are rejected before
@@ -356,7 +356,7 @@ already have changed the workspace.
 | `prompt` | string | yes | Initial user prompt |
 | `cwd` | absolute path | yes | Working directory |
 | `sandbox` | string | yes | `read-only`, `workspace-write`, or `danger-full-access` |
-| `model` | string | no | `gpt-5.6-sol` or `gpt-5.6-terra` |
+| `model` | string | no | `gpt-6-astra` or `gpt-5.6-terra` |
 | `model_reasoning_effort` | string | no | `medium`, `high`, `xhigh`, or `max` |
 | `allow_subagents` | boolean | no | Enable native in-process Codex subagents for this thread; default `false` |
 | `goal` | string | no | Set the native durable objective; `""` suppresses the server default |
@@ -418,7 +418,7 @@ and are removed after the child exits.
 | --- | --- | --- |
 | `--codex-state-root <path>` | XDG state path above | `MCP_AGENTS_CODEX_STATE_ROOT` |
 | `--codex-session-retention-days <days>` | `30`; `0` disables expiry | `MCP_AGENTS_CODEX_SESSION_RETENTION_DAYS` |
-| `--model <model>` | `gpt-5.6-sol` | — |
+| `--model <model>` | `gpt-6-astra` | — |
 | `--model_reasoning_effort <effort>` | `xhigh` | — |
 | `--codex-workspace-network=true\|false` | `true` | `MCP_AGENTS_CODEX_WORKSPACE_NETWORK_ACCESS` |
 | `--codex_idle_timeout <seconds>` | `600`; `0` disables | — |
@@ -607,8 +607,9 @@ one hour, pages results at 32,768 Unicode code points, and rejects a final
 result over 10 MiB. Background reviews have a bridge-owned two-hour deadline;
 operators can replace it with `--timeout <seconds>` at server startup.
 
-Claude is pinned to `claude-opus-4-8` at effort `xhigh` and runs as a leaf
-reviewer. It keeps project instructions and repository context but disables
+Claude is pinned to `claude-fable-5-1` at effort `xhigh`, falls back to
+`claude-opus-5` when that model is overloaded or unavailable, and runs as a
+leaf reviewer. It keeps project instructions and repository context but disables
 hooks, subagents, skills, slash commands, external MCP servers, and mutation
 tools. Only `Read`, `Glob`, `Grep`, and plan-mode read-only `Bash` inspection
 are available. The leaf instruction also forbids test execution, installs,

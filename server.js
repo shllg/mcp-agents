@@ -53,7 +53,7 @@ const DEFAULT_TIMEOUT_MS = 300_000;
 const DEFAULT_CLAUDE_TIMEOUT_MS = 900_000;
 const DEFAULT_CLAUDE_JOB_TIMEOUT_MS = 7_200_000;
 const DEFAULT_CODEX_TIMEOUT_MS = 7_200_000;
-const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
+const DEFAULT_CODEX_MODEL = "gpt-6-astra";
 const DEFAULT_CODEX_MODEL_REASONING_EFFORT = "xhigh";
 const DEFAULT_CODEX_SANDBOX_MODE = "workspace-write";
 const DEFAULT_CODEX_APPROVAL_POLICY = "never";
@@ -168,7 +168,8 @@ const CODEX_AUTH_FAILURE_MESSAGE =
 // died without cleanup and are swept at startup. Comfortably longer than the
 // hard timeout so a live long-running session is never touched.
 const STALE_CODEX_HOME_MAX_AGE_MS = 12 * 60 * 60 * 1_000;
-const DEFAULT_CLAUDE_MODEL = "claude-opus-4-8";
+const DEFAULT_CLAUDE_MODEL = "claude-fable-5-1";
+const DEFAULT_CLAUDE_FALLBACK_MODEL = "claude-opus-5";
 const DEFAULT_CLAUDE_EFFORT = "xhigh";
 const CODEX_PER_SESSION_MODEL_ARG = "model";
 const CODEX_PER_SESSION_MODELS = [DEFAULT_CODEX_MODEL, "gpt-5.6-terra"];
@@ -345,11 +346,13 @@ const CLI_BACKENDS = {
     command: "claude",
     toolName: "claude_code",
     description:
-      `Run Claude Code CLI with a prompt (via stdin), pinned to ${DEFAULT_CLAUDE_MODEL} at effort ${DEFAULT_CLAUDE_EFFORT}. Supports prompt + optional timeout_ms only; other arguments (model/effort/config) are ignored.`,
+      `Run Claude Code CLI with a prompt (via stdin), pinned to ${DEFAULT_CLAUDE_MODEL} at effort ${DEFAULT_CLAUDE_EFFORT} with automatic fallback to ${DEFAULT_CLAUDE_FALLBACK_MODEL}. Supports prompt + optional timeout_ms only; other arguments (model/effort/config) are ignored.`,
     stdinPrompt: true,
     buildArgs: () => [
       "--model",
       DEFAULT_CLAUDE_MODEL,
+      "--fallback-model",
+      DEFAULT_CLAUDE_FALLBACK_MODEL,
       "--effort",
       DEFAULT_CLAUDE_EFFORT,
       "--no-session-persistence",
@@ -1480,6 +1483,8 @@ function buildClaudeReviewArgs() {
   return [
     "--model",
     DEFAULT_CLAUDE_MODEL,
+    "--fallback-model",
+    DEFAULT_CLAUDE_FALLBACK_MODEL,
     "--effort",
     DEFAULT_CLAUDE_EFFORT,
     "--no-session-persistence",

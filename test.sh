@@ -288,7 +288,7 @@ test_codex_workspace_network_env_error() {
 # ========== CLI flag tests ==========
 
 test_cli_flag "--help prints usage"         "--help"    "Usage:"
-test_cli_flag "--help shows GPT-5.6 SOL default" "--help" "gpt-5.6-sol"
+test_cli_flag "--help shows GPT-6 Astra default" "--help" "gpt-6-astra"
 test_cli_flag "--help shows xhigh default"  "--help"    "xhigh"
 test_cli_flag "--help shows workspace-write default" "--help" "workspace-write"
 test_cli_flag "--help shows never default"  "--help"    "never"
@@ -1859,7 +1859,7 @@ function onMessage(message) {
       const finishStart = () => {
         respond(message.id, {
           thread: value,
-          model: message.params.model || "gpt-5.6-sol",
+          model: message.params.model || "gpt-6-astra",
           modelProvider: "openai",
           cwd: message.params.cwd,
           approvalPolicy: message.params.approvalPolicy || "never",
@@ -1881,7 +1881,7 @@ function onMessage(message) {
       }
       respond(message.id, {
         thread: thread(message.params.threadId),
-        model: "gpt-5.6-sol",
+        model: "gpt-6-astra",
         modelProvider: "openai",
         cwd: workspace,
         approvalPolicy: "never",
@@ -1976,7 +1976,7 @@ function onMessage(message) {
     case "thread/fork":
       respond(message.id, {
         thread: { ...thread("thread-forked"), forkedFromId: message.params.threadId },
-        model: "gpt-5.6-sol",
+        model: "gpt-6-astra",
         modelProvider: "openai",
         cwd: workspace,
         approvalPolicy: "never",
@@ -2212,7 +2212,7 @@ const initialArgs = (prompt = "hello") => ({
   prompt,
   cwd: `${stubDir}/workspace`,
   sandbox: "read-only",
-  model: "gpt-5.6-sol",
+  model: "gpt-6-astra",
   model_reasoning_effort: "high",
 });
 const data = {};
@@ -3802,7 +3802,8 @@ test_claude_job \
    (.captures[0] as $capture |
      ($capture.meta.cwd == "'"$(pwd)"'") and
      ($capture.meta.streaming == true) and
-     (arg_after($capture.meta.argv; "--model") == "claude-opus-4-8") and
+     (arg_after($capture.meta.argv; "--model") == "claude-fable-5-1") and
+     (arg_after($capture.meta.argv; "--fallback-model") == "claude-opus-5") and
      (arg_after($capture.meta.argv; "--effort") == "xhigh") and
      (arg_after($capture.meta.argv; "--input-format") == "stream-json") and
      (arg_after($capture.meta.argv; "--output-format") == "stream-json") and
@@ -3869,7 +3870,8 @@ test_claude_job \
    (.captures[0] as $capture |
      ($capture.meta.streaming == false) and
      ($capture.rawStdin == "LEGACY") and
-     (arg_after($capture.meta.argv; "--model") == "claude-opus-4-8") and
+     (arg_after($capture.meta.argv; "--model") == "claude-fable-5-1") and
+     (arg_after($capture.meta.argv; "--fallback-model") == "claude-opus-5") and
      (arg_after($capture.meta.argv; "--effort") == "xhigh") and
      (arg_after($capture.meta.argv; "--output-format") == "json") and
      ($capture.meta.argv | index("--no-session-persistence") != null) and
@@ -4159,7 +4161,7 @@ test_codex_app_case "Codex initial calls map to thread/start and turn/start" \
    ([.appRequests[] | select(.method == "initialized" and (has("id") | not))] |
      length == 1) and
    ([.appRequests[] | select(.method == "thread/start")][0].params |
-     (.cwd | endswith("/workspace")) and (.model == "gpt-5.6-sol") and
+     (.cwd | endswith("/workspace")) and (.model == "gpt-6-astra") and
      (.sandbox == "read-only")) and
    ([.appRequests[] | select(.method == "turn/start")][0].params |
      (.threadId == "thread-1") and (.effort == "high") and
