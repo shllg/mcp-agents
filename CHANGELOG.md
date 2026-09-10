@@ -15,6 +15,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rounds; the raw `browser` and `codex-legacy` transport boundaries are
   unchanged.
 
+### Fixed
+
+- Keep a foreground Codex turn's completion promise handled for its whole
+  life. A question that arrives before the turn has an awaiter left the
+  rejection unobserved, so a single deferred question could take the whole
+  bridge down through the fatal `unhandledRejection` path.
+- Shut down when the stdio transport closes without an stdin `end` event. An
+  over-limit JSON-RPC frame closes the transport and pauses stdin, which
+  previously left the `keepAlive` interval holding an orphaned bridge process
+  alive after the client disconnected.
+- Hide foreground interactions from `codex-interactions` and refuse them in
+  `codex-interaction-resolve`. Settling one out-of-band stranded the turn and
+  never released its thread lease, so every later operation on that thread
+  failed with `codex_thread_busy`.
+- Offer MCP form elicitation only to clients that actually declare it. A
+  client declaring URL-mode elicitation alone was offered a form request the
+  SDK then refused, wedging the turn instead of falling back to the
+  background interaction queue.
+
 ## [0.30.0] - 2026-09-07
 
 ### Changed

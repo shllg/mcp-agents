@@ -906,6 +906,142 @@ EOF
   rm -f "$output_file"
 }
 
+# ── Helper: verify an over-limit frame cannot leave an orphaned bridge ──
+# The stdio transport closes itself when a single frame exceeds its read
+# buffer, and closing pauses stdin -- so the 'end' event the bridge normally
+# shuts down on never arrives. Without a transport-close hook the keepAlive
+# interval then holds the process open forever.
+test_oversized_frame_shutdown() {
+  local label="$1"
+  local tmpdir output_file status
+
+  echo "--- $label ---"
+
+  tmpdir=$(mktemp -d)
+  output_file=$(mktemp)
+  set +e
+  MCP_AGENTS_TEST_STATE_ROOT="$tmpdir/state" \
+    node --input-type=module >"$output_file" 2>&1 <<'EOF'
+import { spawn } from "node:child_process";
+import { appendFileSync } from "node:fs";
+
+const child = spawn(process.execPath, [
+  "server.js",
+  "--provider",
+  "codex",
+  "--codex-state-root",
+  process.env.MCP_AGENTS_TEST_STATE_ROOT,
+], {
+  cwd: process.cwd(),
+  detached: true,
+  stdio: ["pipe", "pipe", "pipe"],
+});
+
+appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${child.pid}\n`);
+child.stdout.resume();
+child.stdin.on("error", () => {});
+const closed = new Promise((resolve) => {
+  child.once("exit", (code, signal) => resolve({ kind: "exit", code, signal }));
+});
+child.stderr.setEncoding("utf8");
+let stderr = "";
+const ready = new Promise((resolve) => {
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+    if (stderr.includes("Codex MCP adapter listening")) resolve({ kind: "ready" });
+  });
+});
+let startupTimeout;
+const startup = await Promise.race([
+  ready,
+  closed,
+  new Promise((resolve) => {
+    startupTimeout = setTimeout(() => resolve({ kind: "startup-timeout" }), 5_000);
+  }),
+]);
+clearTimeout(startupTimeout);
+if (startup.kind !== "ready") {
+  try { process.kill(-child.pid, "SIGKILL"); } catch {}
+  await Promise.race([
+    closed,
+    new Promise((resolve) => setTimeout(resolve, 1_000)),
+  ]);
+  console.error(`bridge did not become ready: ${JSON.stringify(startup)}\n${stderr}`);
+  process.exit(123);
+}
+
+// One frame past the transport's 10 MiB read buffer, with no framing newline.
+child.stdin.write(`{"jsonrpc":"2.0","id":1,"method":"ping","params":{"pad":"${"x".repeat(11 * 1024 * 1024)}`);
+
+let timeout;
+const result = await Promise.race([
+  closed,
+  new Promise((resolve) => {
+    timeout = setTimeout(() => resolve({ kind: "timeout" }), 5_000);
+  }),
+]);
+clearTimeout(timeout);
+
+if (result.kind === "timeout") {
+  try { process.kill(-child.pid, "SIGKILL"); } catch {}
+  await Promise.race([
+    closed,
+    new Promise((resolve) => setTimeout(resolve, 1_000)),
+  ]);
+  console.error(`bridge survived an over-limit frame as an orphan\n${stderr}`);
+  process.exit(124);
+}
+if (result.signal !== null) {
+  console.error(`bridge exited from signal ${result.signal}\n${stderr}`);
+  process.exit(125);
+}
+if (result.code !== 0) {
+  console.error(`bridge exited with status ${result.code}\n${stderr}`);
+  process.exit(126);
+}
+if (!stderr.includes("(transport-close)")) {
+  console.error(`bridge did not shut down through the transport close hook\n${stderr}`);
+  process.exit(127);
+}
+EOF
+  status=$?
+  set -e
+
+  case "$status" in
+    0)
+      green "PASS: $label"
+      PASS=$((PASS + 1))
+      ;;
+    123)
+      red "FAIL: $label (bridge did not become ready)"
+      cat "$output_file"
+      FAIL=$((FAIL + 1))
+      ;;
+    124)
+      red "FAIL: $label (bridge survived an over-limit frame)"
+      cat "$output_file"
+      FAIL=$((FAIL + 1))
+      ;;
+    125)
+      red "FAIL: $label (bridge exited from a signal)"
+      cat "$output_file"
+      FAIL=$((FAIL + 1))
+      ;;
+    127)
+      red "FAIL: $label (shutdown did not come from the transport close hook)"
+      cat "$output_file"
+      FAIL=$((FAIL + 1))
+      ;;
+    *)
+      red "FAIL: $label (exit $status)"
+      cat "$output_file"
+      FAIL=$((FAIL + 1))
+      ;;
+  esac
+  rm -rf "$tmpdir"
+  rm -f "$output_file"
+}
+
 # ── Helper: fake Claude CLI for background-job contract tests. It captures ──
 # argv/cwd/stdin per process and emits deterministic stream-json, including
 # fragmented, malformed, and unknown frames that the bridge must safely ignore.
@@ -1954,6 +2090,39 @@ function startTurn(message, review = false, responseExtra = {}) {
     return;
   }
 
+  if (mode === "deferred-question-die") {
+    // Ask before the turn/start response resolves. The bridge has no turn for
+    // this turnId yet, so it must defer the request and drain it inside
+    // registerTurn -- the window where the turn has no awaiter. Then exit, so
+    // the turn is rejected while that is still true.
+    send({
+      id: `question-${turnCounter}`,
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId,
+        turnId,
+        itemId: `question-item-${turnCounter}`,
+        isBlocking: true,
+        questions: [{
+          id: "choice",
+          header: "Choice",
+          question: "Pick one",
+          isOther: false,
+          isSecret: false,
+          options: [
+            { label: "Ship", description: "Continue" },
+            { label: "Stop", description: "Cancel" },
+          ],
+        }],
+      },
+    });
+    setTimeout(() => {
+      respond(message.id, { turn: turn(turnId), ...responseExtra });
+      notify("turn/started", { threadId, turn: turn(turnId) });
+      setTimeout(() => process.exit(23), 80);
+    }, 20);
+    return;
+  }
   if (mode === "turn-start-delayed") setTimeout(announce, 300);
   else announce();
 }
@@ -2200,6 +2369,7 @@ if (scenario === "retention-journal") {
 }
 const stubMode = {
   "queued-interaction": "approval",
+  "foreground-interaction-hidden": "question",
   "approval-no-elicit": "approval",
   "stale-race": "park",
   "cancel-during-thread-start": "thread-start-withheld",
@@ -2281,10 +2451,32 @@ const discardPending = (id) => {
   return true;
 };
 
+let interactionsDuringRound;
 function onFrame(frame) {
   frames.push(frame);
   if (frame.method === "elicitation/create" && frame.id !== undefined) {
     if (scenario === "interaction-timeout") return;
+    if (scenario === "foreground-interaction-hidden") {
+      // The foreground interaction is pending for as long as this request is
+      // unanswered, so ask the background queue about it from inside the round.
+      interactionsDuringRound = call("codex-interactions", {});
+      void interactionsDuringRound.finally(() => write({
+        jsonrpc: "2.0",
+        id: frame.id,
+        result: { action: "accept", content: { choice: "Ship" } },
+      }));
+      return;
+    }
+    if (scenario === "deferred-question-die") {
+      // Answer late, so the app-server child is already gone by the time the
+      // round resumes and the turn is rejected with nothing awaiting it.
+      setTimeout(() => write({
+        jsonrpc: "2.0",
+        id: frame.id,
+        result: { action: "accept", content: { choice: "Ship" } },
+      }), 300);
+      return;
+    }
     const schema = frame.params?.requestedSchema || frame.params?.schema || {};
     const isQuestion = JSON.stringify(schema).includes("choice");
     write({
@@ -2555,6 +2747,14 @@ try {
     const startedAt = Date.now();
     data.result = await call("codex", initialArgs("let interaction expire"));
     data.elapsedMs = Date.now() - startedAt;
+  } else if (scenario === "foreground-interaction-hidden") {
+    await mcpInitialize(true);
+    data.result = await call("codex", initialArgs("interact"));
+    data.duringRound = await interactionsDuringRound;
+  } else if (scenario === "deferred-question-die") {
+    await mcpInitialize(true);
+    data.result = await call("codex", initialArgs("interact"));
+    data.ping = await call("ping", {});
   } else if (scenario === "queued-interaction") {
     await mcpInitialize(false);
     data.started = await call("codex-start", initialArgs("interact"));
@@ -4115,6 +4315,7 @@ test_no_registered_child_leaks() {
 
 test_provider_shutdown_kills_child "stdin shutdown kills detached claude child"
 test_closed_stderr_shutdown "closed stderr exits without an EPIPE shutdown spin"
+test_oversized_frame_shutdown "an over-limit frame shuts down instead of orphaning the bridge"
 
 # Stub-based Claude one-shot review tests (fast — no real Claude needed).
 test_claude_job \
@@ -4852,6 +5053,25 @@ test_codex_app_case "Background approvals remain resolvable through the queue" \
    ([.appRequests[] | select(.id == "approval-1")][0].result.decision == "accept") and
    (.data.status.result.structuredContent.state == "completed") and
    (.frames | tostring | contains("approval-1") | not)' \
+  "--approval_policy on-request"
+
+test_codex_app_case "A deferred foreground question never strands its turn rejection" \
+  "deferred-question-die" \
+  '(.data.result.error.code == -32602) and
+   (.data.result.error.data.reason == "invalid_foreground_interaction_state") and
+   (.data.ping.result.content[0].text == "pong") and
+   ([.frames[] | select(.method == "elicitation/create")] | length == 1) and
+   (.stderr | contains("UnhandledRejection") | not) and
+   (.stderr | contains("(stdin-end)"))' \
+  "--approval_policy on-request"
+
+test_codex_app_case "Foreground interactions stay out of the background queue" \
+  "foreground-interaction-hidden" \
+  '([.frames[] | select(.method == "elicitation/create")] | length == 1) and
+   (.data.duringRound.result.structuredContent.count == 0) and
+   (.data.duringRound.result.structuredContent.interactions == []) and
+   (.data.duringRound.result.content[0].text == "No pending Codex interactions.") and
+   (.data.result.result.content[0].text == "INTERACTION_OK")' \
   "--approval_policy on-request"
 
 test_codex_app_case "Child death fails one generation and never replays its turn" \

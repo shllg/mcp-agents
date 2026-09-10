@@ -37,7 +37,7 @@ import {
   inputRequired,
   inputResponse,
 } from "@modelcontextprotocol/server";
-import { serveStdio } from "@modelcontextprotocol/server/stdio";
+import { serveStdio, StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const STARTUP_CWD = process.cwd();
@@ -6676,6 +6676,15 @@ async function runCodexAppServer({
       resolveTurn = resolvePromise;
       rejectTurn = rejectPromise;
     });
+    // Rejections are reported through whoever awaits the turn, but between
+    // foreground input rounds nobody does: a deferred App Server question can
+    // reveal an interaction before awaitForegroundResult attaches awaitTurn,
+    // and an out-of-band settle leaves the turn running with no awaiter. An
+    // unhandled rejection there reaches fatalShutdown and tears down every
+    // unrelated turn in the bridge, so mark the promise handled at birth.
+    // Awaiters still observe the rejection; only the process-level report is
+    // suppressed.
+    completion.catch(() => {});
     const now = Date.now();
     const turn = {
       generation: generationState.generation,
@@ -6876,7 +6885,15 @@ async function runCodexAppServer({
     const capability = envelopeCapabilities === undefined
       ? outerServer?.getClientCapabilities()?.elicitation
       : envelopeCapabilities?.elicitation;
-    return Boolean(capability && capability.form !== false);
+    if (!capability) return false;
+    // Mirror the SDK's own gate for an embedded elicitation/create input
+    // request: `form` must be declared, except that a bare `elicitation: {}`
+    // still means form support (the pre-mode 2025 reading). A client that
+    // declares only `url` does not support forms, and offering it one wedges
+    // the turn on both eras. An explicit `form: false` stays refused here and
+    // falls back to the background queue.
+    if (capability.form === undefined) return capability.url === undefined;
+    return capability.form !== false;
   };
   const interactionElicitationRequest = (interaction) => {
     if (interaction.kind === "user_input") {
@@ -8675,6 +8692,10 @@ async function runCodexAppServer({
       }
       if (params.name === "codex-interactions") {
         const pending = [...interactions.values()]
+          // Foreground interactions belong to the input_required retry that is
+          // already holding the caller's tool call. Only that retry may settle
+          // one, so the background queue never reports them.
+          .filter((interaction) => !interaction.foreground)
           .filter((interaction) => !args.threadId || interaction.threadId === args.threadId)
           .filter((interaction) => !args.jobId || interaction.jobId === args.jobId)
           .map(sanitizedInteraction);
@@ -8685,7 +8706,12 @@ async function runCodexAppServer({
       }
       if (params.name === "codex-interaction-resolve") {
         const interaction = interactions.get(args.interactionId);
-        if (!interaction) {
+        // Settling a foreground interaction here would answer App Server while
+        // the turn has no MCP request left to deliver to: forgetTurn never
+        // runs, the thread lease is never released, and the client's own retry
+        // fails its pending-interaction check. Report it exactly as absent so
+        // the queue tools disclose nothing about foreground state.
+        if (!interaction || interaction.foreground) {
           return errorResult(
             "interaction_not_found",
             "The interaction is absent, expired, or already resolved",
@@ -8752,14 +8778,26 @@ async function runCodexAppServer({
     process.exitCode = exitCode;
   };
   fatalShutdown = (reason, exitCode) => { void shutdown(reason, exitCode); };
+  const stdioTransport = new StdioServerTransport();
   stdioHandle = serveStdio(
     ({ era }) => buildCodexMcpServer(era),
     {
+      transport: stdioTransport,
       onerror(error) {
         logErr(`[mcp-agents] Codex MCP stdio error: ${error.message}`);
       },
     },
   );
+  // serveStdio installs its own onclose, so wrap it after the call. A wire
+  // close does not always reach stdin 'end': StdioServerTransport closes
+  // itself on a ReadBuffer overflow and pauses stdin, removing the listener
+  // that would emit it. Without this the keepAlive interval holds the process
+  // open forever after an over-limit frame.
+  const sdkStdioClose = stdioTransport.onclose;
+  stdioTransport.onclose = () => {
+    sdkStdioClose?.();
+    void shutdown("transport-close");
+  };
   keepAlive = setInterval(() => {}, 60_000);
   process.stdin.once("end", () => { void shutdown("stdin-end"); });
   process.stdin.once("close", () => { void shutdown("stdin-close"); });
@@ -9225,13 +9263,28 @@ async function main() {
     return server;
   };
 
+  const stdioTransport = new StdioServerTransport();
   stdioHandle = serveStdio(
     ({ era }) => buildBlockingProviderServer(era),
     {
+      transport: stdioTransport,
       onerror(error) {
         logErr(`[mcp-agents] MCP stdio error: ${error.message}`);
       },
     },
+  );
+  // serveStdio installs its own onclose, so wrap it after the call. A wire
+  // close does not always reach stdin 'end': StdioServerTransport closes
+  // itself on a ReadBuffer overflow and pauses stdin, removing the listener
+  // that would emit it. Without this the keepAlive interval holds the process
+  // open forever after an over-limit frame.
+  const sdkStdioClose = stdioTransport.onclose;
+  stdioTransport.onclose = () => {
+    sdkStdioClose?.();
+    beginShutdown("transport-close");
+  };
+  logErr(
+    `[mcp-agents] listening (provider: ${providerName}, awaiting protocol era)`,
   );
 
   // Prevent premature exit when stdin EOF arrives before async

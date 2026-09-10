@@ -148,8 +148,13 @@ for small prompts.
 
 The bridge speaks
 [JSON-RPC over stdio](https://modelcontextprotocol.io/docs/concepts/transports#stdio).
-It writes `[mcp-agents] ready (provider: <name>)` to stderr when listening;
-stdout remains MCP-only.
+Because the protocol era is chosen by the opening exchange, the bridge logs
+twice to stderr: `[mcp-agents] listening (provider: <name>, awaiting protocol
+era)` once the transport accepts input, then `[mcp-agents] ready (provider:
+<name>, era=<legacy|modern>)` once an era is pinned. The `codex` provider
+logs the same pair as `[mcp-agents] Codex MCP adapter listening` and
+`[mcp-agents] Codex MCP adapter ready`. Wait for the listening line, not the
+ready line, to know the bridge accepts traffic. stdout remains MCP-only.
 
 ## Providers
 
