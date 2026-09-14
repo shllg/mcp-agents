@@ -6095,6 +6095,15 @@ async function createCodexRuntime({
   const activeTurns = new Map();
   const activeTurnsByThread = new Map();
   const provisionalTurns = new Map();
+  // Leases held by operations whose App Server generation died before their
+  // outcome was known. A stdio bridge released these for free when its process
+  // exited; a pooled runtime outlives that, so they are kept here and released
+  // only when this runtime shuts down and the lost child group is proven gone.
+  const uncertainLeases = [];
+  const retainUncertainLease = (release, generationState) => {
+    if (!release) return;
+    uncertainLeases.push({ release, childPid: generationState?.child?.pid });
+  };
   const completedBeforeRegistration = new Map();
   const threadWorkspaces = new Map();
   const jobs = new Map();
@@ -7555,6 +7564,7 @@ async function createCodexRuntime({
     for (const provisional of provisionalTurns.values()) {
       if (provisional.generation !== generationState.generation) continue;
       provisional.state = "outcome_unknown";
+      provisional.generationLost = true;
       provisional.updatedAt = new Date().toISOString();
     }
     for (const turn of activeTurns.values()) {
@@ -7562,6 +7572,8 @@ async function createCodexRuntime({
       turn.state = "outcome_unknown";
       turn.safeToRelease = false;
       turn.uncertain = true;
+      turn.generationLost = true;
+      turn.lostChildPid = generationState.child?.pid;
       turn.updatedAt = new Date().toISOString();
       for (const timerName of [
         "idleTimer",
@@ -8126,6 +8138,8 @@ async function createCodexRuntime({
       if (!isUncertainMutationError(err)) {
         try { releaseLease?.(); } catch {}
         forgetProvisionalTurn(provisional);
+      } else {
+        retainUncertainLease(releaseLease, generationState);
       }
       throw err;
     }
@@ -8257,6 +8271,9 @@ async function createCodexRuntime({
         try { releaseSourceLease?.(); } catch {}
         try { releaseTurnLease?.(); } catch {}
         forgetProvisionalTurn(provisional);
+      } else {
+        retainUncertainLease(releaseSourceLease, generationState);
+        retainUncertainLease(releaseTurnLease, generationState);
       }
       throw err;
     }
@@ -8926,6 +8943,8 @@ async function createCodexRuntime({
           if (!uncertain) {
             forgetProvisionalTurn(provisional);
             release();
+          } else {
+            retainUncertainLease(release, generationState);
           }
         }
       }
@@ -8997,6 +9016,8 @@ async function createCodexRuntime({
           if (!uncertain) {
             forgetProvisionalTurn(provisional);
             release();
+          } else {
+            retainUncertainLease(release, generationState);
           }
         }
       }
@@ -9092,6 +9113,38 @@ async function createCodexRuntime({
         await generationState.gone;
         clearTimeout(killTimer);
       }
+      // Every writer this runtime owned is now gone or being reaped, which is
+      // where a stdio bridge exit left its leases recoverable. Release leases
+      // stranded by generation loss, but only once the lost process group is
+      // proven dead; anything still uncertain keeps its lease and stays busy.
+      const lostGroupGone = (childPid) => {
+        if (!Number.isInteger(childPid) || childPid <= 0) return false;
+        try {
+          process.kill(-childPid, 0);
+          return false;
+        } catch (err) {
+          return err?.code === "ESRCH";
+        }
+      };
+      let keptLeases = 0;
+      for (const turn of [...activeTurns.values()]) {
+        if (!turn.generationLost) continue;
+        if (lostGroupGone(turn.lostChildPid)) forgetTurn(turn);
+        else keptLeases += 1;
+      }
+      for (const entry of uncertainLeases.splice(0)) {
+        if (lostGroupGone(entry.childPid)) {
+          try { entry.release(); } catch {}
+        } else {
+          keptLeases += 1;
+        }
+      }
+      if (keptLeases > 0) {
+        logErr(
+          `[mcp-agents] kept ${keptLeases} Codex thread lease(s) whose ` +
+            "App Server process group is not yet proven gone",
+        );
+      }
       writeBridgeState();
       bridgeStateEnabled = false;
       try { rmSync(bridgeDir, { recursive: true, force: true }); } catch {}
@@ -9103,9 +9156,12 @@ async function createCodexRuntime({
     canonicalProjectCwd,
     buildMcpServer: buildCodexMcpServer,
     canEvict() {
+      // A record stranded by generation loss has no writer left in this
+      // runtime; counting it would pin the runtime and its App Server slot for
+      // the daemon's lifetime. Shutdown releases what it still holds.
       return activeMcpRequests === 0 &&
-        activeTurns.size === 0 &&
-        provisionalTurns.size === 0 &&
+        [...activeTurns.values()].every((turn) => turn.generationLost) &&
+        [...provisionalTurns.values()].every((provisional) => provisional.generationLost) &&
         interactions.size === 0 &&
         !appStarting &&
         [...jobs.values()].every((job) => isTerminalJob(job));
