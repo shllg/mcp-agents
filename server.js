@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /* eslint-disable no-console */
 
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { get as httpGet } from "node:http";
 import { createRequire } from "node:module";
@@ -5679,7 +5679,13 @@ async function runCodexAppServer({
     }
     return JSON.stringify(value);
   };
-  const fingerprintToolCall = (toolName, args) => createHash("sha256")
+  // The signed request state is readable, so an unkeyed digest would let
+  // anyone holding a continuation confirm a guessed prompt offline. Key the
+  // binding per bridge process: retries in this process still match, while the
+  // value reveals nothing about the arguments without the key. The key is kept
+  // separate from the codec's signing key rather than reused across primitives.
+  const callBindingKey = randomBytes(32);
+  const fingerprintToolCall = (toolName, args) => createHmac("sha256", callBindingKey)
     .update(`${toolName}\n${canonicalJson(args)}`)
     .digest("hex");
 

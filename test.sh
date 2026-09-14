@@ -2933,6 +2933,7 @@ EOF
   set +e
   summary=$($TIMEOUT_CMD 12 node --input-type=module - \
     "$tmpdir" "$(pwd)" "$scenario" 2>/dev/null <<'EOF'
+import crypto from "node:crypto";
 import fs from "node:fs";
 import { Client } from "@modelcontextprotocol/client";
 import {
@@ -2981,6 +2982,13 @@ const transport = new StdioClientTransport({
 let stderr = "";
 transport.stderr?.setEncoding("utf8");
 transport.stderr?.on("data", (chunk) => { stderr += chunk; });
+const callArguments = {
+  prompt: "PRIVATE_MODERN_PROMPT",
+  cwd: `${stubDir}/workspace`,
+  sandbox: "read-only",
+  model: "gpt-6-astra",
+  model_reasoning_effort: "high",
+};
 let result;
 let era;
 let driverError;
@@ -2988,16 +2996,7 @@ try {
   await client.connect(transport);
   era = client.getProtocolEra();
   fs.appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${transport.pid}\n`);
-  result = await client.callTool({
-    name: "codex",
-    arguments: {
-      prompt: "PRIVATE_MODERN_PROMPT",
-      cwd: `${stubDir}/workspace`,
-      sandbox: "read-only",
-      model: "gpt-6-astra",
-      model_reasoning_effort: "high",
-    },
-  });
+  result = await client.callTool({ name: "codex", arguments: callArguments });
 } catch (error) {
   driverError = error.stack || String(error);
 } finally {
@@ -3020,6 +3019,20 @@ const clientFrames = readWire(".client.raw");
 const inputRequiredFrames = serverFrames.filter((frame) =>
   frame?.result?.resultType === "input_required"
 );
+// The digest an unkeyed call binding would carry for these exact arguments.
+// A continuation must never commit to it, or its prompt is guessable offline.
+const canonicalJson = (value) => {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    ).join(",")}}`;
+  }
+  return JSON.stringify(value);
+};
+const unkeyedCallHash = crypto.createHash("sha256")
+  .update(`codex\n${canonicalJson(callArguments)}`)
+  .digest("hex");
 const decodedRequestStates = inputRequiredFrames.map((frame) => {
   const state = frame.result.requestState;
   if (typeof state !== "string") return null;
@@ -3040,6 +3053,7 @@ process.stdout.write(`${JSON.stringify({
   clientFrames,
   inputRequiredFrames,
   decodedRequestStates,
+  unkeyedCallHash,
   appRequests: readJsonl(`${stubDir}/app-stdin.jsonl`),
   stderr,
 })}\n`);
@@ -4987,7 +5001,10 @@ test_codex_modern_interaction_case \
    (.decodedRequestStates | length == 1) and
    ([.decodedRequestStates[]?.p | keys] == [["bridgeSessionId","callHash","interactionId","toolName","turnId","v"]]) and
    ((.decodedRequestStates | tostring) |
-     test("PRIVATE_MODERN_PROMPT|Pick one|Ship|INTERACTION_OK|dangerous"; "i") | not)'
+     test("PRIVATE_MODERN_PROMPT|Pick one|Ship|INTERACTION_OK|dangerous"; "i") | not) and
+   (.unkeyedCallHash | test("^[0-9a-f]{64}$")) and
+   (.decodedRequestStates[0].p.callHash | test("^[0-9a-f]{64}$")) and
+   (.decodedRequestStates[0].p.callHash != .unkeyedCallHash)'
 
 test_codex_modern_interaction_case \
   "Modern foreground input without elicitation fails closed without replay" \
