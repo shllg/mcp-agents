@@ -5883,6 +5883,7 @@ async function createCodexRuntime({
   goal,
   stateRoot,
   sessionRetentionDays,
+  confineWorkspaceToProject = false,
 }) {
   const resolvedModel = model || DEFAULT_CODEX_MODEL;
   const resolvedEffort = modelReasoningEffort ||
@@ -6200,6 +6201,30 @@ async function createCodexRuntime({
         "Codex workspace must not overlap the bridge's private state root",
       );
     }
+  };
+  // Over HTTP the project-root header selects this runtime and its durable
+  // state, so the turn has to execute inside that root too. Otherwise a request
+  // routed under one project runs in another while its sessions, leases, and
+  // sidecars are recorded under the first project's state. Stdio runtimes keep
+  // their existing unconfined workspace contract.
+  const assertWorkspaceInsideProject = (cwd, { required = false } = {}) => {
+    if (!confineWorkspaceToProject) return;
+    const outside = () => appError(
+      "codex_workspace_outside_project",
+      "Codex workspace must be inside the request's project root",
+    );
+    if (!cwd) {
+      if (required) throw outside();
+      return;
+    }
+    let canonicalCwd;
+    try {
+      canonicalCwd = realpathSync(resolve(cwd));
+    } catch {
+      throw outside();
+    }
+    const fromRoot = relative(canonicalProjectCwd, canonicalCwd);
+    if (isAbsolute(fromRoot) || fromRoot.split(/[\\/]/u)[0] === "..") throw outside();
   };
 
   const activeTurnsPath = join(bridgeDir, "active-turns.json");
@@ -8039,6 +8064,7 @@ async function createCodexRuntime({
       sandbox: args.sandbox,
     };
     assertWorkspaceOutsideState(workspace?.cwd);
+    assertWorkspaceInsideProject(workspace?.cwd);
     const generationState = await awaitSetupBoundary(ensureApp(), signal, deadlineAt);
     let releaseLease;
     let turn;
@@ -8068,6 +8094,7 @@ async function createCodexRuntime({
           sandbox: resumed?.thread?.sandbox,
         };
         assertWorkspaceOutsideState(resumed?.thread?.cwd ?? workspace?.cwd);
+        assertWorkspaceInsideProject(resumed?.thread?.cwd ?? workspace?.cwd, { required: true });
         rememberThreadWorkspace(threadId, workspace?.cwd, workspace?.sandbox);
         updateProvisionalTurn(provisional, {
           cwd: workspace?.cwd ?? null,
@@ -8192,6 +8219,7 @@ async function createCodexRuntime({
     const deadlineAt = backgroundJob?.deadlineAt ?? Date.now() + resolvedHardMs;
     let workspace = lookupThreadWorkspace(args.threadId);
     assertWorkspaceOutsideState(workspace?.cwd);
+    assertWorkspaceInsideProject(workspace?.cwd);
     const generationState = await awaitSetupBoundary(ensureApp(), signal, deadlineAt);
     const provisional = beginProvisionalTurn({
       generationState,
@@ -8222,6 +8250,7 @@ async function createCodexRuntime({
         sandbox: resumed?.thread?.sandbox,
       };
       assertWorkspaceOutsideState(resumed?.thread?.cwd ?? workspace?.cwd);
+      assertWorkspaceInsideProject(resumed?.thread?.cwd ?? workspace?.cwd, { required: true });
       updateProvisionalTurn(provisional, {
         cwd: workspace?.cwd ?? null,
         sandbox: workspace?.sandbox ?? null,
@@ -9392,7 +9421,7 @@ async function runCodexHttpServer({
   ...runtimeOptions
 }) {
   const pool = createCodexRuntimePool({
-    runtimeOptions,
+    runtimeOptions: { ...runtimeOptions, confineWorkspaceToProject: true },
     idleTimeoutMs: httpRuntimeIdleTimeoutMs,
   });
   let httpHandle;
