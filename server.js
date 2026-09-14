@@ -1659,6 +1659,7 @@ function peekResponseId(prefix) {
  *   cwd?: string,
  *   onSpawn?: (childInfo: { pid?: number, killGroup: () => void }) => void,
  *   onSettled?: (pid?: number) => void,
+ *   signal?: AbortSignal,
  * }} [opts]
  * @returns {Promise<{ output: string, stdoutBytes: number, stderrBytes: number, durationMs: number }>}
  */
@@ -1668,9 +1669,14 @@ function runCli(command, args, opts = {}) {
   const cwd = opts.cwd;
   const onSpawn = opts.onSpawn;
   const onSettled = opts.onSettled;
+  const signal = opts.signal;
   const startedAt = Date.now();
 
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error(`${command} was canceled by the MCP client`));
+      return;
+    }
     let stdout = "";
     let stderr = "";
     let stdoutLen = 0;
@@ -1697,8 +1703,18 @@ function runCli(command, args, opts = {}) {
     };
     onSpawn?.({ pid: child.pid, killGroup });
 
+    // A canceled MCP request must not leave its CLI running to the full
+    // timeout. Over HTTP a client disconnect aborts this signal, and there is
+    // no per-client bridge exit to reap the child the way stdio had.
+    const onAbort = () => {
+      killGroup();
+      done(new Error(`${command} was canceled by the MCP client`));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+
     const done = (err) => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
       if (settled) return;
       settled = true;
       onSettled?.(child.pid);
@@ -9771,6 +9787,7 @@ async function main() {
     const buildCliOpts = (attemptTimeoutMs) => (
       {
         timeoutMs: attemptTimeoutMs,
+        signal: ctx.mcpReq.signal,
         ...(backend.stdinPrompt ? { stdinData: prompt } : {}),
         ...(isolatedWorkdir ? { cwd: isolatedWorkdir } : {}),
         onSpawn: ({ pid, killGroup }) => {
