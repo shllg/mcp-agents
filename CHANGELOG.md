@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.30.2] - 2026-09-16
+
+### Fixed
+
+- Treat a blank `MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS` as unset instead of a
+  one-millisecond deadline, and warn before using the 300-second default for
+  malformed or out-of-range values.
+- Describe thread-index construction as one possible cause of an App Server
+  initialization timeout and direct operators only to the safe timeout override.
+
+### Changed
+
+- Document that thread listings expose App Server prompt previews and that an
+  empty indexed page may mean the generation's private state database is
+  unavailable rather than that durable history is empty.
+
 ## [0.30.1] - 2026-09-15
 
 ### Fixed

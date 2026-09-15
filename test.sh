@@ -296,7 +296,7 @@ test_cli_flag "--help shows workspace network default" "--help" "--codex-workspa
 test_cli_flag "--help shows codex_idle_timeout" "--help" "codex_idle_timeout"
 test_cli_flag "--help shows codex_status_interval default" "--help" "codex_status_interval"
 test_cli_flag "--help shows durable Codex state root" "--help" "--codex-state-root"
-test_cli_flag "--help explains Codex retention scope" "--help" "ordinary vscode sessions are retained"
+test_cli_flag "--help explains Codex retention scope" "--help" "vscode sessions are retained"
 test_cli_flag "--help shows goal flag"      "--help"    "Native durable goal"
 test_cli_flag "--help shows browser provider" "--help" "browser_lease_command"
 test_cli_flag "--help shows browser downstream fallback" "--help" "npx chrome-devtools-mcp@latest"
@@ -1848,6 +1848,7 @@ function onMessage(message) {
         break;
       }
       if (mode === "slow-initialize") setTimeout(() => completeInitialize(message.id), 10_500);
+      else if (mode === "delayed-initialize") setTimeout(() => completeInitialize(message.id), 25);
       else completeInitialize(message.id);
       break;
     case "initialized":
@@ -1976,6 +1977,22 @@ function onMessage(message) {
           ], message.params.sourceKinds),
           nextCursor: null,
         });
+      } else if (
+        mode === "retention-newer" && message.params.archived &&
+        !deletedThreads.has("thread-archived-expired")
+      ) {
+        respond(message.id, {
+          data: filterThreadSources([{
+            ...thread("thread-archived-expired"),
+            archived: true,
+            createdAt: 1,
+            updatedAt: 1,
+            recencyAt: 1,
+            source: "subAgentReview",
+            status: { type: "idle" },
+          }], message.params.sourceKinds),
+          nextCursor: null,
+        });
       } else if (mode === "retention-journal") {
         respond(message.id, { data: [], nextCursor: null });
       } else {
@@ -2081,6 +2098,11 @@ const stubMode = {
   "approval-no-elicit": "approval",
   "stale-race": "park",
   "cancel-during-thread-start": "thread-start-withheld",
+  "init-timeout-empty": "delayed-initialize",
+  "init-timeout-invalid": "delayed-initialize",
+  "init-timeout-negative": "delayed-initialize",
+  "init-timeout-overflow": "delayed-initialize",
+  "init-timeout-zero": "delayed-initialize",
 }[scenario] ?? (["peek", "job-compat", "busy", "idle", "cancel", "steer", "hold"].includes(scenario)
   ? "park"
   : ["schema-no-app", "unavailable-call"].includes(scenario)
@@ -2107,6 +2129,21 @@ const child = spawn("node", ["server.js", "--provider", "codex", ...rawServerArg
       : "codex-cli 0.149.1",
     ...(["init-timeout-first", "init-reject-first"].includes(scenario)
       ? { MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS: "750" }
+      : {}),
+    ...(scenario === "init-timeout-empty"
+      ? { MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS: "" }
+      : {}),
+    ...(scenario === "init-timeout-invalid"
+      ? { MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS: "600s" }
+      : {}),
+    ...(scenario === "init-timeout-negative"
+      ? { MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS: "-1" }
+      : {}),
+    ...(scenario === "init-timeout-overflow"
+      ? { MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS: "2147483648" }
+      : {}),
+    ...(scenario === "init-timeout-zero"
+      ? { MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS: "0" }
       : {}),
     ...(["turn-start-withheld", "archive-withheld"].includes(scenario)
       ? { MCP_AGENTS_CODEX_APP_MUTATION_TIMEOUT_MS: "120" }
@@ -2273,7 +2310,11 @@ try {
       throw new Error("turn/start was not captured before cancellation");
     }
     notify("notifications/cancelled", { requestId: callId, reason: "test" });
-    await sleep(150);
+    if (!await waitFor(() => fs.existsSync(`${stubDir}/app-stdin.jsonl`) &&
+      fs.readFileSync(`${stubDir}/app-stdin.jsonl`, "utf8")
+        .includes('"method":"turn/interrupt"'), 3000)) {
+      throw new Error("turn/interrupt was not captured after cancellation");
+    }
     data.canceled = await Promise.race([open, sleep(250).then(() => null)]);
     data.ping = await request("ping");
   } else if (scenario === "cancel-no-native") {
@@ -4145,9 +4186,11 @@ test_codex_app_case "An initialize timeout discards its generation before retry"
   '(.data.first.result.isError == true) and
    (.data.first.result.structuredContent.code == "codex_app_server_unavailable") and
    (.data.first.result.structuredContent.message |
-      contains("private thread index")) and
+      contains("can include building its private thread index")) and
    (.data.first.result.structuredContent.message |
       contains("MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS")) and
+   (.data.first.result.structuredContent.message |
+      contains("prune old durable sessions") | not) and
    (.stderr | contains("MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS")) and
    (.data.second.result.content[0].text == "APP_SERVER_OK") and
    (.appSpawns | length == 2) and
@@ -4171,12 +4214,48 @@ test_codex_app_case "The default init budget exceeds the former 10-second limit"
    ([.appRequests[] | select(.method == "thread/start")] | length == 1)' \
   "" "25"
 
+test_codex_app_case "An empty init-timeout environment value uses the default" \
+  "init-timeout-empty" \
+  '(.data.call.result.content[0].text == "APP_SERVER_OK") and
+   (.appSpawns | length == 1) and
+   ([.appRequests[] | select(.method == "initialize")] | length == 1) and
+   (.stderr | contains("invalid MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS") | not)'
+
+test_codex_app_case "An invalid init-timeout environment value warns and uses the default" \
+  "init-timeout-invalid" \
+  '(.data.call.result.content[0].text == "APP_SERVER_OK") and
+   (.stderr | contains("invalid MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS")) and
+   (.stderr | contains("using the 300000ms default"))'
+
+test_codex_app_case "A negative init-timeout environment value warns and uses the default" \
+  "init-timeout-negative" \
+  '(.data.call.result.content[0].text == "APP_SERVER_OK") and
+   (.stderr | contains("invalid MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS")) and
+   (.stderr | contains("using the 300000ms default"))'
+
+test_codex_app_case "An overflowing init-timeout environment value warns and uses the default" \
+  "init-timeout-overflow" \
+  '(.data.call.result.content[0].text == "APP_SERVER_OK") and
+   (.stderr | contains("invalid MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS")) and
+   (.stderr | contains("using the 300000ms default"))'
+
+test_codex_app_case "A zero init-timeout environment value keeps the one-millisecond deadline" \
+  "init-timeout-zero" \
+  '(.data.call.result.isError == true) and
+   (.data.call.result.structuredContent.code == "codex_app_server_unavailable") and
+   (.data.call.result.structuredContent.message | contains("within 1ms")) and
+   (.stderr | contains("invalid MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS") | not)'
+
 test_codex_app_case "Codex tools expose closed curated App Server contracts" \
   "schema" \
   '(.data.tools.result.tools | map({key:.name,value:.}) | from_entries) as $t |
    ([$t[] | select(.name | startswith("codex")) |
       .inputSchema.additionalProperties == false] | all) and
    (($t.codex.inputSchema.required | sort) == ["cwd","prompt","sandbox"]) and
+   ($t["codex-thread-list"].description | contains("first user message")) and
+   (($t["codex-thread-list"].description | contains("empty page")) and
+    ($t["codex-thread-list"].description |
+      contains("private state database"))) and
    (($t.codex.inputSchema.properties | keys | sort) ==
       ["allow_subagents","cwd","goal","model","model_reasoning_effort","prompt","sandbox"]) and
    (($t["codex-reply"].inputSchema.properties | keys | sort) ==
@@ -4463,6 +4542,7 @@ test_codex_app_case "Thread tools map to stable history and lifecycle methods" \
       (.archived == false) and (.useStateDbOnly == true) and
       (.sourceKinds == ["vscode","appServer","subAgentReview"])) and
    (.data.list.result.structuredContent.threads[0].id == "thread-listed") and
+   (.data.list.result.structuredContent.threads[0].preview == "stub preview") and
    ([.appRequests[] | select(.method == "thread/read")][0].params.includeTurns == true) and
    ([.appRequests[] | select(.method == "thread/fork")][0].params.lastTurnId == "turn-read") and
    ([.appRequests[].method | select(. == "thread/archive")] | length == 1) and
@@ -4578,17 +4658,30 @@ test_codex_app_stale_lease_race \
 test_codex_app_case "Retention clears goals on a newer Codex version" \
   "retention-newer" \
   '(.appSpawns[0].storage.goals.symlink == true) and
-   ([.appRequests[] | select(.method == "thread/list" and .params.limit == 100)][0].params |
-      (.useStateDbOnly == false) and
-      (.sourceKinds == ["appServer","subAgentReview"])) and
+   ([.appRequests[] |
+      select(.method == "thread/list" and .params.limit == 100) |
+      .params | {archived,useStateDbOnly,sourceKinds}] == [
+        {archived:false,useStateDbOnly:false,
+         sourceKinds:["appServer","subAgentReview"]},
+        {archived:true,useStateDbOnly:false,
+         sourceKinds:["appServer","subAgentReview"]}
+      ]) and
    ([.appRequests[] | select(.method == "thread/delete" and
       .params.threadId == "thread-expired")] | length == 1) and
+   ([.appRequests[] | select(.method == "thread/delete" and
+      .params.threadId == "thread-archived-expired")] | length == 1) and
    ([.appRequests[] | select(.method == "thread/delete" and
       .params.threadId == "thread-fresh")] | length == 0) and
    ([.appRequests[] | select(.method == "thread/delete" and
       .params.threadId == "thread-vscode-expired")] | length == 0) and
    ([.appRequests[] | select(.method == "thread/goal/clear" and
       .params.threadId == "thread-expired")] | length == 1) and
+   ([.appRequests[] | select(.method == "thread/goal/clear" and
+      .params.threadId == "thread-archived-expired")] | length == 1) and
+   ([.appRequests[] | select(
+      (.method == "thread/goal/clear" or .method == "thread/delete") and
+      .params.threadId == "thread-archived-expired") | .method] ==
+      ["thread/goal/clear","thread/delete"]) and
    ([.appRequests[] | select(.method == "thread/goal/clear" and
       .params.threadId == "thread-vscode-expired")] | length == 0)' \
   "--codex-session-retention-days 1"

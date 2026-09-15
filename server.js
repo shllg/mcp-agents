@@ -332,6 +332,25 @@ const testTunableMs = (name, fallback) => {
   return Number.isFinite(parsed) && parsed >= 0 ? Math.round(parsed) : fallback;
 };
 
+const resolveCodexAppInitTimeoutMs = () => {
+  const value = process.env[CODEX_APP_INIT_TIMEOUT_ENV];
+  if (value == null || value.trim() === "") {
+    return DEFAULT_CODEX_APP_INIT_TIMEOUT_MS;
+  }
+  const parsed = Number(value);
+  const rounded = Math.round(parsed);
+  if (
+    Number.isFinite(parsed) && parsed >= 0 &&
+    rounded <= MAX_TIMER_DELAY_MS
+  ) return rounded;
+  logErr(
+    `[mcp-agents] WARNING: invalid ${CODEX_APP_INIT_TIMEOUT_ENV}; ` +
+      `expected milliseconds from 0 to ${MAX_TIMER_DELAY_MS}; ` +
+      `using the ${DEFAULT_CODEX_APP_INIT_TIMEOUT_MS}ms default`,
+  );
+  return DEFAULT_CODEX_APP_INIT_TIMEOUT_MS;
+};
+
 const testTunablePositiveInteger = (name, fallback) => {
   const value = process.env[name];
   if (value == null) return fallback;
@@ -3130,7 +3149,11 @@ function codexToolPresentation(toolName) {
   }
   if (toolName === "codex-thread-list") {
     return {
-      description: "List durable Codex App Server threads using bounded pagination.",
+      description:
+        "List the current App Server generation's indexed thread snapshot using " +
+        "bounded pagination. Rows include a preview, usually the first user " +
+        "message. An empty page can also mean the private state database is " +
+        "unavailable; reconnect to rebuild the index.",
       inputSchema: {
         type: "object",
         properties: {
@@ -5629,10 +5652,7 @@ async function runCodexAppServer({
     "MCP_AGENTS_TEST_COMMENTARY_BYTES",
     MAX_CODEX_COMMENTARY_BYTES,
   );
-  const appInitTimeoutMs = testTunableMs(
-    CODEX_APP_INIT_TIMEOUT_ENV,
-    DEFAULT_CODEX_APP_INIT_TIMEOUT_MS,
-  );
+  const appInitTimeoutMs = resolveCodexAppInitTimeoutMs();
   const appMutationTimeoutMs = testTunableMs(
     "MCP_AGENTS_CODEX_APP_MUTATION_TIMEOUT_MS",
     60_000,
@@ -7512,9 +7532,9 @@ async function runCodexAppServer({
       onGenerationGone(generationState, "failed during initialization");
       const detail = boundedText(err?.message, 1_000);
       const message = err?.codexCode === "codex_app_server_timeout"
-        ? `Codex App Server initialization timed out while building its private ` +
-          `thread index: ${detail}. Increase ${CODEX_APP_INIT_TIMEOUT_ENV} ` +
-          "(milliseconds) or prune old durable sessions before retrying"
+        ? `Codex App Server initialization timed out: ${detail}. Startup can ` +
+          `include building its private thread index from durable session history. ` +
+          `Increase ${CODEX_APP_INIT_TIMEOUT_ENV} (milliseconds) and retry`
         : `Codex App Server initialization failed: ${detail}`;
       logErr(`[mcp-agents] ${message}`);
       throw appError(

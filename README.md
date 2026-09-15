@@ -375,7 +375,7 @@ remain unavailable.
 | `codex-goal-set` | `threadId` plus one of `objective`, `status`, `tokenBudget` | Create or update the native durable goal |
 | `codex-goal-get`, `codex-goal-clear` | `threadId` | Read counters or clear the goal |
 | `codex-review`, `codex-review-start` | `threadId`, `target` | Run a native inline or detached review, blocking or as a job |
-| `codex-thread-list` | — | List active or archived durable threads with cursor pagination |
+| `codex-thread-list` | — | List active or archived durable threads with cursor pagination; rows include prompt previews |
 | `codex-thread-read` | `threadId` | Read sanitized metadata and optionally bounded turn history |
 | `codex-thread-fork` | `threadId` | Fork all history or through `lastTurnId` |
 | `codex-thread-archive`, `codex-thread-unarchive` | `threadId` | Move a thread into or out of the archive |
@@ -392,9 +392,11 @@ Review targets are closed objects:
 ```
 
 Delivery is `inline` by default or `detached`. Thread reads and listings are
-bounded to 100 records per call. Returned history is sanitized; the bridge does
-not expose raw App Server frames, hidden reasoning, config, arbitrary filesystem
-operations, or private native request IDs.
+bounded to 100 records per call. A listing's `preview` is usually the first user
+message, so treat thread-list output as conversation content. Returned history
+is otherwise sanitized; the bridge does not expose raw App Server frames,
+hidden reasoning, config, arbitrary filesystem operations, or private native
+request IDs.
 
 </details>
 
@@ -417,10 +419,11 @@ and are removed after the child exits.
 App Server initialization gets a 300,000-millisecond budget by default so a
 generation can build its private thread index from a large durable session
 history. `MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS` is measured in milliseconds;
-zero clamps to one millisecond and does not disable the timeout. Initialization
-must succeed before retention starts. If indexing exceeds the budget, raise the
-environment value. The first App-backed Codex tool call's hard deadline includes
-this lazy initialization and setup time.
+an unset or blank value uses the default, while an invalid value logs a warning
+and also uses the default. Zero clamps to one millisecond and does not disable
+the timeout. Initialization must succeed before retention starts. If indexing
+exceeds the budget, raise the environment value. The first App-backed Codex
+tool call's hard deadline includes this lazy initialization and setup time.
 
 Bare `codex app-server` defaults `--session-source` to `vscode`. User-facing
 thread listing requests `vscode`, `appServer`, and `subAgentReview` with
@@ -428,13 +431,16 @@ thread listing requests `vscode`, `appServer`, and `subAgentReview` with
 another session-file scan after initialization. Each bridge therefore reads the
 index snapshot built for its current App Server generation. Threads created,
 resumed, archived, or unarchived by a sibling bridge appear after this child
-reconnects or restarts.
+reconnects or restarts. App Server also returns an empty state-only page when
+its private state database is unavailable, so an empty `codex-thread-list`
+result does not prove the durable history is empty. The wrapper does not rescan
+session files in that case; restart the bridge to build a fresh private index.
 
 | Setting | Default | Environment |
 | --- | --- | --- |
 | `--codex-state-root <path>` | XDG state path above | `MCP_AGENTS_CODEX_STATE_ROOT` |
 | `--codex-session-retention-days <days>` | `30` for eligible `appServer` / `subAgentReview` sessions; `0` disables expiry | `MCP_AGENTS_CODEX_SESSION_RETENTION_DAYS` |
-| App Server initialization | `300000` ms; `0` clamps to `1` ms | `MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS` |
+| App Server initialization | `300000` ms; blank uses the default; invalid warns and uses the default; `0` clamps to `1` ms | `MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS` |
 | `--model <model>` | `gpt-6-astra` | — |
 | `--model_reasoning_effort <effort>` | `xhigh` | — |
 | `--codex-workspace-network=true\|false` | `true` | `MCP_AGENTS_CODEX_WORKSPACE_NETWORK_ACCESS` |
