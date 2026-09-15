@@ -296,7 +296,7 @@ test_cli_flag "--help shows workspace network default" "--help" "--codex-workspa
 test_cli_flag "--help shows codex_idle_timeout" "--help" "codex_idle_timeout"
 test_cli_flag "--help shows codex_status_interval default" "--help" "codex_status_interval"
 test_cli_flag "--help shows durable Codex state root" "--help" "--codex-state-root"
-test_cli_flag "--help shows 30-day Codex session retention" "--help" "--codex-session-retention-days"
+test_cli_flag "--help explains Codex retention scope" "--help" "ordinary vscode sessions are retained"
 test_cli_flag "--help shows goal flag"      "--help"    "Native durable goal"
 test_cli_flag "--help shows browser provider" "--help" "browser_lease_command"
 test_cli_flag "--help shows browser downstream fallback" "--help" "npx chrome-devtools-mcp@latest"
@@ -1593,10 +1593,14 @@ const thread = (id = "thread-1", turns = []) => ({
   preview: "stub preview",
   projectId: null,
   sessionId: `session-${id}`,
-  source: "appServer",
+  source: "vscode",
   status: { type: active?.threadId === id ? "active" : "idle", ...(active?.threadId === id ? { activeFlags: [] } : {}) },
   turns,
 });
+const filterThreadSources = (threads, sourceKinds) =>
+  Array.isArray(sourceKinds)
+    ? threads.filter((candidate) => sourceKinds.includes(candidate.source))
+    : threads;
 const turn = (id, status = "inProgress", items = []) => ({
   id,
   status,
@@ -1614,6 +1618,12 @@ const send = (value, callback) => {
 };
 const respond = (id, result) => send({ id, result });
 const notify = (method, params) => send({ method, params });
+const completeInitialize = (id) => respond(id, {
+  userAgent: "codex-app-stub/0.149.1",
+  codexHome: process.env.CODEX_HOME,
+  platformFamily: "unix",
+  platformOs: process.platform,
+});
 
 function completeActive(text = "APP_SERVER_OK", status = "completed") {
   if (!active) return;
@@ -1837,12 +1847,8 @@ function onMessage(message) {
         send({ id: message.id, error: { code: -32001, message: "init rejected" } });
         break;
       }
-      respond(message.id, {
-        userAgent: "codex-app-stub/0.149.1",
-        codexHome: process.env.CODEX_HOME,
-        platformFamily: "unix",
-        platformOs: process.platform,
-      });
+      if (mode === "slow-initialize") setTimeout(() => completeInitialize(message.id), 10_500);
+      else completeInitialize(message.id);
       break;
     case "initialized":
       break;
@@ -1945,9 +1951,17 @@ function onMessage(message) {
     case "thread/list":
       if (mode === "retention-newer" && !deletedThreads.has("thread-expired")) {
         respond(message.id, {
-          data: [
+          data: filterThreadSources([
             {
               ...thread("thread-expired"),
+              createdAt: 1,
+              updatedAt: 1,
+              recencyAt: 1,
+              source: "appServer",
+              status: { type: "idle" },
+            },
+            {
+              ...thread("thread-vscode-expired"),
               createdAt: 1,
               updatedAt: 1,
               recencyAt: 1,
@@ -1956,15 +1970,22 @@ function onMessage(message) {
             {
               ...thread("thread-fresh"),
               recencyAt: now(),
+              source: "appServer",
               status: { type: "idle" },
             },
-          ],
+          ], message.params.sourceKinds),
           nextCursor: null,
         });
       } else if (mode === "retention-journal") {
         respond(message.id, { data: [], nextCursor: null });
       } else {
-        respond(message.id, { data: [thread("thread-listed")], nextCursor: null });
+        respond(message.id, {
+          data: filterThreadSources(
+            [thread("thread-listed")],
+            message.params.sourceKinds,
+          ),
+          nextCursor: null,
+        });
       }
       break;
     case "thread/read":
@@ -2085,7 +2106,7 @@ const child = spawn("node", ["server.js", "--provider", "codex", ...rawServerArg
       ? "codex-cli 0.150.0"
       : "codex-cli 0.149.1",
     ...(["init-timeout-first", "init-reject-first"].includes(scenario)
-      ? { MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS: "100" }
+      ? { MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS: "750" }
       : {}),
     ...(["turn-start-withheld", "archive-withheld"].includes(scenario)
       ? { MCP_AGENTS_CODEX_APP_MUTATION_TIMEOUT_MS: "120" }
@@ -2120,12 +2141,13 @@ child.stderr.setEncoding("utf8");
 child.stderr.on("data", (chunk) => { stderr += chunk; });
 
 const write = (value) => child.stdin.write(`${JSON.stringify(value)}\n`);
+const requestTimeoutMs = scenario === "slow-initialize" ? 13_000 : 3_500;
 const request = (method, params = {}) => new Promise((resolve, reject) => {
   const id = nextId++;
   const timer = setTimeout(() => {
     pending.delete(id);
     reject(new Error(`timeout waiting for ${method} (${id})`));
-  }, 3500);
+  }, requestTimeoutMs);
   pending.set(id, { resolve, reject, timer, method });
   write({ jsonrpc: "2.0", id, method, params });
 });
@@ -2246,7 +2268,10 @@ try {
     await mcpInitialize();
     const callId = nextId;
     const open = call("codex", initialArgs("cancel me")).catch((error) => ({ driverError: error.message }));
-    await sleep(100);
+    if (!await waitFor(() => fs.existsSync(`${stubDir}/app-stdin.jsonl`) &&
+      fs.readFileSync(`${stubDir}/app-stdin.jsonl`, "utf8").includes('"method":"turn/start"'))) {
+      throw new Error("turn/start was not captured before cancellation");
+    }
     notify("notifications/cancelled", { requestId: callId, reason: "test" });
     await sleep(150);
     data.canceled = await Promise.race([open, sleep(250).then(() => null)]);
@@ -2277,8 +2302,10 @@ try {
     await mcpInitialize();
     const callId = nextId;
     void call("codex", initialArgs("cancel during setup"));
-    await waitFor(() => fs.existsSync(`${stubDir}/app-stdin.jsonl`) &&
-      fs.readFileSync(`${stubDir}/app-stdin.jsonl`, "utf8").includes('"method":"thread/start"'));
+    if (!await waitFor(() => fs.existsSync(`${stubDir}/app-stdin.jsonl`) &&
+      fs.readFileSync(`${stubDir}/app-stdin.jsonl`, "utf8").includes('"method":"thread/start"'))) {
+      throw new Error("thread/start was not captured before cancellation");
+    }
     const canceledAt = Date.now();
     notify("notifications/cancelled", { requestId: callId, reason: "cancel setup" });
     data.sibling = await request("ping");
@@ -2429,8 +2456,10 @@ try {
   } else if (scenario === "turn-start-delayed") {
     await mcpInitialize();
     const open = call("codex", initialArgs("delayed start"));
-    await waitFor(() => fs.existsSync(`${stubDir}/app-stdin.jsonl`) &&
-      fs.readFileSync(`${stubDir}/app-stdin.jsonl`, "utf8").includes('"method":"turn/start"'));
+    if (!await waitFor(() => fs.existsSync(`${stubDir}/app-stdin.jsonl`) &&
+      fs.readFileSync(`${stubDir}/app-stdin.jsonl`, "utf8").includes('"method":"turn/start"'))) {
+      throw new Error("delayed turn/start was not captured");
+    }
     data.peek = await call("codex-peek", { threadId: "thread-1" });
     data.sidecarsWhileStarting = readSidecars();
     data.call = await open;
@@ -2443,7 +2472,9 @@ try {
     await mcpInitialize();
     const slot = process.env.MCP_STUB_RACE_SLOT || String(process.pid);
     fs.writeFileSync(`${stubDir}/race-ready-${slot}`, "ready\n");
-    await waitFor(() => fs.existsSync(process.env.MCP_STUB_START_GATE), 3000);
+    if (!await waitFor(() => fs.existsSync(process.env.MCP_STUB_START_GATE), 3000)) {
+      throw new Error("stale-lease race gate did not open");
+    }
     data.started = await call("codex-reply-start", {
       threadId: "thread-stale",
       prompt: "take stale lease",
@@ -2510,7 +2541,7 @@ EOF
 
 test_codex_app_case() {
   local label="$1" scenario="$2" predicate="$3" server_args="${4:-}"
-  local tmpdir status summary ok
+  local command_timeout="${5:-9}" tmpdir status summary ok
   echo "--- $label ---"
   tmpdir=$(mktemp -d)
   mkdir -p "$tmpdir/real-codex-home" "$tmpdir/state" "$tmpdir/workspace"
@@ -2519,7 +2550,7 @@ test_codex_app_case() {
   write_codex_app_server_stub "$tmpdir"
   write_codex_app_server_driver "$tmpdir"
   set +e
-  summary=$($TIMEOUT_CMD 9 node "$tmpdir/app-driver.mjs" \
+  summary=$($TIMEOUT_CMD "$command_timeout" node "$tmpdir/app-driver.mjs" \
     "$tmpdir" "$(pwd)" "$scenario" "$server_args" 2>/dev/null)
   status=$?
   set -e
@@ -2563,6 +2594,7 @@ test_codex_app_bridge_restart() {
   printf '%s\n%s\n' "$first" "$second" | jq -s -e '
     (.[0].driverError == null) and (.[1].driverError == null) and
     (.[0].closeInfo.code == 0) and (.[1].closeInfo.code == 0) and
+    (.[0].data.call.result.structuredContent.threadId == "thread-1") and
     (.[1].data.reply.result.structuredContent.threadId == "thread-1") and
     (.[1].appSpawns | length == 2) and
     (.[1].appSpawns[0].codexHome != .[1].appSpawns[1].codexHome) and
@@ -4112,6 +4144,11 @@ test_codex_app_case "An initialize timeout discards its generation before retry"
   "init-timeout-first" \
   '(.data.first.result.isError == true) and
    (.data.first.result.structuredContent.code == "codex_app_server_unavailable") and
+   (.data.first.result.structuredContent.message |
+      contains("private thread index")) and
+   (.data.first.result.structuredContent.message |
+      contains("MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS")) and
+   (.stderr | contains("MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS")) and
    (.data.second.result.content[0].text == "APP_SERVER_OK") and
    (.appSpawns | length == 2) and
    ([.appRequests[] | select(.method == "initialize")] | length == 2) and
@@ -4125,6 +4162,14 @@ test_codex_app_case "An initialize rejection discards its generation before retr
    (.appSpawns | length == 2) and
    ([.appRequests[] | select(.method == "initialize")] | length == 2) and
    ([.appRequests[] | select(.method == "thread/start")] | length == 1)'
+
+test_codex_app_case "The default init budget exceeds the former 10-second limit" \
+  "slow-initialize" \
+  '(.data.call.result.content[0].text == "APP_SERVER_OK") and
+   (.appSpawns | length == 1) and
+   ([.appRequests[] | select(.method == "initialize")] | length == 1) and
+   ([.appRequests[] | select(.method == "thread/start")] | length == 1)' \
+  "" "25"
 
 test_codex_app_case "Codex tools expose closed curated App Server contracts" \
   "schema" \
@@ -4415,8 +4460,9 @@ test_codex_app_case "Thread tools map to stable history and lifecycle methods" \
   "threads" \
   '([.appRequests[] | select(.method == "thread/list")][0].params |
       (.cwd | endswith("/workspace")) and (.limit == 10) and
-      (.archived == false) and (.useStateDbOnly == false) and
-      (.sourceKinds == ["appServer","subAgentReview"])) and
+      (.archived == false) and (.useStateDbOnly == true) and
+      (.sourceKinds == ["vscode","appServer","subAgentReview"])) and
+   (.data.list.result.structuredContent.threads[0].id == "thread-listed") and
    ([.appRequests[] | select(.method == "thread/read")][0].params.includeTurns == true) and
    ([.appRequests[] | select(.method == "thread/fork")][0].params.lastTurnId == "turn-read") and
    ([.appRequests[].method | select(. == "thread/archive")] | length == 1) and
@@ -4532,12 +4578,19 @@ test_codex_app_stale_lease_race \
 test_codex_app_case "Retention clears goals on a newer Codex version" \
   "retention-newer" \
   '(.appSpawns[0].storage.goals.symlink == true) and
+   ([.appRequests[] | select(.method == "thread/list" and .params.limit == 100)][0].params |
+      (.useStateDbOnly == false) and
+      (.sourceKinds == ["appServer","subAgentReview"])) and
    ([.appRequests[] | select(.method == "thread/delete" and
       .params.threadId == "thread-expired")] | length == 1) and
    ([.appRequests[] | select(.method == "thread/delete" and
       .params.threadId == "thread-fresh")] | length == 0) and
+   ([.appRequests[] | select(.method == "thread/delete" and
+      .params.threadId == "thread-vscode-expired")] | length == 0) and
    ([.appRequests[] | select(.method == "thread/goal/clear" and
-      .params.threadId == "thread-expired")] | length == 1)' \
+      .params.threadId == "thread-expired")] | length == 1) and
+   ([.appRequests[] | select(.method == "thread/goal/clear" and
+      .params.threadId == "thread-vscode-expired")] | length == 0)' \
   "--codex-session-retention-days 1"
 
 test_codex_app_case "Retention journal recovery clears a native missing thread" \

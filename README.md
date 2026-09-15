@@ -414,10 +414,27 @@ metadata, and content-free bridge sidecars. General App Server SQLite state,
 logs, config, cache, and auth snapshots remain in private per-generation homes
 and are removed after the child exits.
 
-| CLI flag | Default | Environment |
+App Server initialization gets a 300,000-millisecond budget by default so a
+generation can build its private thread index from a large durable session
+history. `MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS` is measured in milliseconds;
+zero clamps to one millisecond and does not disable the timeout. Initialization
+must succeed before retention starts. If indexing exceeds the budget, raise the
+environment value. The first App-backed Codex tool call's hard deadline includes
+this lazy initialization and setup time.
+
+Bare `codex app-server` defaults `--session-source` to `vscode`. User-facing
+thread listing requests `vscode`, `appServer`, and `subAgentReview` with
+`useStateDbOnly`, preserving explicitly MCP-labelled sessions while avoiding
+another session-file scan after initialization. Each bridge therefore reads the
+index snapshot built for its current App Server generation. Threads created,
+resumed, archived, or unarchived by a sibling bridge appear after this child
+reconnects or restarts.
+
+| Setting | Default | Environment |
 | --- | --- | --- |
 | `--codex-state-root <path>` | XDG state path above | `MCP_AGENTS_CODEX_STATE_ROOT` |
-| `--codex-session-retention-days <days>` | `30`; `0` disables expiry | `MCP_AGENTS_CODEX_SESSION_RETENTION_DAYS` |
+| `--codex-session-retention-days <days>` | `30` for eligible `appServer` / `subAgentReview` sessions; `0` disables expiry | `MCP_AGENTS_CODEX_SESSION_RETENTION_DAYS` |
+| App Server initialization | `300000` ms; `0` clamps to `1` ms | `MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS` |
 | `--model <model>` | `gpt-6-astra` | — |
 | `--model_reasoning_effort <effort>` | `xhigh` | — |
 | `--codex-workspace-network=true\|false` | `true` | `MCP_AGENTS_CODEX_WORKSPACE_NETWORK_ACCESS` |
@@ -428,8 +445,11 @@ and are removed after the child exits.
 A custom state root must be absolute and outside the served workspace.
 Directories use mode `0700`, files use `0600`, and the process sets umask `0077`
 before creating credential-bearing or durable state. Retention runs at startup
-and daily, skips live or uncertain ownership, and removes only inactive thread
-state older than the configured window.
+and daily, skips live or uncertain ownership, and removes only eligible inactive
+thread state older than the configured window. Retention keeps its existing
+`appServer` and `subAgentReview` source scope; ordinary `vscode` wrapper threads
+remain ineligible because native deletion can also remove spawned descendants
+and reverted history.
 
 Multiple bridge processes may share the project store, but wrapper operations
 take a per-thread lease and Codex keeps its native writer lock. A live or
@@ -444,12 +464,12 @@ native request IDs. The lifecycle distinguishes `starting`, `active`,
 
 Native goals use App Server's thread goal methods rather than prompt
 conditioning. Goal status, token budget, usage, and elapsed time survive bridge
-restarts. On POSIX, `mcp-agents` shares Codex's current `goals_1.sqlite`,
-`goals_1.sqlite-wal`, and `goals_1.sqlite-shm` layout between isolated App
-Server generations. This compatibility assumption is documented rather than
-patch-version-gated; if Codex changes the layout, `mcp-agents` must be updated
-to preserve goals across bridge restarts. Durable native goals are currently
-unsupported on Windows.
+restarts. On POSIX, `mcp-agents` shares only Codex's current `goals_1.sqlite`,
+`goals_1.sqlite-wal`, and `goals_1.sqlite-shm` files between otherwise isolated
+App Server SQLite homes. This compatibility assumption is documented rather
+than patch-version-gated; if Codex changes the layout, `mcp-agents` must be
+updated to preserve goals across bridge restarts. Durable native goals are
+currently unsupported on Windows.
 
 </details>
 
@@ -457,9 +477,10 @@ unsupported on Windows.
 <summary>Isolation, approvals, and interactions</summary>
 
 Each App Server generation receives an isolated `CODEX_HOME` and
-`CODEX_SQLITE_HOME`. The bridge copies only authentication and the model cache,
-writes a minimal config, strips external MCP servers and unrelated preferences,
-and selectively mirrors an explicit Fast-mode opt-in.
+`CODEX_SQLITE_HOME`. The bridge links only the durable native goal files into
+the SQLite home, copies authentication and the model cache, writes a minimal
+config, strips external MCP servers and unrelated preferences, and selectively
+mirrors an explicit Fast-mode opt-in.
 
 Fast mode is inherited only when both of these settings are present in the
 source Codex config:

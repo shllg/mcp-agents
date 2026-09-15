@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.30.1] - 2026-09-15
+
+### Fixed
+
+- Increase the default Codex App Server initialization budget from 10 to 300
+  seconds, so projects with large durable session histories can finish building
+  a generation's private thread index instead of entering a restart loop.
+- Serve user-facing thread listings from the initialized generation's state
+  database without rescanning session files, and include the bare App Server's
+  default source kind (`vscode`) so ordinary wrapper threads appear alongside
+  explicit `appServer` and `subAgentReview` sessions.
+- Keep retention on its existing source scope so the corrected `vscode`
+  discovery does not make ordinary wrapper threads newly eligible for native
+  deletion, which can also remove spawned descendants and reverted history.
+
 ## [0.30.0] - 2026-09-07
 
 ### Changed

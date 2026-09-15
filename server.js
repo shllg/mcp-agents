@@ -63,7 +63,9 @@ const CODEX_WORKSPACE_NETWORK_ACCESS_ENV =
 const CODEX_STATE_ROOT_ENV = "MCP_AGENTS_CODEX_STATE_ROOT";
 const CODEX_SESSION_RETENTION_DAYS_ENV =
   "MCP_AGENTS_CODEX_SESSION_RETENTION_DAYS";
+const CODEX_APP_INIT_TIMEOUT_ENV = "MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS";
 const DEFAULT_CODEX_SESSION_RETENTION_DAYS = 30;
+const DEFAULT_CODEX_APP_INIT_TIMEOUT_MS = 300_000;
 const MINIMUM_CODEX_VERSION = "0.149.1";
 const CODEX_INTERACTION_TIMEOUT_MS = 10 * 60 * 1_000;
 const DEFAULT_CODEX_IDLE_TIMEOUT_MS = 600_000;
@@ -515,8 +517,9 @@ Options:
                                  durable Codex state (codex only)
                                  [env: ${CODEX_STATE_ROOT_ENV}]
   --codex-session-retention-days <days>
-                                 Retain resumable Codex sessions for this many
-                                 days (codex only); 0 disables expiry
+                                 Expire eligible App Server/review sessions
+                                 after this many days (codex only); ordinary
+                                 vscode sessions are retained; 0 disables expiry
                                  [default: ${DEFAULT_CODEX_SESSION_RETENTION_DAYS};
                                  env: ${CODEX_SESSION_RETENTION_DAYS_ENV}]
   --browser_lease_command <cmd>  Required browser lease helper command or JSON
@@ -5627,8 +5630,8 @@ async function runCodexAppServer({
     MAX_CODEX_COMMENTARY_BYTES,
   );
   const appInitTimeoutMs = testTunableMs(
-    "MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS",
-    10_000,
+    CODEX_APP_INIT_TIMEOUT_ENV,
+    DEFAULT_CODEX_APP_INIT_TIMEOUT_MS,
   );
   const appMutationTimeoutMs = testTunableMs(
     "MCP_AGENTS_CODEX_APP_MUTATION_TIMEOUT_MS",
@@ -7507,9 +7510,16 @@ async function runCodexAppServer({
     } catch (err) {
       killChildGroup(child);
       onGenerationGone(generationState, "failed during initialization");
+      const detail = boundedText(err?.message, 1_000);
+      const message = err?.codexCode === "codex_app_server_timeout"
+        ? `Codex App Server initialization timed out while building its private ` +
+          `thread index: ${detail}. Increase ${CODEX_APP_INIT_TIMEOUT_ENV} ` +
+          "(milliseconds) or prune old durable sessions before retrying"
+        : `Codex App Server initialization failed: ${detail}`;
+      logErr(`[mcp-agents] ${message}`);
       throw appError(
         "codex_app_server_unavailable",
-        `Codex App Server initialization failed: ${boundedText(err?.message, 1_000)}`,
+        message,
       );
     }
     logErr(
@@ -8433,8 +8443,8 @@ async function runCodexAppServer({
           limit: args.limit ?? 20,
           ...(args.cwd ? { cwd: args.cwd } : {}),
           archived: args.archived ?? false,
-          sourceKinds: ["appServer", "subAgentReview"],
-          useStateDbOnly: false,
+          sourceKinds: ["vscode", "appServer", "subAgentReview"],
+          useStateDbOnly: true,
         });
         const threads = (result?.data ?? []).map((thread) => sanitizeThread(thread));
         return toolResult(JSON.stringify(threads), {
