@@ -661,6 +661,7 @@ session files in that case; restart the bridge to build a fresh private index.
 | `--codex-state-root <path>` | XDG state path above | `MCP_AGENTS_CODEX_STATE_ROOT` |
 | `--codex-session-retention-days <days>` | `30` for eligible `appServer` / `subAgentReview` sessions; `0` disables expiry | `MCP_AGENTS_CODEX_SESSION_RETENTION_DAYS` |
 | App Server initialization | `300000` ms; blank uses the default; invalid warns and uses the default; `0` clamps to `1` ms | `MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS` |
+| Progress detail | `detailed`; `minimal` keeps content-free command and file-change wording; blank uses the default; invalid warns and uses the default | `MCP_AGENTS_CODEX_PROGRESS` |
 | `--model <model>` | `gpt-6-astra` | — |
 | `--model_reasoning_effort <effort>` | `xhigh` | — |
 | `--codex-workspace-network=true\|false` | `true` | `MCP_AGENTS_CODEX_WORKSPACE_NETWORK_ACCESS` |
@@ -780,9 +781,25 @@ longer question sequences.
 <summary>Progress, cancellation, and jobs</summary>
 
 Blocking calls remain the preferred path, including for long builds. When the
-caller supplies an MCP progress token, the adapter sends throttled,
-privacy-safe status without exposing prompts, final-answer drafts, command
-strings or output, paths, tool arguments, or hidden reasoning.
+caller supplies an MCP progress token, the adapter sends a throttled status
+line, at most once per second, that reads like the Codex TUI:
+
+```text
+Codex: Checking the claim race · search grant_epoch in app/models [14 cmds, 2 files edited]
+```
+
+The line keeps Codex's latest commentary sentence or reasoning-summary headline,
+the current action, and running tallies. Reads, searches, and listings show the
+file name, path, or query exactly as Codex typed it, so a searched-for literal
+appears verbatim. File edits show file names. Other commands show only their
+program, plus one subcommand word for known tools (`git diff`), and the script
+or tool that `exec` / `run` starts (`bundle exec rspec`, `npm run test`). The
+line never carries prompts, final-answer drafts, raw reasoning, command output,
+diffs, MCP tool arguments, flags, or other command arguments. A background
+job's status message is the same line, so `codex-status` returns it to the
+polling caller. Set
+`MCP_AGENTS_CODEX_PROGRESS=minimal` to drop reasoning headlines and show every
+command and file change only as `running command` or `applying file changes`.
 
 Background jobs remain connection-local. At most eight are active and 32 are
 retained for one hour; commentary and final results are read in bounded pages.

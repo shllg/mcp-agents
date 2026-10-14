@@ -77,6 +77,7 @@ const CODEX_STATE_ROOT_ENV = "MCP_AGENTS_CODEX_STATE_ROOT";
 const CODEX_SESSION_RETENTION_DAYS_ENV =
   "MCP_AGENTS_CODEX_SESSION_RETENTION_DAYS";
 const CODEX_APP_INIT_TIMEOUT_ENV = "MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS";
+const CODEX_PROGRESS_DETAIL_ENV = "MCP_AGENTS_CODEX_PROGRESS";
 const DEFAULT_CODEX_SESSION_RETENTION_DAYS = 30;
 const DEFAULT_CODEX_APP_INIT_TIMEOUT_MS = 300_000;
 const DEFAULT_HTTP_PORT = 8_765;
@@ -388,6 +389,19 @@ const resolveCodexAppInitTimeoutMs = () => {
       `using the ${DEFAULT_CODEX_APP_INIT_TIMEOUT_MS}ms default`,
   );
   return DEFAULT_CODEX_APP_INIT_TIMEOUT_MS;
+};
+
+// `detailed` names what Codex reads, searches, edits and runs; `minimal` keeps
+// the older content-free vocabulary for every command and file change.
+const resolveCodexProgressDetail = () => {
+  const value = process.env[CODEX_PROGRESS_DETAIL_ENV]?.trim() ?? "";
+  if (value === "" || value === "detailed") return "detailed";
+  if (value === "minimal") return "minimal";
+  logErr(
+    `[mcp-agents] WARNING: invalid ${CODEX_PROGRESS_DETAIL_ENV}; ` +
+      "expected detailed or minimal; using detailed",
+  );
+  return "detailed";
 };
 
 const testTunablePositiveInteger = (name, fallback) => {
@@ -6387,6 +6401,7 @@ async function createCodexRuntime({
     MAX_CODEX_COMMENTARY_BYTES,
   );
   const appInitTimeoutMs = resolveCodexAppInitTimeoutMs();
+  const progressDetail = resolveCodexProgressDetail();
   const appMutationTimeoutMs = testTunableMs(
     "MCP_AGENTS_CODEX_APP_MUTATION_TIMEOUT_MS",
     60_000,
@@ -7374,25 +7389,189 @@ async function createCodexRuntime({
     }
   };
 
+  const clipText = (value, max) => {
+    const points = Array.from(boundedText(value, max + 1));
+    return points.length > max ? `${points.slice(0, max - 1).join("")}…` : points.join("");
+  };
+  const baseName = (path) =>
+    typeof path === "string" ? path.split(/[\\/]/u).filter(Boolean).at(-1) ?? "" : "";
+  const listNames = (names) => {
+    const unique = [...new Set(names.filter(Boolean))];
+    const shown = unique.slice(0, 3).map((name) => clipText(name, 40)).join(", ");
+    return unique.length > 3 ? `${shown} +${unique.length - 3} more` : shown;
+  };
+  // Splits shell text into simple commands of words, honoring quotes and
+  // escapes so a quoted value never breaks into words of its own.
+  const shellCommands = (text) => {
+    const commands = [[]];
+    let word;
+    let quote;
+    const endWord = () => {
+      if (word !== undefined) commands.at(-1).push(word);
+      word = undefined;
+    };
+    for (let index = 0; index < text.length; index += 1) {
+      const char = text[index];
+      if (quote) {
+        if (char === quote) quote = undefined;
+        else if (char === "\\" && quote === "\"" && index + 1 < text.length) word += text[++index];
+        else word += char;
+      } else if (char === "'" || char === "\"") {
+        quote = char;
+        word ??= "";
+      } else if (char === "\\" && index + 1 < text.length) {
+        word = (word ?? "") + text[++index];
+      } else if (";|&\n".includes(char)) {
+        endWord();
+        if (commands.at(-1).length) commands.push([]);
+      } else if (/\s/u.test(char)) {
+        endWord();
+      } else {
+        word = (word ?? "") + char;
+      }
+    }
+    endWord();
+    return commands.filter((words) => words.length);
+  };
+  // A command collapses to its program, plus one plain subcommand word for
+  // tools known to take one (`git diff`); `exec` / `run` also name what they
+  // start (`bundle exec rspec`, `npm run test`). Other arguments, flags, and
+  // environment assignments, where secrets live, never reach the progress
+  // line: `echo hunter2` shows as `echo`, `git grep hunter2` as `git grep`.
+  const SUBCOMMAND_PROGRAMS = new Set([
+    "aws", "brew", "bun", "bundle", "cargo", "copilot", "docker", "gh", "git", "go",
+    "kubectl", "make", "mise", "npm", "npx", "pnpm", "rails", "rake", "swift", "uv", "yarn",
+  ]);
+  const summarizeShellCommand = (value) => {
+    const text = Array.isArray(value) ? value.at(-1) : value;
+    if (typeof text !== "string") return "a command";
+    const plain = (word) => typeof word === "string" && /^[a-z][a-z0-9:_-]{0,23}$/u.test(word);
+    for (const words of shellCommands(text)) {
+      while (/^[A-Za-z_]\w*=/u.test(words[0] ?? "")) words.shift();
+      if (!words.length || ["cd", "export", "set"].includes(words[0])) continue;
+      const program = baseName(words[0]);
+      if (["bash", "sh", "zsh"].includes(program) && /^-\w*c$/u.test(words[1] ?? "")) {
+        return summarizeShellCommand(words[2]);
+      }
+      if (!/^[A-Za-z0-9][\w.+-]{0,31}$/u.test(program)) return "a command";
+      const shown = [program];
+      if (SUBCOMMAND_PROGRAMS.has(program) && plain(words[1])) {
+        shown.push(words[1]);
+        if (["exec", "run"].includes(words[1]) && plain(words[2])) shown.push(words[2]);
+      }
+      return shown.join(" ");
+    }
+    return "a command";
+  };
+  // Codex's own parse of a command: reads, searches, and listings by file name
+  // or query, anything else by its summarized program.
+  const describeCommand = (item) => {
+    const parts = [];
+    for (const action of Array.isArray(item.commandActions) ? item.commandActions : []) {
+      let part;
+      if (action?.type === "read") {
+        part = `read ${clipText(action.name || baseName(action.path), 60) || "a file"}`;
+      } else if (action?.type === "search") {
+        const query = clipText(action.query, 60);
+        const where = clipText(action.path, 60);
+        part = query
+          ? `search ${query}${where ? ` in ${where}` : ""}`
+          : `search ${where || "files"}`;
+      } else if (action?.type === "listFiles" || action?.type === "list_files") {
+        part = `list ${clipText(action.path, 60) || "files"}`;
+      } else {
+        part = `ran ${summarizeShellCommand(action?.command)}`;
+      }
+      if (part !== parts.at(-1)) parts.push(part);
+    }
+    if (!parts.length) parts.push(`ran ${summarizeShellCommand(item.command)}`);
+    return parts.length > 3
+      ? `${parts.slice(0, 3).join(", ")} +${parts.length - 3} more`
+      : parts.join(", ");
+  };
+  // Maps an item to a progress update: `headline` is what Codex says it is
+  // doing, `action` what it does right now, `command` / `files` feed the
+  // tallies. An empty update is activity with nothing new to show.
   const resolveTurnProgressMessage = (item, phase = "started") => {
     if (!item || typeof item !== "object") return undefined;
+    const detailed = progressDetail === "detailed";
     switch (item.type) {
       case "commandExecution":
-        return phase === "completed" ? "command finished" : "running command";
-      case "fileChange":
-        return phase === "completed" ? "file changes finished" : "applying file changes";
+        if (phase === "started") {
+          return { command: true, action: detailed ? describeCommand(item) : "running command" };
+        }
+        if (!detailed) return { action: "command finished" };
+        return Number.isInteger(item.exitCode) && item.exitCode !== 0
+          ? { action: `${describeCommand(item)} (exit ${item.exitCode})` }
+          : {};
+      case "fileChange": {
+        const paths = Array.isArray(item.changes)
+          ? item.changes.map((change) => change?.path)
+            .filter((path) => typeof path === "string" && path)
+          : [];
+        const applied = phase === "completed" && (item.status ?? "completed") === "completed";
+        const files = applied ? paths : [];
+        if (!detailed) {
+          return { files, action: phase === "completed" ? "file changes finished" : "applying file changes" };
+        }
+        const names = listNames(paths.map(baseName)) || "files";
+        if (phase === "started") return { action: `editing ${names}` };
+        return { files, action: applied ? `edited ${names}` : `edit ${item.status}: ${names}` };
+      }
+      case "reasoning": {
+        // Only the readable summary Codex streams for display; raw reasoning
+        // `content` never reaches the line.
+        if (!detailed || phase !== "completed" || !Array.isArray(item.summary)) return undefined;
+        const summary = item.summary
+          .map((part) => (typeof part === "string" ? part : part?.text))
+          .filter((part) => typeof part === "string" && part.trim())
+          .at(-1);
+        if (!summary) return undefined;
+        return { headline: /^\s*\*\*(.+?)\*\*/u.exec(summary)?.[1] ?? summary.trim().split("\n")[0] };
+      }
+      case "mcpToolCall":
+        if (!detailed) return undefined;
+        if (phase === "started") return { action: `calling ${clipText(item.server, 30)}.${clipText(item.tool, 40)}` };
+        return item.status === "failed"
+          ? { action: `${clipText(item.server, 30)}.${clipText(item.tool, 40)} failed` }
+          : {};
       case "plan":
-        return boundedText(item.text) || "updated plan";
+        return { headline: boundedText(item.text) || "updated plan" };
       case "collabAgentToolCall":
       case "subAgentActivity":
-        return "native sub-agent activity";
-      case "webSearch":
-        return "searching the web";
+        return { action: "native sub-agent activity" };
+      case "webSearch": {
+        const query = detailed
+          ? clipText(item.query || item.action?.query || item.action?.queries?.[0], 60)
+          : "";
+        if (!query) return { action: "searching the web" };
+        return { action: `${phase === "completed" ? "searched" : "searching"} the web for ${query}` };
+      }
       case "contextCompaction":
-        return "compacting context";
+        return { action: "compacting context" };
       default:
         return undefined;
     }
+  };
+  const renderTurnProgress = (turn, change) => {
+    const view = turn.progressView;
+    // A new headline starts a new step, so the previous step's action goes.
+    if (change.headline) {
+      view.headline = clipText(change.headline, 80);
+      view.action = "";
+    }
+    if (change.action) view.action = clipText(change.action, 80);
+    if (change.command) view.commands += 1;
+    for (const path of change.files ?? []) {
+      if (view.files.size < 10_000) view.files.add(path);
+    }
+    const count = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+    const tallies = [
+      view.commands ? count(view.commands, "cmd", "cmds") : "",
+      view.files.size ? `${count(view.files.size, "file", "files")} edited` : "",
+    ].filter(Boolean).join(", ");
+    const line = [view.headline, view.action].filter(Boolean).join(" · ");
+    return boundedText(tallies ? `${line} [${tallies}]` : line);
   };
   const appendJobCommentary = (job, value) => {
     if (!job || typeof value !== "string" || !value) return;
@@ -7408,7 +7587,11 @@ async function createCodexRuntime({
     job.commentary = points.slice(removed).join("");
     job.commentaryStartOffset += removed;
   };
-  const scheduleProgress = (turn, message, commentary) => {
+  const scheduleProgress = (turn, change, commentary) => {
+    const message = change &&
+        (change.headline || change.action || change.command || change.files?.length)
+      ? renderTurnProgress(turn, change)
+      : undefined;
     turn.updatedAt = new Date().toISOString();
     turn.lastActivityAt = Date.now();
     if (turn.idleTimer && resolvedIdleMs > 0) clearTimeout(turn.idleTimer);
@@ -7575,6 +7758,7 @@ async function createCodexRuntime({
       lastActivityAt: now,
       hardDeadlineAt: deadlineAt ?? now + resolvedHardMs,
       itemPhases: new Map(),
+      progressView: { headline: "", action: "", commands: 0, files: new Set() },
       agentMessages: [],
       finalAnswers: [],
       resolve: resolveTurn,
@@ -7619,7 +7803,7 @@ async function createCodexRuntime({
         `reported_effort=${reasoningEffort.reported ?? "none"}, ` +
         `effort_status=${reasoningEffort.status})`,
     );
-    scheduleProgress(turn, "turn started");
+    scheduleProgress(turn, { action: "turn started" });
     // The call was canceled while turn/start was in flight, but Codex started
     // the turn anyway: stop it now, unless Codex already reported it finished.
     if (cancelRequested &&
@@ -7871,7 +8055,7 @@ async function createCodexRuntime({
     const turn = activeTurns.get(interaction.turnId);
     if (turn && turn.state === "waiting_for_input") {
       turn.state = "active";
-      scheduleProgress(turn, "interaction resolved");
+      scheduleProgress(turn, { action: "interaction resolved" });
     }
     return true;
   };
@@ -8103,7 +8287,7 @@ async function createCodexRuntime({
       interactions.set(interactionId, interaction);
       if (turn) {
         turn.state = "waiting_for_input";
-        scheduleProgress(turn, "waiting for user input");
+        scheduleProgress(turn, { action: "waiting for user input" });
       }
       if (interaction.foreground) revealForegroundInteraction(turn, interaction);
       return;
@@ -8175,7 +8359,7 @@ async function createCodexRuntime({
       interactions.set(interactionId, interaction);
       if (turn) {
         turn.state = "waiting_for_input";
-        scheduleProgress(turn, "waiting for approval");
+        scheduleProgress(turn, { action: "waiting for approval" });
       }
       if (interaction.foreground) revealForegroundInteraction(turn, interaction);
       return;
@@ -8218,7 +8402,7 @@ async function createCodexRuntime({
       } else if (turn && params.willRetry !== true) {
         turn.reject(appError("codex_turn_failed", message));
       } else if (turn) {
-        scheduleProgress(turn, boundedText(message));
+        scheduleProgress(turn, { action: message });
       }
       return;
     }
@@ -8251,7 +8435,14 @@ async function createCodexRuntime({
     if (method === "item/agentMessage/delta") {
       const phase = turn.itemPhases.get(params.itemId);
       if (phase === "commentary") {
-        scheduleProgress(turn, boundedText(params.delta), params.delta);
+        // Show the sentence as it grows, once it says more than a word or two,
+        // not just its latest fragment.
+        if (turn.commentaryDraft?.itemId !== params.itemId) {
+          turn.commentaryDraft = { itemId: params.itemId, text: "" };
+        }
+        const draft = turn.commentaryDraft;
+        if (typeof params.delta === "string" && draft.text.length < 400) draft.text += params.delta;
+        scheduleProgress(turn, draft.text.length >= 24 ? { headline: draft.text } : {}, params.delta);
       } else {
         scheduleProgress(turn);
       }
@@ -8268,7 +8459,8 @@ async function createCodexRuntime({
         // A later answer replaces one dropped over the frame cap.
         if (item.phase !== "commentary") turn.answerDropped = false;
         if (item.phase === "commentary") {
-          scheduleProgress(turn, boundedText(item.text), `${item.text}\n\n`);
+          turn.commentaryDraft = undefined;
+          scheduleProgress(turn, { headline: item.text }, `${item.text}\n\n`);
         }
       } else {
         const progress = resolveTurnProgressMessage(item, "completed");
@@ -8277,7 +8469,7 @@ async function createCodexRuntime({
       return;
     }
     if (method === "turn/started" || method === "thread/status/changed") {
-      scheduleProgress(turn, method === "turn/started" ? "turn active" : "thread status changed");
+      scheduleProgress(turn, method === "turn/started" ? { action: "turn active" } : {});
     }
   };
 
@@ -9964,7 +10156,7 @@ async function createCodexRuntime({
             writeBridgeState();
           },
         });
-        scheduleProgress(turn, "additional input accepted");
+        scheduleProgress(turn, { action: "additional input accepted" });
         return toolResult("Codex accepted the additional input.", {
           threadId: args.threadId,
           turnId: turn.turnId,

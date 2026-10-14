@@ -3059,6 +3059,53 @@ function startTurn(message, review = false, responseExtra = {}) {
       return;
     }
     if (mode === "noise") process.stdout.write("codex diagnostic on stdout\n");
+    if (mode === "progress-items") {
+      const item = (method, value) => notify(method, { threadId, turnId, item: value });
+      item("item/completed", {
+        type: "reasoning",
+        id: "reasoning-1",
+        summary: ["**Inspecting the claim race**\n\nSUMMARY_BODY"],
+        content: ["RAW_REASONING_SECRET"],
+      });
+      const command = (id, commandActions) => {
+        const value = {
+          type: "commandExecution",
+          id,
+          command: "/bin/zsh -lc 'COMMAND_STRING_SECRET'",
+          cwd: workspace,
+          status: "inProgress",
+          commandActions,
+        };
+        item("item/started", value);
+        item("item/completed", { ...value, status: "completed", exitCode: 0 });
+      };
+      command("command-read", [{
+        type: "read", command: "cat app/models/a.rb", name: "a.rb", path: "app/models/a.rb",
+      }]);
+      command("command-curl", [{
+        type: "unknown",
+        command: "TOKEN=ENV_SECRET PASSWORD='first hunter2 last' " +
+          "curl -H 'Authorization: Bearer BEARER_SECRET' https://x",
+      }]);
+      command("command-git", [{ type: "unknown", command: "git grep hunter2 && git diff ARG_SECRET" }]);
+      command("command-echo", [{ type: "unknown", command: "echo hunter2" }]);
+      command("command-rspec", [{ type: "unknown", command: "bundle exec rspec spec/a_spec.rb" }]);
+      const change = {
+        type: "fileChange",
+        id: "change-1",
+        changes: [{ path: `${workspace}/app/b.rb`, kind: { type: "update" }, diff: "DIFF_SECRET" }],
+        status: "inProgress",
+      };
+      item("item/started", change);
+      item("item/completed", { ...change, status: "completed" });
+      item("item/started", { type: "agentMessage", id: "commentary-1", text: "", phase: "commentary" });
+      for (const delta of ["Checking the ", "cursor claim path"]) {
+        notify("item/agentMessage/delta", { threadId, turnId, itemId: "commentary-1", delta });
+      }
+      item("item/completed", {
+        type: "agentMessage", id: "commentary-1", text: "Checking the cursor claim path", phase: "commentary",
+      });
+    }
     if (mode === "peek-reply" && turnCounter > 1) return;
     // A held start's turn runs until the bridge interrupts it; later turns finish.
     if (turnId === heldTurnId) return;
@@ -3672,6 +3719,8 @@ const stubMode = {
   "init-timeout-overflow": "delayed-initialize",
   "init-timeout-zero": "delayed-initialize",
   "cancel-steer": "steer-held",
+  "progress-detailed": "progress-items",
+  "progress-minimal": "progress-items",
 }[scenario] ?? (/^cancel-(start|review)-/u.test(scenario) ? "start-held" : null) ??
   (["peek", "job-compat", "job-idle", "busy", "idle", "cancel", "steer", "hold"].includes(scenario)
   ? "park"
@@ -3690,6 +3739,12 @@ const child = spawn("node", ["server.js", "--provider", "codex", ...rawServerArg
     MCP_STUB_APP_MODE: stubMode,
     MCP_STUB_APP_WORKSPACE: `${stubDir}/workspace`,
     MCP_STUB_REQUIRE_SESSION: scenario === "restart-reply" ? "1" : "0",
+    ...(scenario.startsWith("progress-")
+      ? {
+          MCP_AGENTS_CODEX_PROGRESS_INTERVAL_MS: "0",
+          MCP_AGENTS_CODEX_PROGRESS: scenario === "progress-minimal" ? "minimal" : "",
+        }
+      : {}),
     MCP_STUB_CODEX_VERSION: [
       "goal-default-newer",
       "retention-newer",
@@ -4554,6 +4609,13 @@ try {
       if (state && state !== "running" && state !== "starting") break;
     }
     data.result = await call("codex-result", { jobId, offset: 0 });
+  } else if (scenario.startsWith("progress-")) {
+    await mcpInitialize();
+    data.call = await request("tools/call", {
+      name: "codex",
+      arguments: initialArgs("hello"),
+      _meta: { progressToken: "codex-progress" },
+    });
   } else {
     await mcpInitialize();
     data.call = await call("codex", initialArgs("hello"));
@@ -8129,6 +8191,38 @@ test_codex_app_case "Completed agent items are authoritative over streamed delta
   '(.data.call.result.content[0].text == "APP_SERVER_OK") and
    (.data.call.result.structuredContent.content == "APP_SERVER_OK") and
    (.data.call.result | tostring | contains("COMMENTARY_ONLY") | not)'
+
+test_codex_app_case "Codex progress names reads, edits, and programs but never arguments" \
+  "progress-detailed" \
+  '(.data.call.result.content[0].text == "APP_SERVER_OK") and
+   ([.frames[] | select(.method == "notifications/progress") | .params] as $progress |
+     ([$progress[].message] | join("\n")) as $all |
+     ($progress | length > 5) and
+     ($progress | all(.progressToken == "codex-progress" and (.message | startswith("Codex: ")))) and
+     ([$progress[].progress] | . == (sort | unique)) and
+     ($all | contains("Inspecting the claim race")) and
+     ($all | contains("read a.rb")) and
+     ($all | contains("ran curl")) and
+     ($all | contains("ran git grep")) and
+     ($all | contains("ran bundle exec rspec")) and
+     ($all | contains("ran echo")) and
+     ($all | contains("hunter2") | not) and
+     ($all | contains("edited b.rb")) and
+     ($all | test("SECRET|SUMMARY_BODY") | not) and
+     ([$progress[].message | select(startswith("Codex: Checking the ") and (contains("claim") | not))] | length == 0) and
+     ([$progress[].message | select(startswith("Codex: cursor claim path"))] | length == 0) and
+     ([$progress[].message | select(. == "Codex: Checking the cursor claim path [5 cmds, 1 file edited]")] | length == 2) and
+     ($progress[-1].message == "Codex: Checking the cursor claim path [5 cmds, 1 file edited]"))'
+
+test_codex_app_case "Minimal Codex progress keeps the content-free command vocabulary" \
+  "progress-minimal" \
+  '(.data.call.result.content[0].text == "APP_SERVER_OK") and
+   ([.frames[] | select(.method == "notifications/progress") | .params.message] |
+     join("\n") as $all |
+     ($all | contains("running command")) and
+     ($all | contains("file changes finished")) and
+     ($all | test("Inspecting|a\\.rb|b\\.rb|curl|git grep|echo|rspec|hunter2|SECRET") | not) and
+     (.[-1] == "Codex: Checking the cursor claim path [5 cmds, 1 file edited]"))'
 
 test_codex_app_case "Bounded diagnostic noise is quarantined to stderr" \
   "noise" \
