@@ -508,6 +508,14 @@ generation against the same durable sessions. A dispatched turn is reported as
 `codex_outcome_unknown` and is never replayed automatically because it may
 already have changed the workspace.
 
+App Server frames are capped at 10 MiB. With Codex 0.151.0 or later the bridge
+asks for metadata only when it resumes or forks a thread, since a long
+thread's full history alone can exceed the cap. A frame over the cap fails only
+what it belongs to: the request it answers, or the turn whose answer it
+carried. Progress-only frames are dropped, and an approval request over the cap
+is refused, which interrupts its turn. Only a frame that cannot be attributed
+safely, or the answer to a dispatched mutation, still restarts the child.
+
 <details>
 <summary>Tool contracts and curated tools</summary>
 
@@ -591,7 +599,18 @@ Review targets are closed objects:
 ```
 
 Delivery is `inline` by default or `detached`. Thread reads and listings are
-bounded to 100 records per call. A listing's `preview` is usually the first user
+bounded to 100 records per call. With Codex 0.151.0 or later,
+`codex-thread-read` pages history through Codex, oldest turn first, with each
+turn's request and final answer, and its `cursor` is opaque. A page too large
+for one result is shrunk; a single turn too large on its own is skipped and
+flagged `historyTruncated`. Legacy-history threads are read in place. Reading a
+paginated thread that no turn is running on loads it briefly under its thread
+lease and releases it again: meanwhile replies, reviews, goal tools, forks, and
+archiving on that thread return `codex_thread_busy`, from the same bridge too,
+and the read returns `codex_thread_busy` while anything else holds the lease.
+An archived paginated thread cannot be loaded; restore it with
+`codex-thread-unarchive` to read its history. Older Codex reads the whole
+history and pages it locally. A listing's `preview` is usually the first user
 message, so treat thread-list output as conversation content. Returned history
 is otherwise sanitized; the bridge does not expose raw App Server frames,
 hidden reasoning, config, arbitrary filesystem operations, or private native

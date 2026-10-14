@@ -2760,6 +2760,16 @@ const captureDir = process.env.MCP_STUB_APP_CAPTURE_DIR;
 const mode = process.env.MCP_STUB_APP_MODE || "normal";
 const workspace = process.env.MCP_STUB_APP_WORKSPACE;
 const spawnFile = `${captureDir}/app-spawns.jsonl`;
+// Like real Codex before 0.151.0, which gates excludeTurns on experimentalApi.
+const stubMinor = Number(/0\.(\d+)\./u.exec(process.env.MCP_STUB_CODEX_VERSION || "")?.[1] ?? 149);
+const excludeTurnsRejected = (message) => {
+  if (stubMinor >= 151 || !Object.hasOwn(message.params ?? {}, "excludeTurns")) return false;
+  send({ id: message.id, error: {
+    code: -32600,
+    message: `${message.method}.excludeTurns requires experimentalApi capability`,
+  } });
+  return true;
+};
 const captureFile = `${captureDir}/app-stdin.jsonl`;
 fs.appendFileSync(process.env.MCP_AGENTS_TEST_CHILD_REGISTRY, `${process.pid}\n`);
 const previousSpawns = fs.existsSync(spawnFile)
@@ -2819,6 +2829,9 @@ let lateResume = null;
 const deletedThreads = new Set();
 const goals = new Map();
 const unsubscribedThreads = new Set();
+// Like real Codex, a paginated thread lists no history until it was resumed.
+const resumedThreads = new Set();
+const archivedThreads = new Set();
 const timelineFile = `${captureDir}/app-timeline.jsonl`;
 const timeline = (dir, method, threadId, turnId) => {
   if (typeof method !== "string") return;
@@ -2833,6 +2846,7 @@ const now = () => Math.floor(Date.now() / 1000);
 const thread = (id = "thread-1", turns = []) => ({
   id,
   cliVersion: "0.149.1",
+  historyMode: id === "thread-legacy" ? "legacy" : "paginated",
   createdAt: now(),
   updatedAt: now(),
   cwd: workspace,
@@ -2953,6 +2967,11 @@ function startTurn(message, review = false, responseExtra = {}) {
   if (mode === "turn-start-withheld") return;
 
   const announce = () => {
+    // An over-cap answer to a dispatched mutation cannot be attributed safely.
+    if (mode === "oversized-start") {
+      respond(message.id, { turn: turn(turnId), padding: "x".repeat(11 * 1024 * 1024) });
+      return;
+    }
     respond(message.id, { turn: turn(turnId), ...responseExtra });
     // Like real Codex, a held turn activates shortly after turn/start is
     // answered and refuses turn/interrupt until then.
@@ -2972,10 +2991,40 @@ function startTurn(message, review = false, responseExtra = {}) {
       process.stdout.write('{"method":"turn/completed","params":BROKEN}\n');
       return;
     }
+    const huge = () => "x".repeat(11 * 1024 * 1024);
     if (mode === "oversized" || mode === "oversized-complete") {
       process.stdout.write(`${JSON.stringify({ method: "item/agentMessage/delta", params: {
-        threadId, turnId, itemId, delta: "x".repeat(11 * 1024 * 1024),
+        threadId, turnId, itemId, delta: huge(),
       } })}\n`);
+      if (mode === "oversized") return;
+    }
+    if (mode === "oversized-answer" || mode === "oversized-answer-recovered") {
+      // Real Codex serializes the item before its routing ids, and its
+      // turn/completed carries no items.
+      process.stdout.write(`${JSON.stringify({ method: "item/completed", params: {
+        item: { type: "agentMessage", id: itemId, phase: "final_answer", text: huge() },
+        threadId,
+        turnId,
+      } })}\n`);
+      if (mode === "oversized-answer-recovered") {
+        notify("item/completed", { threadId, turnId, item: {
+          type: "agentMessage", id: `${itemId}-late`, phase: "final_answer", text: "LATE_OK",
+        } });
+      }
+      active = null;
+      notify("turn/completed", { threadId, turn: turn(turnId, "completed") });
+      return;
+    }
+    if (mode === "oversized-request") {
+      process.stdout.write(`${JSON.stringify({
+        id: "approval-huge",
+        method: "item/commandExecution/requestApproval",
+        params: { threadId, turnId, itemId: "command-huge", command: huge(), cwd: workspace },
+      })}\n`);
+      return;
+    }
+    if (mode === "oversized-unrouted") {
+      process.stdout.write(`${JSON.stringify({ method: "thread/stub/huge", params: { threadId, blob: huge() } })}\n`);
       return;
     }
     if (mode === "auth") {
@@ -3265,6 +3314,14 @@ function onMessage(message) {
       break;
     }
     case "thread/resume":
+      if (excludeTurnsRejected(message)) break;
+      if (archivedThreads.has(message.params.threadId)) {
+        send({ id: message.id, error: {
+          code: -32600,
+          message: `session ${message.params.threadId} is archived. Run \`codex unarchive ${message.params.threadId}\` to unarchive it first.`,
+        } });
+        break;
+      }
       if (mode === "resume-withheld") break;
       if (mode === "goal-set-closed-canceled" &&
           unsubscribedThreads.has(message.params.threadId)) {
@@ -3294,8 +3351,13 @@ function onMessage(message) {
         send({ id: message.id, error: { code: -32000, message: "durable session missing" } });
         break;
       }
+      resumedThreads.add(message.params.threadId);
       respond(message.id, {
-        thread: thread(message.params.threadId),
+        thread: mode === "resume-history-oversized" && !message.params.excludeTurns
+          ? { ...thread(message.params.threadId), turns: [{ id: "turn-old", items: [{
+            type: "agentMessage", id: "item-old", text: "x".repeat(11 * 1024 * 1024),
+          }] }] }
+          : thread(message.params.threadId),
         // Neither value is a wrapper default, so a reply proves the read-back.
         model: "gpt-5.6-terra",
         modelProvider: "openai",
@@ -3484,7 +3546,28 @@ function onMessage(message) {
         { type: "reasoning", id: "reasoning-read", summary: ["SECRET_REASONING"] },
       ])] : []) });
       break;
+    case "thread/turns/list":
+      if (stubMinor < 151) {
+        send({ id: message.id, error: {
+          code: -32600, message: "thread/turns/list requires experimentalApi capability",
+        } });
+        break;
+      }
+      respond(message.id, {
+        // A legacy rollout is replayed on every listing, loaded or not.
+        data: resumedThreads.has(message.params.threadId) ||
+          message.params.threadId === "thread-legacy" ? [turn("turn-read", "completed", [
+            { type: "userMessage", id: "user-read", content: [{ type: "text", text: "ASK_OK" }] },
+            { type: "reasoning", id: "reasoning-read", summary: ["SECRET_REASONING"] },
+            { type: "commandExecution", id: "command-read", command: "SECRET_COMMAND" },
+            { type: "agentMessage", id: "agent-read", phase: "final_answer", text: "READ_OK" },
+          ])] : [],
+        nextCursor: "cursor-next",
+        backwardsCursor: null,
+      });
+      break;
     case "thread/fork":
+      if (excludeTurnsRejected(message)) break;
       respond(message.id, {
         thread: { ...thread("thread-forked"), forkedFromId: message.params.threadId },
         model: "gpt-6-astra",
@@ -3497,9 +3580,11 @@ function onMessage(message) {
       break;
     case "thread/archive":
       if (mode === "archive-withheld") break;
+      archivedThreads.add(message.params.threadId);
       respond(message.id, {});
       break;
     case "thread/unarchive":
+      archivedThreads.delete(message.params.threadId);
       respond(message.id, { thread: thread(message.params.threadId) });
       break;
     case "thread/delete":
@@ -3573,6 +3658,8 @@ const stubMode = {
   "stale-race": "park",
   "cancel-during-thread-start": "thread-start-withheld",
   "resume-canceled": "resume-withheld",
+  "reply-history-oversized": "resume-history-oversized",
+  "reply-history-oversized-old": "resume-history-oversized",
   "thread-start-late-cancel": "thread-start-delayed",
   "thread-start-late-in-grace": "thread-start-delayed",
   "thread-start-late-cancel-subagents": "thread-start-delayed",
@@ -3609,7 +3696,9 @@ const child = spawn("node", ["server.js", "--provider", "codex", ...rawServerArg
       "retention-journal",
     ].includes(scenario)
       ? "codex-cli 0.150.0"
-      : "codex-cli 0.149.1",
+      : ["reply", "reply-history-oversized", "threads", "threads-archived"].includes(scenario)
+        ? "codex-cli 0.151.0"
+        : "codex-cli 0.149.1",
     ...(["init-timeout-first", "init-reject-first"].includes(scenario)
       ? { MCP_AGENTS_CODEX_APP_INIT_TIMEOUT_MS: "750" }
       : {}),
@@ -3845,7 +3934,8 @@ try {
     data.resources = await request("resources/list");
     data.templates = await request("resources/templates/list");
     data.prompts = await request("prompts/list");
-  } else if (scenario === "reply" || scenario === "restart-reply") {
+  } else if (["reply", "restart-reply", "reply-history-oversized",
+    "reply-history-oversized-old"].includes(scenario)) {
     await mcpInitialize();
     data.reply = await call("codex-reply", {
       threadId: scenario === "restart-reply" ? "thread-1" : "thread-resume",
@@ -4347,7 +4437,13 @@ try {
     });
     const jobId = data.started.result?.structuredContent?.jobId;
     data.cancel = await call("codex-cancel", { jobId });
-  } else if (scenario === "threads") {
+  } else if (scenario === "threads-archived") {
+    await mcpInitialize();
+    data.archive = await call("codex-thread-archive", { threadId: "thread-listed" });
+    data.archivedRead = await call("codex-thread-read", { threadId: "thread-listed", includeTurns: true });
+    data.legacyRead = await call("codex-thread-read", { threadId: "thread-legacy", includeTurns: true });
+    data.unarchive = await call("codex-thread-unarchive", { threadId: "thread-listed" });
+  } else if (scenario === "threads" || scenario === "threads-legacy") {
     await mcpInitialize();
     data.list = await call("codex-thread-list", { cwd: `${stubDir}/workspace`, limit: 10, archived: false });
     data.read = await call("codex-thread-read", { threadId: "thread-listed", includeTurns: true, limit: 5 });
@@ -5354,7 +5450,7 @@ test_codex_app_bridge_restart() {
       .[1].appSpawns[1].storage.goals.target) and
     ([.[1].appRequests[] | select(.method == "thread/start")] | length == 1) and
     ([.[1].appRequests[] | select(.method == "thread/resume" and
-      .params.threadId == "thread-1")] | length == 1)
+      .params.threadId == "thread-1" and (.params | has("excludeTurns") | not))] | length == 1)
   ' >/dev/null 2>&1 || ok=0
 
   if [ "$ok" -eq 1 ]; then
@@ -7152,7 +7248,7 @@ test_codex_app_case "Codex initial calls map to thread/start and turn/start" \
    (.appSpawns[0].argv[0:2] == ["app-server","--stdio"]) and
    ([.appRequests[] | select(.method == "initialize")][0] |
      (.params.clientInfo.name == "mcp-agents") and
-     (.params | has("experimentalApi") | not)) and
+     (.params.capabilities == {optOutNotificationMethods: ["turn/diff/updated"]})) and
    ([.appRequests[] | select(.method == "initialized" and (has("id") | not))] |
      length == 1) and
    ([.appRequests[] | select(.method == "thread/start")][0].params |
@@ -7266,10 +7362,27 @@ test_codex_app_case "Codex replies resume durable threads before starting turns"
        reasoningEffort:{requested:null,reported:"max",status:"inherited"}}) and
    (.stderr | contains("Codex turn started (tool=codex-reply, thread=thread-resume, reported_by=thread_resume, requested_model=none, reported_model=gpt-5.6-terra, model_status=inherited, requested_effort=none, reported_effort=max, effort_status=inherited)")) and
    ([.appRequests[] | select(.method == "thread/resume" and
-      .params.threadId == "thread-resume")] | length == 1) and
+      .params.threadId == "thread-resume" and .params.excludeTurns == true)] | length == 1) and
    ([.appRequests[] | select(.method == "turn/start" and
       .params.threadId == "thread-resume" and
       .params.input == [{type:"text",text:"continue"}])] | length == 1)'
+
+test_codex_app_case "Codex replies resume threads whose history exceeds the frame cap" \
+  "reply-history-oversized" \
+  '(.data.reply.result.isError != true) and
+   (.data.reply.result.structuredContent.threadId == "thread-resume") and
+   (.appSpawns | length == 1) and
+   (.stderr | contains("frame exceeded") | not)'
+
+test_codex_app_case "An over-cap App Server answer fails only its request" \
+  "reply-history-oversized-old" \
+  '(.data.reply.result.isError == true) and
+   (.data.reply.result.structuredContent.code == "codex_app_server_error") and
+   (.data.reply.result.structuredContent.message |
+     contains("answered thread/resume with a 11.0 MiB frame over the 10 MiB cap")) and
+   (.appSpawns | length == 1) and
+   (.stderr | contains("restarting child") | not) and
+   (.frames | tostring | contains("xxxxxxxxxxxxxxxx") | not)'
 
 test_codex_app_case "An unacknowledged turn start stays outcome-unknown and leased" \
   "turn-start-withheld" \
@@ -7566,8 +7679,19 @@ test_codex_app_case "Thread tools map to stable history and lifecycle methods" \
       (.sourceKinds == ["vscode","appServer","subAgentReview"])) and
    (.data.list.result.structuredContent.threads[0].id == "thread-listed") and
    (.data.list.result.structuredContent.threads[0].preview == "stub preview") and
-   ([.appRequests[] | select(.method == "thread/read")][0].params.includeTurns == true) and
-   ([.appRequests[] | select(.method == "thread/fork")][0].params.lastTurnId == "turn-read") and
+   ([.appRequests[] | select(.method == "thread/read")][0].params.includeTurns == false) and
+   ([.appRequests[] | select(.method == "thread/turns/list")][0].params ==
+      {threadId:"thread-listed",cursor:null,limit:5,sortDirection:"asc",itemsView:"summary"}) and
+   ([.appRequests | to_entries[] | select(.value.method == "thread/resume" and
+      .value.params == {threadId:"thread-listed",excludeTurns:true}) | .key][0] as $resume |
+    [.appRequests | to_entries[] | select(.value.method == "thread/turns/list") | .key][0] as $list |
+    $resume != null and $list != null and $resume < $list) and
+   (.data.read.result.structuredContent | tostring | contains("SECRET_COMMAND") | not) and
+   ([.appRequests[] | select(.method == "thread/unsubscribe" and
+      .params.threadId == "thread-listed")] | length >= 1) and
+   (.data.read.result.structuredContent.thread.nextCursor == "cursor-next") and
+   (.data.read.result.structuredContent | tostring | contains("ASK_OK")) and
+   ([.appRequests[] | select(.method == "thread/fork")][0].params | .lastTurnId == "turn-read" and .excludeTurns == true) and
    ([.appRequests[].method | select(. == "thread/archive")] | length == 1) and
    ([.appRequests[].method | select(. == "thread/unarchive")] | length == 1) and
    (.data.read.result.structuredContent | tostring | contains("READ_OK")) and
@@ -7577,6 +7701,30 @@ test_codex_app_case "Thread tools map to stable history and lifecycle methods" \
    (.data.read.result.structuredContent | del(.thread.reasoningEffort) | tostring |
      contains("reasoning") | not) and
    (.data.read.result.structuredContent | tostring | contains("SECRET_REASONING") | not)'
+
+test_codex_app_case "Thread history reads legacy threads in place and explains archived ones" \
+  "threads-archived" \
+  '(.data.archivedRead.result.isError == true) and
+   (.data.archivedRead.result.structuredContent.message |
+     contains("is archived; restore it with codex-thread-unarchive")) and
+   (.data.unarchive.result.isError != true) and
+   (.data.legacyRead.result.isError != true) and
+   (.data.legacyRead.result.structuredContent | tostring | contains("READ_OK")) and
+   ([.appRequests[] | select(.method == "thread/resume" and
+      .params.threadId == "thread-legacy")] | length == 0) and
+   ([.appRequests[] | select(.method == "thread/turns/list" and
+      .params.threadId == "thread-legacy")] | length == 1) and
+   (.appSpawns | length == 1)'
+
+test_codex_app_case "Thread history before Codex 0.151 is read whole and paged locally" \
+  "threads-legacy" \
+  '([.appRequests[] | select(.method == "thread/read")][0].params.includeTurns == true) and
+   ([.appRequests[] | select(.method == "thread/turns/list" or
+      (.method == "thread/resume" and .params.threadId == "thread-listed"))] | length == 0) and
+   ([.appRequests[] | select(.method == "thread/fork")][0].params | has("excludeTurns") | not) and
+   (.data.read.result.structuredContent | tostring | contains("READ_OK")) and
+   (.data.read.result.structuredContent | tostring | contains("SECRET_REASONING") | not) and
+   (.data.fork.result.isError != true)'
 
 # Thread release: a finished thread is unsubscribed so Codex can unload it and
 # stop its per-thread MCP servers; an active goal keeps it loaded.
@@ -7700,7 +7848,7 @@ test_codex_app_case "A canceled resume still releases its thread" \
 test_codex_app_case "A fork is released once it is created" \
   "threads" \
   '([.appRequests[] | select(.method == "thread/unsubscribe") | .params.threadId] ==
-      ["thread-forked"])'
+      ["thread-listed", "thread-forked"])'
 
 test_codex_app_case "A background job releases its thread when the turn completes" \
   "release-job" \
@@ -7993,12 +8141,59 @@ test_codex_app_case "Malformed App Server JSON fails the generation closed" \
   '(.data.call.result.isError == true) and
    (.data.call.result.structuredContent.code == "codex_outcome_unknown")'
 
-test_codex_app_case "A complete oversized App Server frame fails its generation typed" \
+test_codex_app_case "An oversized App Server progress frame is dropped and the turn finishes" \
   "oversized-complete" \
-  '(.data.call.result.isError == true) and
-   (.data.call.result.structuredContent.code == "codex_outcome_unknown") and
+  '(.data.call.result.isError != true) and
+   (.data.call.result.content[0].text == "APP_SERVER_OK") and
+   (.appSpawns | length == 1) and
+   (.stderr | contains("dropped a 11.0 MiB Codex App Server item/agentMessage/delta notification")) and
+   (.stderr | contains("restarting child") | not) and
    (.frames | tostring | contains("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx") | not) and
    ((.frames | tostring | length) < 100000)'
+
+test_codex_app_case "A dropped oversized answer fails only its turn" \
+  "oversized-answer" \
+  '(.data.call.result.isError == true) and
+   (.data.call.result.structuredContent.code == "codex_turn_failed") and
+   (.data.call.result.structuredContent.message |
+     contains("answer exceeded the 10 MiB frame cap and was dropped")) and
+   (.appSpawns | length == 1) and
+   (.stderr | contains("restarting child") | not) and
+   (.frames | tostring | contains("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx") | not)'
+
+test_codex_app_case "A later answer replaces one dropped over the frame cap" \
+  "oversized-answer-recovered" \
+  '(.data.call.result.isError != true) and
+   (.data.call.result.content[0].text == "LATE_OK") and
+   (.appSpawns | length == 1)'
+
+test_codex_app_case "An oversized approval request is refused and its turn interrupted, without a restart" \
+  "oversized-request" \
+  '(.data.call.result.isError == true) and
+   (.data.call.result.structuredContent.code == "codex_turn_failed") and
+   (.data.call.result.structuredContent.message |
+     contains("approval request over the 10 MiB frame cap")) and
+   ([.appRequests[] | select(.id == "approval-huge" and .result == {decision:"cancel"})] |
+     length == 1) and
+   ([.appRequests[] | select(.method == "turn/interrupt")] | length == 1) and
+   (.appSpawns | length == 1) and
+   (.stderr | contains("declined a 11.0 MiB Codex App Server item/commandExecution/requestApproval request")) and
+   (.frames | tostring | contains("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx") | not)'
+
+test_codex_app_case "An oversized answer to a dispatched mutation restarts the generation" \
+  "oversized-start" \
+  '(.data.call.result.isError == true) and
+   (.data.call.result.structuredContent.code == "codex_outcome_unknown") and
+   (.data.call.result.structuredContent.message | contains("sent a frame over 10 MiB")) and
+   ([.stderr | scan("frame exceeded 10 MiB; restarting child")] | length == 1) and
+   (.frames | tostring | contains("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx") | not)'
+
+test_codex_app_case "An unroutable oversized App Server frame still restarts the generation" \
+  "oversized-unrouted" \
+  '(.data.call.result.isError == true) and
+   (.data.call.result.structuredContent.code == "codex_outcome_unknown") and
+   ([.stderr | scan("frame exceeded 10 MiB; restarting child")] | length == 1) and
+   (.frames | tostring | contains("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx") | not)'
 
 test_codex_app_case "Closed schemas reject invalid calls before App Server work" \
   "invalid" \

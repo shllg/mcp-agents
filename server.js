@@ -3166,6 +3166,19 @@ function codexSupportsAgentsEnabledKey(version) {
 }
 
 /**
+ * Whether `thread/resume` and `thread/fork` accept `excludeTurns` without
+ * `experimentalApi`. It is stable from 0.151.0; older App Servers reject it
+ * with -32600. Their legacy-history threads also answer far below the frame
+ * cap, unlike the paginated threads 0.152 introduced.
+ * @param {{ major: number, minor: number } | undefined} version
+ * @returns {boolean}
+ */
+function codexSupportsExcludeTurns(version) {
+  if (!version) return true;
+  return version.major > 0 || version.minor >= 151;
+}
+
+/**
  * Quote a string for TOML output.
  * @param {string} value
  * @returns {string}
@@ -6198,6 +6211,123 @@ async function runBrowserPassthrough({
   }
 }
 
+// Routing fields read from an App Server frame too large to buffer, and the
+// longest value kept for each. A frame past the absolute bound is broken.
+const OVERSIZE_FRAME_FIELDS = new Set([
+  "id", "method", "params.threadId", "params.turnId", "params.item.type", "params.item.phase",
+]);
+const MAX_OVERSIZE_FRAME_FIELD_BYTES = 256;
+const MAX_OVERSIZE_FRAME_BYTES = 256 * 1024 * 1024;
+
+/**
+ * Scan an over-cap App Server frame chunk by chunk in constant memory, keeping
+ * the OVERSIZE_FRAME_FIELDS values wherever they appear: classification must
+ * not depend on the order in which Codex serializes fields. Escaped and
+ * over-long values are not identifiers and are dropped.
+ * @returns {{ feed: (bytes: Buffer) => void, fields: Record<string, string | number> }}
+ */
+function createOversizeFrameScanner() {
+  const fields = {};
+  const stack = [];
+  let inString = false;
+  let escaped = false;
+  let isKey = false;
+  let text = null;
+  let textPath = null;
+  let scalar;
+  let scalarPath = null;
+  const valuePath = () => {
+    const top = stack.at(-1);
+    if (!top) return "";
+    if (top.array || top.path === null || top.key === null) return null;
+    return top.path ? `${top.path}.${top.key}` : top.key;
+  };
+  const endScalar = () => {
+    if (scalar) {
+      const raw = Buffer.from(scalar).toString("utf8");
+      fields[scalarPath] = /^-?\d+$/u.test(raw) ? Number(raw) : raw;
+    }
+    scalar = undefined;
+  };
+  const feed = (bytes) => {
+    // The next quote and backslash in this chunk, found once each, not again
+    // per string or escape; -1 means none is left.
+    let nextQuote = -2;
+    let nextEscape = -2;
+    for (let i = 0; i < bytes.length; i++) {
+      const byte = bytes[i];
+      if (inString) {
+        // An escape may end one chunk and its escaped byte start the next.
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+        if (!text) {
+          // Skip uncollected string content in bulk; it is most of the frame.
+          if (nextQuote !== -1 && nextQuote < i) nextQuote = bytes.indexOf(0x22, i);
+          if (nextEscape !== -1 && nextEscape < i) nextEscape = bytes.indexOf(0x5c, i);
+          const next = nextQuote === -1 ? nextEscape :
+            nextEscape === -1 ? nextQuote : Math.min(nextQuote, nextEscape);
+          if (next === -1) return;
+          i = next;
+        }
+        if (bytes[i] === 0x5c || (bytes[i] !== 0x22 && text.length >= MAX_OVERSIZE_FRAME_FIELD_BYTES)) {
+          escaped = bytes[i] === 0x5c;
+          text = null;
+          continue;
+        }
+        if (bytes[i] !== 0x22) {
+          text.push(bytes[i]);
+          continue;
+        }
+        inString = false;
+        if (isKey) {
+          if (text) stack.at(-1).key = Buffer.from(text).toString("utf8");
+        } else if (text) {
+          fields[textPath] = Buffer.from(text).toString("utf8");
+        }
+        text = null;
+        continue;
+      }
+      const top = stack.at(-1);
+      if (byte === 0x22) {
+        endScalar();
+        inString = true;
+        isKey = Boolean(top && !top.array && top.expectKey);
+        if (isKey) {
+          top.key = null;
+          top.expectKey = false;
+          text = [];
+        } else {
+          textPath = valuePath();
+          text = OVERSIZE_FRAME_FIELDS.has(textPath) ? [] : null;
+        }
+      } else if (byte === 0x7b || byte === 0x5b) {
+        endScalar();
+        stack.push({ path: valuePath(), key: null, expectKey: byte === 0x7b, array: byte === 0x5b });
+      } else if (byte === 0x7d || byte === 0x5d) {
+        endScalar();
+        stack.pop();
+      } else if (byte === 0x2c) {
+        endScalar();
+        if (top && !top.array) {
+          top.expectKey = true;
+          top.key = null;
+        }
+      } else if (byte === 0x3a || byte === 0x20 || byte === 0x09 || byte === 0x0d) {
+        endScalar();
+      } else if (scalar === undefined) {
+        scalarPath = valuePath();
+        scalar = OVERSIZE_FRAME_FIELDS.has(scalarPath) ? [byte] : null;
+      } else if (scalar) {
+        if (scalar.length < MAX_OVERSIZE_FRAME_FIELD_BYTES) scalar.push(byte);
+        else scalar = null;
+      }
+    }
+  };
+  return { feed, fields };
+}
+
 /**
  * Create the project-scoped Codex runtime independently from its MCP transport.
  * App Server request IDs, raw events, reasoning items, and private storage paths
@@ -6299,6 +6429,7 @@ async function createCodexRuntime({
     ? `${codexVersion.major}.${codexVersion.minor}.${codexVersion.patch}`
     : "unknown";
   const agentsEnabledKeySupported = codexSupportsAgentsEnabledKey(codexVersion);
+  const excludeTurnsSupported = codexSupportsExcludeTurns(codexVersion);
   const durableGoalsSupported = process.platform !== "win32";
   const bridgeId = randomUUID();
   const interactionStateCodec = createRequestStateCodec({
@@ -7360,15 +7491,22 @@ async function createCodexRuntime({
     for (const item of completed.items ?? []) {
       if (item?.type === "exitedReviewMode" && typeof item.review === "string") {
         turn.finalAnswers.push(item.review);
+        turn.answerDropped = false;
       } else if (item?.type === "agentMessage" && typeof item.text === "string") {
         turn.agentMessages.push(item.text);
         if (item.phase === "final_answer") turn.finalAnswers.push(item.text);
+        if (item.phase !== "commentary") turn.answerDropped = false;
       }
     }
     let finalText = turn.finalAnswers.at(-1) ?? turn.agentMessages.at(-1) ?? "";
     if (!finalText && typeof completed.output === "string") finalText = completed.output;
     writeBridgeState();
-    if (status === "completed") {
+    if (status === "completed" && turn.answerDropped) {
+      turn.reject(appError(
+        "codex_turn_failed",
+        "Codex completed the turn, but its answer exceeded the 10 MiB frame cap and was dropped",
+      ));
+    } else if (status === "completed") {
       turn.resolve({ status, content: finalText, turn: completed });
     } else {
       turn.reject(appError(
@@ -8123,9 +8261,12 @@ async function createCodexRuntime({
       const item = params.item;
       if (item?.type === "exitedReviewMode" && typeof item.review === "string") {
         turn.finalAnswers.push(item.review);
+        turn.answerDropped = false;
       } else if (item?.type === "agentMessage" && typeof item.text === "string") {
         turn.agentMessages.push(item.text);
         if (item.phase === "final_answer") turn.finalAnswers.push(item.text);
+        // A later answer replaces one dropped over the frame cap.
+        if (item.phase !== "commentary") turn.answerDropped = false;
         if (item.phase === "commentary") {
           scheduleProgress(turn, boundedText(item.text), `${item.text}\n\n`);
         }
@@ -8216,6 +8357,99 @@ async function createCodexRuntime({
     cleanupGeneration(generationState);
     writeBridgeState();
     generationState.resolveGone?.();
+  };
+  // The last resort: end the generation once, drop the rest of its output, and
+  // tell pending callers why instead of a bare SIGKILL.
+  const restartForOversizeFrame = (generationState) => {
+    if (generationState.killReason) return;
+    logErr("[mcp-agents] Codex App Server frame exceeded 10 MiB; restarting child");
+    generationState.killReason = "sent a frame over 10 MiB and was restarted";
+    generationState.frameChunks = [];
+    generationState.frameBytes = 0;
+    generationState.oversize = undefined;
+    killChildGroup(generationState.child);
+  };
+  // The stream is back in step after an over-cap frame, so it fails only what
+  // it belongs to. A frame that cannot be attributed safely, or the answer to a
+  // dispatched mutation (Codex acted, but on what is unknown), still restarts.
+  const routeOversizeFrame = (generationState, fields, bytes) => {
+    const { id, method } = fields;
+    const size = `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+    if (id !== undefined && method === undefined) {
+      const pending = generationState.pending.get(id);
+      if (pending && pending.generation !== generationState.generation) return;
+      if (pending?.mutating) {
+        restartForOversizeFrame(generationState);
+        return;
+      }
+      logErr(
+        `[mcp-agents] dropped a ${size} Codex App Server answer` +
+          `${pending ? ` to ${pending.method}` : ""} over the 10 MiB frame cap`,
+      );
+      // Codex still acted on it; let a late hook record what it holds.
+      if (!pending || pending.canceled) {
+        const lateHook = pending ? pending.onLateResult : generationState.lateResultHooks.get(id);
+        if (pending) pending.onLateResult = undefined;
+        else generationState.lateResultHooks.delete(id);
+        try { lateHook?.(); } catch {}
+        return;
+      }
+      generationState.pending.delete(id);
+      clearTimeout(pending.timer);
+      pending.detachAbort?.();
+      pending.reject(appError(
+        "codex_app_server_error",
+        `Codex App Server answered ${pending.method} with a ${size} frame over the 10 MiB cap; ` +
+          "the answer was dropped",
+      ));
+      return;
+    }
+    if (id !== undefined && typeof method === "string") {
+      logErr(`[mcp-agents] declined a ${size} Codex App Server ${method} request over the 10 MiB frame cap`);
+      if (!appInteractionMethods.has(method)) {
+        respondToApp(generationState, id, undefined, {
+          code: -32600,
+          message: "request exceeded the client's 10 MiB frame cap",
+        });
+        return;
+      }
+      failClosedAppInteraction(generationState, { id, method });
+      // Codex aborts the turn on a refused approval; say why, as for an
+      // unexpected approval.
+      if (method.endsWith("/requestApproval") && method !== "item/permissions/requestApproval") {
+        const turn = activeTurns.get(fields["params.turnId"]) ??
+          activeTurnsByThread.get(fields["params.threadId"]);
+        if (turn?.generation === generationState.generation && !turn.terminal) {
+          void interruptTurn(turn, "approval request over the 10 MiB frame cap");
+          turn.reject(appError(
+            "codex_turn_failed",
+            "Codex sent an approval request over the 10 MiB frame cap; it was refused and the turn interrupted",
+          ));
+        }
+      }
+      return;
+    }
+    // Item notifications only drive progress, except a dropped answer: its
+    // turn must not report an earlier message as the result.
+    if (typeof method === "string" && (method.startsWith("item/") || method === "turn/diff/updated")) {
+      const answer = method === "item/completed" && (
+        fields["params.item.type"] === "exitedReviewMode" ||
+        (fields["params.item.type"] === "agentMessage" && fields["params.item.phase"] !== "commentary")
+      );
+      if (answer) {
+        const turnId = fields["params.turnId"];
+        const threadId = fields["params.threadId"];
+        if (turnId === undefined && threadId === undefined) {
+          restartForOversizeFrame(generationState);
+          return;
+        }
+        const turn = activeTurns.get(turnId) ?? activeTurnsByThread.get(threadId);
+        if (turn?.generation === generationState.generation) turn.answerDropped = true;
+      }
+      logErr(`[mcp-agents] dropped a ${size} Codex App Server ${method} notification over the 10 MiB frame cap`);
+      return;
+    }
+    restartForOversizeFrame(generationState);
   };
   const parseAppLine = (generationState, line) => {
     const trimmed = line.trim();
@@ -8411,38 +8645,51 @@ async function createCodexRuntime({
       subagentThreads: new Set(),
       // Canceled setup requests whose late answer may still name a thread.
       lateResultHooks: new Map(),
-      buffer: Buffer.alloc(0),
+      frameChunks: [],
+      frameBytes: 0,
+      oversize: undefined,
       noiseLines: 0,
     };
     app = generationState;
     child.stdin.on("error", () => {});
+    // A frame is kept as its chunks and joined once. Past the cap it is only
+    // scanned for routing fields as it streams by, in constant memory.
     child.stdout.on("data", (chunk) => {
-      if (!generationState.alive) return;
-      generationState.buffer = generationState.buffer.length
-        ? Buffer.concat([generationState.buffer, chunk])
-        : Buffer.from(chunk);
-      if (generationState.buffer.length > MAX_BUFFER_BYTES &&
-          generationState.buffer.indexOf(0x0a) === -1) {
-        logErr("[mcp-agents] Codex App Server frame exceeded 10 MiB; restarting child");
-        killChildGroup(child);
-        return;
-      }
-      let newline;
-      while ((newline = generationState.buffer.indexOf(0x0a)) !== -1) {
-        if (newline > MAX_BUFFER_BYTES) {
-          logErr("[mcp-agents] Codex App Server frame exceeded 10 MiB; restarting child");
-          generationState.buffer = Buffer.alloc(0);
-          killChildGroup(child);
-          return;
+      let start = 0;
+      while (start < chunk.length && generationState.alive && !generationState.killReason) {
+        const newline = chunk.indexOf(0x0a, start);
+        const piece = chunk.subarray(start, newline === -1 ? chunk.length : newline);
+        const { oversize } = generationState;
+        if (oversize) {
+          oversize.scanner.feed(piece);
+          oversize.bytes += piece.length;
+          if (oversize.bytes > MAX_OVERSIZE_FRAME_BYTES) {
+            restartForOversizeFrame(generationState);
+            return;
+          }
+        } else if (generationState.frameBytes + piece.length > MAX_BUFFER_BYTES) {
+          const scanner = createOversizeFrameScanner();
+          for (const part of generationState.frameChunks) scanner.feed(part);
+          scanner.feed(piece);
+          generationState.oversize = { scanner, bytes: generationState.frameBytes + piece.length };
+          generationState.frameChunks = [];
+          generationState.frameBytes = 0;
+        } else if (piece.length) {
+          generationState.frameChunks.push(piece);
+          generationState.frameBytes += piece.length;
         }
-        const line = generationState.buffer.subarray(0, newline).toString("utf8");
-        generationState.buffer = generationState.buffer.subarray(newline + 1);
-        parseAppLine(generationState, line);
-      }
-      if (generationState.buffer.length > MAX_BUFFER_BYTES) {
-        logErr("[mcp-agents] Codex App Server frame exceeded 10 MiB; restarting child");
-        generationState.buffer = Buffer.alloc(0);
-        killChildGroup(child);
+        if (newline === -1) return;
+        start = newline + 1;
+        const finished = generationState.oversize;
+        if (finished) {
+          generationState.oversize = undefined;
+          routeOversizeFrame(generationState, finished.scanner.fields, finished.bytes);
+          continue;
+        }
+        const line = Buffer.concat(generationState.frameChunks, generationState.frameBytes);
+        generationState.frameChunks = [];
+        generationState.frameBytes = 0;
+        parseAppLine(generationState, line.toString("utf8"));
       }
     });
     child.stderr.on("data", (chunk) => {
@@ -8457,7 +8704,8 @@ async function createCodexRuntime({
       killChildGroup(child);
       onGenerationGone(
         generationState,
-        signal ? `was killed by ${signal}` : `exited with code ${code}`,
+        generationState.killReason ??
+          (signal ? `was killed by ${signal}` : `exited with code ${code}`),
       );
     });
     writeBridgeState();
@@ -8465,7 +8713,8 @@ async function createCodexRuntime({
     try {
       initialized = await requestApp(generationState, "initialize", {
         clientInfo: { name: "mcp-agents", title: "mcp-agents", version: VERSION },
-        capabilities: {},
+        // The wrapper ignores the cumulative turn diff, which has no size cap.
+        capabilities: { optOutNotificationMethods: ["turn/diff/updated"] },
       }, appInitTimeoutMs);
       if (
         !initialized || typeof initialized !== "object" ||
@@ -8635,7 +8884,9 @@ async function createCodexRuntime({
         const resumed = await requestApp(
           generationState,
           "thread/resume",
-          { threadId },
+          // Nothing reads the history, and a long thread's history alone can
+          // exceed the 10 MiB frame cap and take the whole child down.
+          excludeTurnsSupported ? { threadId, excludeTurns: true } : { threadId },
           resumeTimeoutMs,
           {
             signal,
@@ -9350,46 +9601,55 @@ async function createCodexRuntime({
     { jobId },
   );
 
-  const sanitizeThread = (thread, { includeTurns = false, cursor, limit = 20 } = {}) => {
+  const sanitizeTurn = (turn) => ({
+    id: turn?.id,
+    status: turn?.status,
+    items: Array.isArray(turn?.items)
+      ? turn.items.flatMap((item) => {
+        if (item?.type === "agentMessage" && typeof item.text === "string") {
+          return [{ id: item.id, type: item.type, phase: item.phase, text: item.text }];
+        }
+        if (item?.type === "userMessage" && Array.isArray(item.content)) {
+          return [{
+            id: item.id,
+            type: item.type,
+            content: item.content
+              .filter((part) => part?.type === "text" && typeof part.text === "string")
+              .map((part) => ({ type: "text", text: part.text })),
+          }];
+        }
+        return [];
+      })
+      : [],
+  });
+  // `page` is a thread/turns/list answer: Codex pages the history itself and
+  // its cursor is opaque. Without it, a full-history thread/read is paged here.
+  const sanitizeThread = (thread, { includeTurns = false, cursor, limit = 20, page } = {}) => {
     if (!thread || typeof thread !== "object") return {};
     const clean = {};
     for (const field of [
       "id", "preview", "modelProvider", "model", "reasoningEffort", "cwd", "createdAt",
       "updatedAt", "status", "archived", "name", "gitInfo",
     ]) if (thread[field] !== undefined) clean[field] = thread[field];
-    if (!includeTurns || !Array.isArray(thread.turns)) return clean;
-    const start = cursor ? Number(cursor) : 0;
-    const safeStart = Number.isInteger(start) && start >= 0 ? start : 0;
-    const turns = thread.turns.slice(safeStart, safeStart + limit).map((turn) => ({
-      id: turn.id,
-      status: turn.status,
-      items: Array.isArray(turn.items)
-        ? turn.items.flatMap((item) => {
-          if (item?.type === "agentMessage" && typeof item.text === "string") {
-            return [{ id: item.id, type: item.type, phase: item.phase, text: item.text }];
-          }
-          if (item?.type === "userMessage" && Array.isArray(item.content)) {
-            return [{
-              id: item.id,
-              type: item.type,
-              content: item.content
-                .filter((part) => part?.type === "text" && typeof part.text === "string")
-                .map((part) => ({ type: "text", text: part.text })),
-            }];
-          }
-          return [];
-        })
-        : [],
-    }));
-    clean.turns = turns;
-    clean.nextCursor = safeStart + turns.length < thread.turns.length
-      ? String(safeStart + turns.length)
-      : null;
+    let restartCursor = cursor ?? null;
+    if (page) {
+      clean.turns = (Array.isArray(page.data) ? page.data : []).map(sanitizeTurn);
+      clean.nextCursor = typeof page.nextCursor === "string" ? page.nextCursor : null;
+    } else {
+      if (!includeTurns || !Array.isArray(thread.turns)) return clean;
+      const start = cursor ? Number(cursor) : 0;
+      const safeStart = Number.isInteger(start) && start >= 0 ? start : 0;
+      clean.turns = thread.turns.slice(safeStart, safeStart + limit).map(sanitizeTurn);
+      clean.nextCursor = safeStart + clean.turns.length < thread.turns.length
+        ? String(safeStart + clean.turns.length)
+        : null;
+      restartCursor = String(safeStart);
+    }
     const encoded = JSON.stringify(clean);
     if (Buffer.byteLength(encoded, "utf8") > MAX_CODEX_COMMENTARY_BYTES) {
       clean.turns = [];
       clean.historyTruncated = true;
-      clean.nextCursor = String(safeStart);
+      clean.nextCursor = restartCursor;
     }
     return clean;
   };
@@ -9823,15 +10083,85 @@ async function createCodexRuntime({
       }
       if (params.name === "codex-thread-read") {
         const generationState = await ensureApp();
+        // Full history in one answer has no size bound; Codex pages it itself
+        // where it can (0.151.0 and later).
+        const paged = args.includeTurns === true && excludeTurnsSupported;
         const result = await requestApp(generationState, "thread/read", {
           threadId: args.threadId,
-          includeTurns: args.includeTurns ?? false,
+          includeTurns: args.includeTurns === true && !paged,
         });
-        const thread = sanitizeThread(result?.thread, {
-          includeTurns: args.includeTurns,
-          cursor: args.cursor,
-          limit: args.limit ?? 20,
-        });
+        if (!paged) {
+          const thread = sanitizeThread(result?.thread, {
+            includeTurns: args.includeTurns,
+            cursor: args.cursor,
+            limit: args.limit ?? 20,
+          });
+          return toolResult(JSON.stringify(thread), { thread });
+        }
+        // Halve the page until its sanitized form fits one result.
+        const readPage = async () => {
+          for (let limit = args.limit ?? 20; ; limit = Math.ceil(limit / 2)) {
+            const page = await requestApp(generationState, "thread/turns/list", {
+              threadId: args.threadId,
+              cursor: args.cursor ?? null,
+              limit,
+              sortDirection: "asc",
+              itemsView: "summary",
+            });
+            const thread = sanitizeThread(result?.thread, { cursor: args.cursor, page });
+            if (!thread.historyTruncated) return thread;
+            if (limit === 1) {
+              // One turn alone is too large: skip it rather than stall paging.
+              thread.nextCursor = typeof page?.nextCursor === "string" ? page.nextCursor : null;
+              return thread;
+            }
+          }
+        };
+        let thread;
+        // Codex replays a legacy thread's rollout on every listing, and a
+        // thread with a turn running here is loaded already. Any other thread
+        // lists no history until it is loaded, so resume it under its lease
+        // and release it afterwards, like a fork.
+        const running = generationState.nativeActive.has(args.threadId) ||
+          [...activeTurns.values()].some((turn) => !turn.terminal &&
+            turn.generation === generationState.generation &&
+            (turn.threadId === args.threadId || turn.reviewThreadId === args.threadId));
+        if (running || result?.thread?.historyMode === "legacy") {
+          thread = await readPage();
+        } else {
+          if (confineWorkspaceToProject) {
+            assertWorkspaceOutsideState(result?.thread?.cwd);
+            assertWorkspaceInsideProject(result?.thread?.cwd, { required: true });
+          }
+          const release = acquireThreadLease(args.threadId, params.name);
+          const provisional = beginProvisionalTurn({
+            generationState,
+            threadId: args.threadId,
+            cwd: result?.thread?.cwd,
+            requestId: idKey(ctx.mcpReq.id),
+            tool: params.name,
+          });
+          try {
+            try {
+              await resumeThread(generationState, args.threadId, { signal: ctx.mcpReq.signal });
+            } catch (err) {
+              if (err?.appServerCode === -32600 && /\bis archived\b/iu.test(err?.message ?? "")) {
+                throw appError(
+                  "codex_app_server_error",
+                  `Codex thread ${args.threadId} is archived; restore it with ` +
+                    "codex-thread-unarchive to read its history",
+                  { appServerCode: err.appServerCode },
+                );
+              }
+              throw err;
+            }
+            thread = await readPage();
+          } finally {
+            forgetProvisionalTurn(provisional);
+            try { await releaseThread(generationState, args.threadId); } catch {}
+            release();
+          }
+        }
         return toolResult(JSON.stringify(thread), { thread });
       }
       if ([
@@ -9852,6 +10182,8 @@ async function createCodexRuntime({
             params.name === "codex-thread-archive" ? "thread/archive" : "thread/unarchive";
           const request = { threadId: args.threadId };
           if (args.lastTurnId) request.lastTurnId = args.lastTurnId;
+          // sanitizeThread drops the fork's turns anyway; see resumeThread.
+          if (method === "thread/fork" && excludeTurnsSupported) request.excludeTurns = true;
           const result = await requestApp(
             generationState,
             method,
