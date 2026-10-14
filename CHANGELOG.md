@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.36.0] - 2026-10-14
+
+### Changed
+
+- Codex progress shows what Codex is doing instead of generic `running command`
+  / `command finished` lines. The status keeps Codex's latest commentary or
+  reasoning-summary headline, then the current action (`read sync_job.rb`,
+  `search grant_epoch in app/`, `edited a.rb`, `ran git diff`), then command and
+  edited-file tallies. Unparsed commands show only their program, plus one
+  subcommand word for known tools and the target of `exec` / `run`; flags,
+  arguments, and environment assignments never appear, even inside quotes.
+  Background job status carries the same line. Streaming commentary grows as
+  a sentence instead of showing only its latest fragment.
+  `MCP_AGENTS_CODEX_PROGRESS=minimal` restores content-free wording for
+  commands and file changes
+
 ## [0.35.0] - 2026-10-14
 
 ### Changed
