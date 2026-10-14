@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.35.0] - 2026-10-14
+
+### Changed
+
+- With Codex 0.151.0 or later, `codex-thread-read` pages history through Codex
+  (`thread/turns/list`): oldest turn first, each turn's request and final
+  answer, and an opaque `cursor`. Intermediate commentary is no longer
+  included, and an oversized page is shrunk instead of returned empty.
+  Reading a paginated thread that no turn is running on loads it briefly
+  under its thread lease: meanwhile other operations on that thread return
+  `codex_thread_busy`, from the same bridge too, and the read itself does so
+  while anything else holds the lease. An archived paginated thread must be
+  restored with `codex-thread-unarchive` before its history can be read.
+- The bridge opts out of Codex's `turn/diff/updated` notification, which it
+  never used and which has no size cap.
+
+### Fixed
+
+- `codex-reply`, `codex-review`, goal changes, and `codex-thread-fork` on a
+  long thread no longer kill the Codex App Server child every time. Codex
+  answered each resume or fork with the thread's whole history, which for a
+  long thread exceeded the 10 MiB frame cap. With Codex 0.151.0 or later the
+  bridge now asks for metadata only.
+- One oversized App Server frame no longer cuts off every Codex call on the
+  same child. It fails only the request or turn it belongs to: progress-only
+  frames are dropped, and an oversized approval request is refused, which
+  interrupts its turn with that reason. Only a frame that cannot be
+  attributed, or the answer to a dispatched mutation, still restarts the
+  child. Pending requests then report that reason instead of
+  `killed by SIGKILL`, and the restart is logged once instead of several
+  times.
+- `codex-thread-read` with `includeTurns` no longer returns an empty history,
+  without any error, for a thread that Codex had not loaded.
+- A large App Server frame is no longer copied again on every incoming chunk.
+
 ## [0.34.0] - 2026-10-06
 
 ### Added
